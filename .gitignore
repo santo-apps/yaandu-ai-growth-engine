@@ -1,0 +1,43 @@
+# Local environment and credentials
+/.env
+/.env.*
+!/.env.example
+!/.env.testing.example
+
+# PHP / Laravel dependencies and runtime output
+/vendor/
+/bootstrap/cache/*.php
+/storage/*.key
+/storage/app/private/*
+/storage/framework/*
+!/storage/framework/.gitignore
+/storage/logs/*
+!/storage/logs/.gitignore
+/.phpunit.cache/
+/.phpunit.result.cache
+/coverage/
+/clover.xml
+
+# Vue / Vite dependencies and generated build output
+/node_modules/
+/dist/
+/public/build/
+/public/hot
+*.tsbuildinfo
+
+# Local development data and acceptance artifacts
+/yaandu_growth
+/artifacts/local-acceptance/
+/tests/Playwright/artifacts/
+/tests/Playwright/screenshots/
+
+# IDE, OS, editor and temporary files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*.tmp
+*.temp
+*.log

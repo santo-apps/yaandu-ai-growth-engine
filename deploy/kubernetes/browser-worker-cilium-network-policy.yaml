@@ -1,0 +1,61 @@
+# Apply in the dedicated browser-worker namespace. The browser worker must run
+# in a separate pod/container selected by this label; do not run Chromium inside
+# the Laravel API or ordinary queue-worker pod.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: yaandu-browser
+---
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: yaandu-browser-worker-egress
+  namespace: yaandu-browser
+spec:
+  endpointSelector:
+    matchLabels:
+      app.kubernetes.io/name: yaandu-browser-worker
+  # Capture pods receive input through the Kubernetes Job spec and return
+  # artifacts to a one-object, short-lived S3-compatible presigned URL. They
+  # expose no pod service, sidecar, health endpoint, or local job listener.
+  ingress: []
+  egressDeny:
+    - toEntities:
+        - host
+        - remote-node
+    - toCIDRSet:
+        # Loopback, private, shared, link-local, documentation, benchmark,
+        # multicast, and reserved IPv4 ranges. Include every VPC/cluster/service
+        # CIDR used by the deployment even when it is not listed here.
+        - cidr: 0.0.0.0/8
+        - cidr: 10.0.0.0/8
+        - cidr: 100.64.0.0/10
+        - cidr: 127.0.0.0/8
+        - cidr: 169.254.0.0/16
+        - cidr: 172.16.0.0/12
+        - cidr: 192.0.0.0/24
+        - cidr: 192.0.2.0/24
+        - cidr: 192.88.99.0/24
+        - cidr: 192.168.0.0/16
+        - cidr: 198.18.0.0/15
+        - cidr: 198.51.100.0/24
+        - cidr: 203.0.113.0/24
+        - cidr: 224.0.0.0/4
+        - cidr: 240.0.0.0/4
+        # IPv6 loopback, unique-local, link-local, documentation/multicast,
+        # IPv4-mapped, and the well-known NAT64 translation range.
+        - cidr: ::1/128
+        - cidr: fc00::/7
+        - cidr: fe80::/10
+        - cidr: 2001:db8::/32
+        - cidr: ff00::/8
+        - cidr: ::ffff:0:0/96
+        - cidr: 64:ff9b::/96
+        # Explicit cloud metadata destinations (also covered by link-local).
+        - cidr: 169.254.169.254/32
+        - cidr: fd00:ec2::254/128
+  egress:
+    # Arbitrary public websites are necessary for capture. egressDeny above
+    # takes precedence; cluster/VPC service ranges must be added above.
+    - toEntities:
+        - world
