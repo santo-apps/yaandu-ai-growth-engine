@@ -3,6 +3,8 @@
 namespace App\Http\Controllers\Api\V1;
 
 use App\Discovery\DiscoveryCandidateService;
+use App\Discovery\CheapCandidateFilter;
+use App\Discovery\DiscoveryAnalysisBudget;
 use App\Discovery\DiscoveryQuery;
 use App\Discovery\DiscoverySourceRegistry;
 use App\Discovery\DomainNormalizer;
@@ -25,10 +27,19 @@ final class DiscoveryController extends Controller
         return DB::table('discovery_searches')->where('tenant_id', app('tenant.id'))->orderByDesc('created_at')->paginate(25);
     }
 
+    public function sourceHealth(Request $request, \App\Discovery\DiscoverySourceHealth $health)
+    {
+        $role = $request->user()->tenants()->whereKey(app('tenant.id'))->wherePivot('status', 'active')->value('tenant_user.role');
+        abort_unless(in_array($role, ['owner', 'admin'], true), 403, 'Discovery source diagnostics require an active owner or admin.');
+        return response()->json($health->status());
+    }
+
     public function createSearch(Request $request)
     {
         $data = $request->validate([
-            'name' => ['required', 'string', 'max:160'], 'source' => ['required', 'in:deterministic_local,supplied_seed'],
+            'name' => ['required', 'string', 'max:160'], 'source' => ['required', 'in:deterministic_local,supplied_seed,location_open_web'],
+            'city' => ['nullable', 'string', 'max:100'], 'country' => ['nullable', 'string', 'max:100'], 'region' => ['nullable', 'string', 'max:100'],
+            'business_category' => ['nullable', 'string', 'max:100'], 'radius_m' => ['nullable', 'integer', 'min:500', 'max:25000'],
             'locations' => ['nullable', 'array', 'max:20'], 'locations.*' => ['string', 'max:100'],
             'industries' => ['nullable', 'array', 'max:20'], 'industries.*' => ['string', 'max:150'],
             'keywords' => ['nullable', 'array', 'max:30'], 'keywords.*' => ['string', 'max:100'],
@@ -41,6 +52,9 @@ final class DiscoveryController extends Controller
         ]);
         if (($data['source'] ?? null) === 'deterministic_local' && (! app()->environment(['local', 'testing']) || ! config('discovery.allow_deterministic', false))) {
             return response()->json(['message' => 'Deterministic discovery is disabled in this environment.'], 422);
+        }
+        if (($data['source'] ?? null) === 'location_open_web' && (! config('discovery.osm_enabled', false) || empty($data['city']))) {
+            throw ValidationException::withMessages(['city' => ['Choose a supported city for location discovery.']]);
         }
         $tenant = app('tenant.id');
         $id = (string) Str::uuid();
@@ -111,6 +125,8 @@ final class DiscoveryController extends Controller
             ->when($request->filled('industry'), fn ($query) => $query->where('industry', $request->string('industry')->toString()))
             ->orderByDesc('created_at')->paginate(50);
         $page->getCollection()->transform(function ($candidate) use ($tenant) {
+            $candidate->sources = DB::table('discovery_candidate_sources')->where('tenant_id', $tenant)->where('candidate_id', $candidate->id)->pluck('source')->unique()->values();
+            $candidate->source_count = $candidate->sources->count();
             $candidate->contact_count = $candidate->company_id ? DB::table('contacts')->where('tenant_id', $tenant)->where('company_id', $candidate->company_id)->count() : 0;
             $score = $candidate->company_id ? DB::table('lead_scores')->where('tenant_id', $tenant)->where('company_id', $candidate->company_id)->orderByDesc('scored_at')->first(['score', 'components']) : null;
             $candidate->lead_score = $score?->score;
@@ -141,7 +157,9 @@ final class DiscoveryController extends Controller
             return $contact;
         });
         $scores = $company ? DB::table('lead_scores')->where('tenant_id', $tenant)->where('company_id', $company->id)->orderByDesc('scored_at')->limit(5)->get() : collect();
-        return response()->json(['candidate' => $row, 'company' => $company, 'findings' => $intelligence, 'website_issues' => $issues, 'contacts' => $contacts, 'scores' => $scores]);
+        $sources = DB::table('discovery_candidate_sources')->where('tenant_id', $tenant)->where('candidate_id', $row->id)->orderBy('source')->get()
+            ->map(function ($source): object { $source->source_metadata = is_array($source->source_metadata) ? $source->source_metadata : json_decode((string) $source->source_metadata, true); return $source; });
+        return response()->json(['candidate' => $row, 'company' => $company, 'findings' => $intelligence, 'website_issues' => $issues, 'contacts' => $contacts, 'scores' => $scores, 'sources' => $sources]);
     }
 
     public function previewImport(Request $request, DomainNormalizer $domains)
@@ -259,6 +277,25 @@ final class DiscoveryController extends Controller
             }
             if (in_array($data['action'], ['analyze', 'intelligence', 'scoring'], true) && $candidate->company_id && $candidate->verification_state === 'verified') {
                 $stage = $data['action'] === 'scoring' ? 'scoring' : 'all';
+                if ($candidate->lifecycle_status === 'reviewable' || $candidate->analysis_status === 'completed') {
+                    $results[] = ['candidate_id' => $id, 'status' => 'skipped', 'reason' => 'Analysis and scoring are already complete.'];
+                    continue;
+                }
+                $filter = app(CheapCandidateFilter::class)->evaluate($candidate);
+                if (! $filter['eligible']) {
+                    DB::table('discovery_candidates')->where('tenant_id', app('tenant.id'))->where('id', $id)->update([
+                        'eligible_for_analysis' => false, 'analysis_status' => 'not_eligible', 'analysis_reason' => $filter['reason'], 'updated_at' => now(),
+                    ]);
+                    $results[] = ['candidate_id' => $id, 'status' => 'skipped', 'reason' => $filter['reason']];
+                    continue;
+                }
+                DB::table('discovery_candidates')->where('tenant_id', app('tenant.id'))->where('id', $id)->update([
+                    'eligible_for_analysis' => true, 'analysis_status' => 'eligible', 'analysis_reason' => $filter['reason'], 'updated_at' => now(),
+                ]);
+                if (! app(DiscoveryAnalysisBudget::class)->reserve((string) app('tenant.id'), $id)) {
+                    $results[] = ['candidate_id' => $id, 'status' => 'skipped', 'reason' => 'Analysis budget reached for this run.'];
+                    continue;
+                }
                 if ($stage === 'scoring' && ! in_array($candidate->lifecycle_status, ['analyzed', 'reviewable'], true)) {
                     $results[] = ['candidate_id' => $id, 'status' => 'skipped', 'reason' => 'Website intelligence must complete before scoring.'];
                     continue;
@@ -302,7 +339,7 @@ final class DiscoveryController extends Controller
     private function refreshImportRun(string $tenant, string $runId): void
     {
         $counts = DB::table('discovery_candidates')->where('tenant_id', $tenant)->where('discovery_run_id', $runId)
-            ->selectRaw('count(*) as found, sum(case when deduplication_state in (\'existing_company\', \'duplicate_candidate\') then 1 else 0 end) as duplicates, sum(case when verification_state = \'invalid\' then 1 else 0 end) as invalid, sum(case when verification_state = \'verified\' then 1 else 0 end) as verified, sum(case when lifecycle_status in (\'analyzed\', \'reviewable\', \'accepted\') then 1 else 0 end) as analyzed, sum(case when lifecycle_status in (\'reviewable\', \'accepted\') then 1 else 0 end) as scored, sum(case when lifecycle_status = \'accepted\' then 1 else 0 end) as accepted, sum(case when lifecycle_status = \'rejected\' then 1 else 0 end) as rejected, sum(case when verification_state in (\'failed\', \'unreachable\', \'robots_denied\') or lifecycle_status = \'analysis_failed\' then 1 else 0 end) as failures')->first();
+            ->selectRaw('count(*) as found, sum(case when deduplication_state in (\'existing_company\', \'duplicate_candidate\') then 1 else 0 end) as duplicates, sum(case when verification_state = \'invalid\' then 1 else 0 end) as invalid, sum(case when verification_state = \'not_required\' then 1 else 0 end) as no_website, sum(case when eligible_for_analysis then 1 else 0 end) as eligible_for_analysis, sum(case when verification_state = \'verified\' then 1 else 0 end) as verified, sum(case when lifecycle_status in (\'analyzed\', \'reviewable\', \'accepted\') then 1 else 0 end) as analyzed, sum(case when lifecycle_status in (\'reviewable\', \'accepted\') then 1 else 0 end) as scored, sum(case when lifecycle_status = \'accepted\' then 1 else 0 end) as accepted, sum(case when lifecycle_status = \'rejected\' then 1 else 0 end) as rejected, sum(case when verification_state in (\'failed\', \'unreachable\', \'robots_denied\') or lifecycle_status = \'analysis_failed\' then 1 else 0 end) as failures')->first();
         $pending = DB::table('discovery_candidates')->where('tenant_id', $tenant)->where('discovery_run_id', $runId)
             ->where(function ($query): void { $query->where('verification_state', 'pending')->orWhereIn('lifecycle_status', ['verified', 'analyzing', 'analyzed']); })->exists();
         DB::table('discovery_runs')->where('tenant_id', $tenant)->where('id', $runId)->update(['status' => $pending ? 'analyzing' : 'completed', 'completed_at' => $pending ? null : now(), 'counts' => json_encode($counts), 'updated_at' => now()]);

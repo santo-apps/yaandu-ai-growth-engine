@@ -5,6 +5,8 @@ namespace App\Jobs;
 use App\Crawling\RobotsRules;
 use App\Crawling\UrlPolicy;
 use App\Discovery\DomainNormalizer;
+use App\Discovery\CheapCandidateFilter;
+use App\Discovery\DiscoveryAnalysisBudget;
 use App\Discovery\DeterministicCandidateFixtureSourceInterface;
 use App\Discovery\DiscoverySourceRegistry;
 use App\Models\Company;
@@ -201,15 +203,24 @@ final class VerifyDiscoveryCandidateJob implements ShouldQueue, ShouldBeUnique
                     'depth' => 0, 'created_at' => now(), 'updated_at' => now()]);
             }
             DB::table('discovery_candidates')->where('tenant_id', $this->tenantId)->where('id', $candidate->id)
-                ->update(['company_id' => $company->id, 'lifecycle_status' => 'analyzing', 'updated_at' => now()]);
-            AnalyzeAndScoreDiscoveryCandidateJob::dispatch($this->tenantId, $candidate->id)->afterCommit();
+                ->update(['company_id' => $company->id, 'lifecycle_status' => 'verified', 'updated_at' => now()]);
+            $verified = DB::table('discovery_candidates')->where('tenant_id', $this->tenantId)->where('id', $candidate->id)->first();
+            $filter = app(CheapCandidateFilter::class)->evaluate($verified);
+            DB::table('discovery_candidates')->where('tenant_id', $this->tenantId)->where('id', $candidate->id)->update([
+                'eligible_for_analysis' => $filter['eligible'], 'analysis_status' => $filter['eligible'] ? 'eligible' : 'not_eligible',
+                'analysis_reason' => $filter['reason'], 'updated_at' => now(),
+            ]);
+            if ($filter['eligible'] && app(DiscoveryAnalysisBudget::class)->reserve($this->tenantId, $candidate->id)) {
+                DB::table('discovery_candidates')->where('tenant_id', $this->tenantId)->where('id', $candidate->id)->update(['lifecycle_status' => 'analyzing', 'updated_at' => now()]);
+                AnalyzeAndScoreDiscoveryCandidateJob::dispatch($this->tenantId, $candidate->id)->afterCommit();
+            }
         });
     }
 
     private function refreshRun(): void
     {
         $counts = DB::table('discovery_candidates')->where('tenant_id', $this->tenantId)->where('discovery_run_id', $this->runId)
-            ->selectRaw('count(*) as found, sum(case when deduplication_state in (\'existing_company\', \'duplicate_candidate\') then 1 else 0 end) as duplicates, sum(case when verification_state = \'invalid\' then 1 else 0 end) as invalid, sum(case when verification_state = \'verified\' then 1 else 0 end) as verified, sum(case when lifecycle_status in (\'analyzed\', \'reviewable\', \'accepted\') then 1 else 0 end) as analyzed, sum(case when lifecycle_status in (\'reviewable\', \'accepted\') then 1 else 0 end) as scored, sum(case when verification_state in (\'failed\', \'unreachable\', \'robots_denied\') or lifecycle_status = \'analysis_failed\' then 1 else 0 end) as failures, sum(case when lifecycle_status = \'accepted\' then 1 else 0 end) as accepted, sum(case when lifecycle_status = \'rejected\' then 1 else 0 end) as rejected')
+            ->selectRaw('count(*) as found, sum(case when deduplication_state in (\'existing_company\', \'duplicate_candidate\') then 1 else 0 end) as duplicates, sum(case when verification_state = \'invalid\' then 1 else 0 end) as invalid, sum(case when verification_state = \'not_required\' then 1 else 0 end) as no_website, sum(case when eligible_for_analysis then 1 else 0 end) as eligible_for_analysis, sum(case when verification_state = \'verified\' then 1 else 0 end) as verified, sum(case when lifecycle_status in (\'analyzed\', \'reviewable\', \'accepted\') then 1 else 0 end) as analyzed, sum(case when lifecycle_status in (\'reviewable\', \'accepted\') then 1 else 0 end) as scored, sum(case when verification_state in (\'failed\', \'unreachable\', \'robots_denied\') or lifecycle_status = \'analysis_failed\' then 1 else 0 end) as failures, sum(case when lifecycle_status = \'accepted\' then 1 else 0 end) as accepted, sum(case when lifecycle_status = \'rejected\' then 1 else 0 end) as rejected')
             ->first();
         $pending = DB::table('discovery_candidates')->where('tenant_id', $this->tenantId)->where('discovery_run_id', $this->runId)
             ->whereNotIn('deduplication_state', ['existing_company', 'duplicate_candidate'])
