@@ -26,6 +26,10 @@ use App\Proposals\ProposalDocumentRendererInterface;
 use App\Proposals\ProposalPdfRenderer;
 use App\Crawling\DnsPublicAddressResolver;
 use App\Crawling\PublicAddressResolverInterface;
+use App\Discovery\LocationResolverInterface;
+use App\Discovery\ConfiguredLocationResolver;
+use App\Discovery\SearchEngineInterface;
+use App\Discovery\DeterministicSearchEngine;
 use Illuminate\Support\ServiceProvider;
 use Illuminate\Cache\RateLimiting\Limit;
 use Illuminate\Support\Facades\RateLimiter;
@@ -38,6 +42,8 @@ class AppServiceProvider extends ServiceProvider
     public function register(): void
     {
         $this->app->bind(PublicAddressResolverInterface::class, DnsPublicAddressResolver::class);
+        $this->app->bind(LocationResolverInterface::class, ConfiguredLocationResolver::class);
+        $this->app->bind(SearchEngineInterface::class, DeterministicSearchEngine::class);
         $this->app->bind(ProposalDocumentRendererInterface::class, ProposalPdfRenderer::class);
         $this->app->tag([OpenAIProvider::class, AnthropicProvider::class, GeminiProvider::class], 'ai.providers');
         if (config('ai.local_acceptance.enabled')) {

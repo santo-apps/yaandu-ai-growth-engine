@@ -54,7 +54,7 @@ final class AnalyzeAndScoreDiscoveryCandidateJob implements ShouldQueue, ShouldB
             throw new RuntimeException('Candidate intelligence must be complete before lead scoring.');
         }
         $this->runAgent($agents, $candidate, 'LeadScoringAgent', ['company_id' => $company->id], 'lead-score');
-        DB::table('discovery_candidates')->where('tenant_id', $this->tenantId)->where('id', $candidate->id)->update(['lifecycle_status' => 'reviewable', 'updated_at' => now()]);
+        DB::table('discovery_candidates')->where('tenant_id', $this->tenantId)->where('id', $candidate->id)->update(['lifecycle_status' => 'reviewable', 'analysis_status' => 'completed', 'updated_at' => now()]);
         $this->refreshRun($candidate->discovery_run_id);
     }
 
@@ -86,13 +86,13 @@ final class AnalyzeAndScoreDiscoveryCandidateJob implements ShouldQueue, ShouldB
         DB::table('discovery_candidates')->where('tenant_id', $this->tenantId)->where('id', $this->candidateId)
             ->whereIn('lifecycle_status', ['verified', 'analyzing', 'analyzed'])->update([
                 'lifecycle_status' => 'analysis_failed', 'failure_code' => 'CANDIDATE_ANALYSIS_FAILED',
-                'failure_summary' => 'Website analysis or lead scoring did not complete. Retry the analysis or review the evidence.', 'updated_at' => now(),
+                'analysis_status' => 'failed', 'failure_summary' => 'Website analysis or lead scoring did not complete. Retry the analysis or review the evidence.', 'updated_at' => now(),
             ]);
     }
 
     private function counts(string $runId): array
     {
         return (array) DB::table('discovery_candidates')->where('tenant_id', $this->tenantId)->where('discovery_run_id', $runId)
-            ->selectRaw('count(*) as found, sum(case when deduplication_state in (\'existing_company\', \'duplicate_candidate\') then 1 else 0 end) as duplicates, sum(case when verification_state = \'invalid\' then 1 else 0 end) as invalid, sum(case when verification_state = \'verified\' then 1 else 0 end) as verified, sum(case when lifecycle_status in (\'analyzed\', \'reviewable\', \'accepted\') then 1 else 0 end) as analyzed, sum(case when lifecycle_status in (\'reviewable\', \'accepted\') then 1 else 0 end) as scored, sum(case when lifecycle_status = \'accepted\' then 1 else 0 end) as accepted, sum(case when lifecycle_status = \'rejected\' then 1 else 0 end) as rejected, sum(case when verification_state in (\'failed\', \'unreachable\', \'robots_denied\') or lifecycle_status = \'analysis_failed\' then 1 else 0 end) as failures')->first();
+            ->selectRaw('count(*) as found, sum(case when deduplication_state in (\'existing_company\', \'duplicate_candidate\') then 1 else 0 end) as duplicates, sum(case when verification_state = \'invalid\' then 1 else 0 end) as invalid, sum(case when verification_state = \'not_required\' then 1 else 0 end) as no_website, sum(case when eligible_for_analysis then 1 else 0 end) as eligible_for_analysis, sum(case when verification_state = \'verified\' then 1 else 0 end) as verified, sum(case when lifecycle_status in (\'analyzed\', \'reviewable\', \'accepted\') then 1 else 0 end) as analyzed, sum(case when lifecycle_status in (\'reviewable\', \'accepted\') then 1 else 0 end) as scored, sum(case when lifecycle_status = \'accepted\' then 1 else 0 end) as accepted, sum(case when lifecycle_status = \'rejected\' then 1 else 0 end) as rejected, sum(case when verification_state in (\'failed\', \'unreachable\', \'robots_denied\') or lifecycle_status = \'analysis_failed\' then 1 else 0 end) as failures')->first();
     }
 }

@@ -73,6 +73,7 @@ Route::prefix('v1')->group(function (): void {
     Route::post('/marketing-configuration/knowledge/{id}/approve', [MarketingConfigurationController::class, 'approveKnowledge']);
     Route::post('/discovery-runs', [AgentRunController::class, 'discovery']);
     Route::get('/discovery/searches', [DiscoveryController::class, 'searches']);
+    Route::get('/discovery/source-health', [DiscoveryController::class, 'sourceHealth']);
     Route::post('/discovery/searches', [DiscoveryController::class, 'createSearch']);
     Route::post('/discovery/searches/{search}/runs', [DiscoveryController::class, 'startRun']);
     Route::get('/discovery/runs', [DiscoveryController::class, 'runs']);
