@@ -13,15 +13,16 @@ import PipelineWorkspace from './components/PipelineWorkspace.vue'
 import MeetingsWorkspace from './components/MeetingsWorkspace.vue'
 import SetupWorkspace from './components/SetupWorkspace.vue'
 import LocalAcceptancePanel from './components/LocalAcceptancePanel.vue'
+import CorpusOperationsWorkspace from './components/CorpusOperationsWorkspace.vue'
 
-type Page = 'Home' | 'Prospects' | 'Prospect 360' | 'Outreach' | 'Inbox' | 'Pipeline' | 'Meetings' | 'Dashboard' | 'Companies' | 'Campaigns' | 'Marketing Intelligence' | 'Conversation Inbox' | 'Proposals' | 'Workflows' | 'Approval Center' | 'Automation' | 'Company Details' | 'Website Intelligence' | 'Contacts' | 'Lead Scores' | 'ICP Configuration' | 'Agent Runs' | 'AI Configuration' | 'Setup' | 'Services & Pricing'
+type Page = 'Home' | 'Prospects' | 'Prospect 360' | 'Outreach' | 'Inbox' | 'Pipeline' | 'Meetings' | 'Dashboard' | 'Companies' | 'Campaigns' | 'Marketing Intelligence' | 'Conversation Inbox' | 'Proposals' | 'Workflows' | 'Approval Center' | 'Automation' | 'Company Details' | 'Website Intelligence' | 'Contacts' | 'Lead Scores' | 'ICP Configuration' | 'Agent Runs' | 'Corpus Operations' | 'AI Configuration' | 'Setup' | 'Services & Pricing'
 const pages: { name: Page; icon: string; group: string }[] = [
   { name: 'Home', icon: '⌂', group: 'SALES' }, { name: 'Prospects', icon: '▦', group: 'SALES' }, { name: 'Outreach', icon: '✉', group: 'SALES' }, { name: 'Inbox', icon: '◌', group: 'SALES' }, { name: 'Pipeline', icon: '↗', group: 'SALES' }, { name: 'Meetings', icon: '◷', group: 'SALES' }, { name: 'Proposals', icon: '▤', group: 'SALES' },
   { name: 'Approval Center', icon: '✓', group: 'MANAGEMENT' }, { name: 'Automation', icon: '⚙', group: 'MANAGEMENT' },
   { name: 'Workflows', icon: '⇢', group: 'AUTOMATION' }, { name: 'Approval Center', icon: '✓', group: 'AUTOMATION' }, { name: 'Automation', icon: '⚙', group: 'AUTOMATION' },
   { name: 'Company Details', icon: '⌂', group: 'WORKSPACE' }, { name: 'Website Intelligence', icon: '◎', group: 'INTELLIGENCE' },
   { name: 'Contacts', icon: '♙', group: 'INTELLIGENCE' }, { name: 'Lead Scores', icon: '↗', group: 'INTELLIGENCE' },
-  { name: 'Setup', icon: '⚙', group: 'SETUP' }, { name: 'Services & Pricing', icon: '▤', group: 'SETUP' }, { name: 'ICP Configuration', icon: '☷', group: 'SETUP' }, { name: 'AI Configuration', icon: '✳', group: 'SETUP' }, { name: 'Agent Runs', icon: '◷', group: 'OPERATIONS' },
+  { name: 'Setup', icon: '⚙', group: 'SETUP' }, { name: 'Services & Pricing', icon: '▤', group: 'SETUP' }, { name: 'ICP Configuration', icon: '☷', group: 'SETUP' }, { name: 'AI Configuration', icon: '✳', group: 'SETUP' }, { name: 'Agent Runs', icon: '◷', group: 'OPERATIONS' }, { name: 'Corpus Operations', icon: '▤', group: 'OPERATIONS' },
 ]
 const salesPages: { name: Page; icon: string }[] = [
   { name: 'Home', icon: '⌂' }, { name: 'Prospects', icon: '▦' }, { name: 'Outreach', icon: '✉' }, { name: 'Inbox', icon: '◌' }, { name: 'Pipeline', icon: '↗' }, { name: 'Meetings', icon: '◷' }, { name: 'Proposals', icon: '▤' },
@@ -355,6 +356,7 @@ onBeforeUnmount(() => screenshotUrls.value.forEach((screenshot) => URL.revokeObj
         <button class="nav-item" :class="{selected:active==='AI Configuration'}" @click="select('AI Configuration')"><span class="nav-icon">✳</span>AI Configuration</button>
         <p class="nav-label secondary-nav-label">OPERATIONS</p>
         <button class="nav-item" :class="{selected:active==='Agent Runs'}" @click="select('Agent Runs')"><span class="nav-icon">◷</span>Agent Runs</button>
+        <button class="nav-item" :class="{selected:active==='Corpus Operations'}" @click="select('Corpus Operations')"><span class="nav-icon">▤</span>Corpus operations</button>
         <button class="nav-item" :class="{selected:active==='Workflows'}" @click="select('Workflows')"><span class="nav-icon">⇢</span>Workflow diagnostics</button>
       </template>
       <div class="sidebar-bottom"><div class="avatar">{{ currentUser?.name?.slice(0, 2).toUpperCase() || 'YA' }}</div><div><b>{{ currentUser?.name || 'Workspace user' }}</b><small>{{ currentUser?.email || 'Yaandu account' }}</small></div><button class="more" v-if="signedIn" aria-label="Sign out" @click="signOut">⇥</button></div>
@@ -379,6 +381,7 @@ onBeforeUnmount(() => screenshotUrls.value.forEach((screenshot) => URL.revokeObj
         <ConversationWorkspace v-else-if="active === 'Inbox' && signedIn && tenant" :tenant-id="tenant" :focus-conversation-id="focusedConversationId" />
         <PipelineWorkspace v-else-if="active === 'Pipeline' && signedIn && tenant" :tenant-id="tenant" :focus-id="focusedOpportunityId" @open-prospect="openProspect" @open-inbox="openInbox" @open-meetings="select('Meetings')" @open-proposals="select('Proposals')" />
         <MeetingsWorkspace v-else-if="active === 'Meetings' && signedIn && tenant" :tenant-id="tenant" @open-prospect="openProspect" @open-inbox="openInbox" @open-pipeline="openPipeline" />
+        <CorpusOperationsWorkspace v-else-if="active === 'Corpus Operations' && signedIn && tenant && isManager" :tenant-id="tenant" />
         <template v-else-if="active === 'Dashboard'">
           <div class="stats-grid">
             <article class="stat-card"><div class="stat-top"><span>Total companies</span><span class="stat-icon blue">▦</span></div><strong>{{ dashboardSummary.companies }}</strong><small>In your prospecting database</small></article>

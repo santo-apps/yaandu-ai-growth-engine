@@ -2,6 +2,8 @@
 
 namespace App\WebsiteResolution;
 
+use App\Crawling\UrlResolver;
+
 final class WebsiteIdentityPageExtractor
 {
     public function extract(string $html, string $url): array
@@ -28,10 +30,45 @@ final class WebsiteIdentityPageExtractor
         $site = $jsonLd[0] ?? [];
         $site['title'] = $title;
         $site['name'] ??= $h1;
+        $site['name_is_structured'] = isset($jsonLd[0]['name']);
         $site['source_url'] = $url;
         $site['description'] = $this->first('/<meta\b[^>]*name=["\']description["\'][^>]*content=["\']([^"\']*)/is', $html);
         $site['text_excerpt'] = mb_substr(trim(preg_replace('/\\s+/u', ' ', html_entity_decode(strip_tags($html), ENT_QUOTES | ENT_HTML5)) ?? ''), 0, 4000);
+        $site['structured_data'] = array_slice($jsonLd, 0, 10);
         return $site;
+    }
+
+    /** @return list<array{url:string,type:string}> */
+    public function identityLinks(string $html, string $baseUrl): array
+    {
+        $previous = libxml_use_internal_errors(true);
+        try {
+            $document = new \DOMDocument();
+            if (! $document->loadHTML('<?xml encoding="UTF-8">'.$html, LIBXML_NONET | LIBXML_NOERROR | LIBXML_NOWARNING)) return [];
+            $links = [];
+            foreach ($document->getElementsByTagName('a') as $anchor) {
+                $href = trim((string) $anchor->getAttribute('href'));
+                if ($href === '' || str_starts_with($href, '#') || preg_match('/^(?:mailto|tel|javascript):/i', $href)) continue;
+                $label = trim(implode(' ', array_filter([
+                    $anchor->textContent,
+                    $anchor->getAttribute('aria-label'),
+                    $anchor->getAttribute('title'),
+                ])));
+                $normalizedLabel = mb_strtolower(preg_replace('/\s+/u', ' ', $label) ?? '');
+                $type = preg_match('/\b(contact|contact us|get in touch|reach us)\b/u', $normalizedLabel)
+                    ? 'contact'
+                    : (preg_match('/\b(about|about us|our story|who we are|company)\b/u', $normalizedLabel) ? 'about' : null);
+                if ($type === null) continue;
+                try { $url = (new UrlResolver())->resolve($baseUrl, $href); }
+                catch (\Throwable) { continue; }
+                $links[$url] = ['url' => $url, 'type' => $type];
+                if (count($links) >= 12) break;
+            }
+            return array_values($links);
+        } finally {
+            libxml_clear_errors();
+            libxml_use_internal_errors($previous);
+        }
     }
 
     private function first(string $pattern, string $html): ?string

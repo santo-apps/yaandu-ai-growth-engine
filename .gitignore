@@ -28,6 +28,13 @@
 # Local development data and acceptance artifacts
 /yaandu_growth
 /artifacts/local-acceptance/
+/artifacts/common-crawl/
+/storage/app/common-crawl/
+*.warc
+*.warc.gz
+*.wet
+*.wet.gz
+/commoncrawl-checkpoints/
 /tests/Playwright/artifacts/
 /tests/Playwright/screenshots/
 

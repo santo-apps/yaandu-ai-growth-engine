@@ -9,6 +9,7 @@ return [
             'supervisor-default' => ['connection' => 'redis', 'queue' => ['default'], 'balance' => 'auto', 'minProcesses' => 1, 'maxProcesses' => 5, 'tries' => 3, 'timeout' => 240],
             'supervisor-discovery' => ['connection' => 'redis', 'queue' => ['discovery'], 'balance' => 'auto', 'minProcesses' => 1, 'maxProcesses' => 3, 'tries' => 3, 'timeout' => 240],
             'supervisor-crawl' => ['connection' => 'redis', 'queue' => ['crawl'], 'balance' => 'simple', 'processes' => 1, 'tries' => 2, 'timeout' => 390],
+            'supervisor-web-index' => ['connection' => 'redis', 'queue' => ['web-index'], 'balance' => 'simple', 'processes' => min(2, max(1, (int) env('WEBSITE_INDEX_INGESTION_MAX_WORKERS', 1))), 'tries' => 10, 'timeout' => 390],
             'supervisor-intelligence' => ['connection' => 'redis', 'queue' => ['intelligence'], 'balance' => 'auto', 'minProcesses' => 1, 'maxProcesses' => 4, 'tries' => 3, 'timeout' => 240],
             'supervisor-scoring' => ['connection' => 'redis', 'queue' => ['scoring'], 'balance' => 'auto', 'minProcesses' => 1, 'maxProcesses' => 4, 'tries' => 3, 'timeout' => 240],
             'supervisor-campaigns' => ['connection' => 'redis', 'queue' => ['campaigns'], 'balance' => 'auto', 'minProcesses' => 1, 'maxProcesses' => 3, 'tries' => 3, 'timeout' => 120],
@@ -18,6 +19,7 @@ return [
         ],
         'local' => [
             'supervisor-local' => ['connection' => 'redis', 'queue' => ['default', 'discovery', 'crawl', 'intelligence', 'scoring', 'campaigns', 'outbound', 'conversations', 'workflow'], 'balance' => 'simple', 'processes' => 2, 'tries' => 1000, 'timeout' => 390],
+            'supervisor-web-index' => ['connection' => 'redis', 'queue' => ['web-index'], 'balance' => 'simple', 'processes' => 1, 'tries' => 10, 'timeout' => 390],
         ],
     ],
 ];

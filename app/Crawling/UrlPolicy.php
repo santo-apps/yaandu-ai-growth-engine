@@ -49,7 +49,7 @@ final class UrlPolicy
         return [$host, $addresses];
     }
 
-    public function fetch(string $url, ?CrawlBudget $budget = null, ?int $timeoutSeconds = null): Response
+    public function fetch(string $url, ?CrawlBudget $budget = null, ?int $timeoutSeconds = null, array $requestHeaders = []): Response
     {
         $timeoutSeconds = min(30, max(1, min($timeoutSeconds ?? 15, (int) config('crawling.request_timeout_seconds', 15))));
         $initial = $this->normalizeHost($url);
@@ -73,7 +73,7 @@ final class UrlPolicy
                     'stream' => true,
                     'curl' => [CURLOPT_RESOLVE => ["{$resolveHost}:{$port}:{$resolveIp}"]],
                 ])->connectTimeout(min(5, $timeoutSeconds))->timeout($timeoutSeconds)
-                    ->withHeaders(['User-Agent' => 'YaanduGrowthBot/1.0 (+contact: crawler@yaandu.com)'])->get($currentUrl));
+                    ->withHeaders(['User-Agent' => 'YaanduGrowthBot/1.0 (+contact: crawler@yaandu.com)', ...$requestHeaders])->get($currentUrl));
 
             if (! $response->redirect()) {
                 $stream = $response->toPsrResponse()->getBody();

@@ -33,7 +33,11 @@ final class LocalWebIndexResolutionSource implements WebsiteResolutionSourceInte
                 $provenance = ['document_id' => $document->id, 'canonical_url' => $document->canonical_url,
                     'normalized_domain' => $document->normalized_domain, 'source' => $document->source,
                     'source_reference' => $document->source_reference, 'source_timestamp' => $document->source_timestamp,
-                    'indexed_at' => $document->indexed_at, 'content_hash' => $document->content_hash];
+                    'indexed_at' => $document->indexed_at, 'content_hash' => $document->content_hash,
+                    'availability' => $document->availability ?? 'available', 'last_fetched_at' => $document->last_fetched_at ?? $document->indexed_at,
+                    'source_observations' => \Illuminate\Support\Facades\DB::table('web_index_document_sources')->where('document_id', $document->id)
+                        ->orderBy('source')->get(['source', 'source_reference', 'source_query', 'evidence_type', 'source_timestamp', 'first_observed_at', 'last_observed_at'])
+                        ->map(function ($row): array { $row->source_query = is_array($row->source_query) ? $row->source_query : (json_decode((string) $row->source_query, true) ?: []); return (array) $row; })->all()];
                 $evidence = [[
                     'signal' => 'local_index_discovery', 'polarity' => 'neutral', 'points' => 0,
                     'summary' => 'A bounded local index returned this public URL as a discovery candidate; search rank is not identity confidence.',
