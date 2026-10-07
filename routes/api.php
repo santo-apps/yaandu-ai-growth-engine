@@ -79,7 +79,13 @@ Route::prefix('v1')->group(function (): void {
     Route::get('/discovery/runs', [DiscoveryController::class, 'runs']);
     Route::get('/discovery/runs/{run}', [DiscoveryController::class, 'showRun']);
     Route::get('/discovery/candidates', [DiscoveryController::class, 'candidates']);
+    Route::post('/discovery/candidates/bulk-resolve-websites', [DiscoveryController::class, 'bulkResolveWebsites']);
+    Route::post('/discovery/candidates/{candidate}/website-resolution', [DiscoveryController::class, 'resolveWebsite']);
     Route::get('/discovery/candidates/{candidate}', [DiscoveryController::class, 'candidate']);
+    Route::get('/discovery/website-resolutions/metrics', [DiscoveryController::class, 'websiteResolutionMetrics']);
+    Route::get('/discovery/website-resolutions/{resolution}', [DiscoveryController::class, 'websiteResolution']);
+    Route::post('/discovery/website-resolutions/{resolution}/retry', [DiscoveryController::class, 'retryWebsiteResolution']);
+    Route::post('/discovery/website-resolutions/{resolution}/review', [DiscoveryController::class, 'reviewWebsiteResolution']);
     Route::post('/discovery/candidates/bulk-review', [DiscoveryController::class, 'bulkReview']);
     Route::post('/discovery/candidates/{candidate}/review', [DiscoveryController::class, 'review']);
     Route::post('/discovery/import/preview', [DiscoveryController::class, 'previewImport']);

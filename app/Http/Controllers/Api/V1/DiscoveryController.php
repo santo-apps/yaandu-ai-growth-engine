@@ -14,6 +14,8 @@ use App\Jobs\RunAgentJob;
 use App\Jobs\AnalyzeAndScoreDiscoveryCandidateJob;
 use App\Jobs\VerifyDiscoveryCandidateJob;
 use App\Models\Company;
+use App\WebsiteResolution\DirectoryDomainClassifier;
+use App\WebsiteResolution\WebsiteResolutionService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
@@ -132,6 +134,7 @@ final class DiscoveryController extends Controller
             $candidate->lead_score = $score?->score;
             $candidate->score_components = $score ? (is_array($score->components) ? $score->components : json_decode($score->components ?? '{}', true)) : null;
             $candidate->review_ready = $candidate->lifecycle_status === 'reviewable' && $candidate->lead_score !== null;
+            $candidate->website_resolution = DB::table('website_resolutions')->where('tenant_id', $tenant)->where('candidate_id', $candidate->id)->orderByDesc('created_at')->first(['id', 'state', 'score', 'confidence_band', 'failure_code', 'failure_summary']);
             return $candidate;
         });
         return $page;
@@ -159,7 +162,125 @@ final class DiscoveryController extends Controller
         $scores = $company ? DB::table('lead_scores')->where('tenant_id', $tenant)->where('company_id', $company->id)->orderByDesc('scored_at')->limit(5)->get() : collect();
         $sources = DB::table('discovery_candidate_sources')->where('tenant_id', $tenant)->where('candidate_id', $row->id)->orderBy('source')->get()
             ->map(function ($source): object { $source->source_metadata = is_array($source->source_metadata) ? $source->source_metadata : json_decode((string) $source->source_metadata, true); return $source; });
-        return response()->json(['candidate' => $row, 'company' => $company, 'findings' => $intelligence, 'website_issues' => $issues, 'contacts' => $contacts, 'scores' => $scores, 'sources' => $sources]);
+        $resolution = DB::table('website_resolutions')->where('tenant_id', $tenant)->where('candidate_id', $row->id)->orderByDesc('created_at')->first();
+        return response()->json(['candidate' => $row, 'company' => $company, 'findings' => $intelligence, 'website_issues' => $issues, 'contacts' => $contacts, 'scores' => $scores, 'sources' => $sources,
+            'website_resolution' => $resolution ? $this->resolutionPayload($tenant, $resolution) : null]);
+    }
+
+    public function resolveWebsite(Request $request, string $candidate, WebsiteResolutionService $resolutions)
+    {
+        $data = $request->validate(['idempotency_key' => ['required', 'string', 'min:8', 'max:128']]);
+        $resolution = $resolutions->request(app('tenant.id'), $candidate, (int) $request->user()->id, $data['idempotency_key']);
+        $this->audit(app('tenant.id'), $request->user()->id, 'website_resolution_requested', $resolution->id, ['candidate_id' => $candidate]);
+        return response()->json($this->resolutionPayload(app('tenant.id'), $resolution), in_array($resolution->state, ['PENDING', 'SEARCHING'], true) ? 202 : 200);
+    }
+
+    public function bulkResolveWebsites(Request $request, WebsiteResolutionService $resolutions)
+    {
+        $data = $request->validate(['candidate_ids' => ['required', 'array', 'min:1', 'max:'.(int) config('website_resolution.max_businesses_per_request', 10)],
+            'candidate_ids.*' => ['required', 'uuid', 'distinct'], 'idempotency_key' => ['required', 'string', 'min:8', 'max:100']]);
+        $tenant = app('tenant.id');
+        $validCount = DB::table('discovery_candidates')->where('tenant_id', $tenant)->whereIn('id', $data['candidate_ids'])
+            ->whereNull('normalized_domain')->where('verification_state', 'not_required')->count();
+        if ($validCount !== count($data['candidate_ids'])) throw ValidationException::withMessages(['candidate_ids' => ['Select only website-less candidates in this tenant.']]);
+        $result = [];
+        foreach ($data['candidate_ids'] as $candidateId) {
+            $key = substr($data['idempotency_key'].'-'.str_replace('-', '', $candidateId), 0, 128);
+            $result[] = $resolutions->request($tenant, $candidateId, (int) $request->user()->id, $key)->id;
+        }
+        $this->audit($tenant, $request->user()->id, 'website_resolution_bulk_requested', null, ['business_count' => count($result)]);
+        return response()->json(['resolution_ids' => $result, 'business_count' => count($result),
+            'estimated_source_lookups' => count($result) * min(3, (int) config('website_resolution.max_source_lookups_per_business', 3)),
+            'budgets' => ['max_businesses' => (int) config('website_resolution.max_businesses_per_request', 10), 'max_sources_per_business' => (int) config('website_resolution.max_source_lookups_per_business', 3), 'max_domains_per_business' => (int) config('website_resolution.max_candidate_domains_per_business', 5)]], 202);
+    }
+
+    public function websiteResolution(string $resolution)
+    {
+        $tenant = app('tenant.id');
+        $row = DB::table('website_resolutions')->where('tenant_id', $tenant)->where('id', $resolution)->first();
+        abort_unless($row, 404);
+        return response()->json($this->resolutionPayload($tenant, $row));
+    }
+
+    public function retryWebsiteResolution(Request $request, string $resolution, WebsiteResolutionService $resolutions)
+    {
+        $data = $request->validate(['idempotency_key' => ['required', 'string', 'min:8', 'max:128']]);
+        $retry = $resolutions->retry(app('tenant.id'), $resolution, (int) $request->user()->id, $data['idempotency_key']);
+        $this->audit(app('tenant.id'), $request->user()->id, 'website_resolution_retried', $retry->id, ['previous_resolution_id' => $resolution]);
+        return response()->json($this->resolutionPayload(app('tenant.id'), $retry), 202);
+    }
+
+    public function reviewWebsiteResolution(Request $request, string $resolution)
+    {
+        $tenant = app('tenant.id');
+        $data = $request->validate(['action' => ['required', 'in:confirm,reject,mark_unresolved'], 'candidate_id' => ['required_if:action,confirm,reject', 'nullable', 'uuid'], 'reason' => ['nullable', 'string', 'max:500']]);
+        $record = DB::table('website_resolutions')->where('tenant_id', $tenant)->where('id', $resolution)->first();
+        abort_unless($record, 404);
+        $actor = (int) $request->user()->id;
+        if ($data['action'] === 'confirm') {
+            $match = DB::table('website_resolution_candidates')->where('tenant_id', $tenant)->where('resolution_id', $resolution)->where('id', $data['candidate_id'])->first();
+            abort_unless($match && $match->status === 'proposed', 404);
+            if (app(DirectoryDomainClassifier::class)->classify($match->candidate_url)) throw ValidationException::withMessages(['candidate_id' => ['Directory and social pages cannot be confirmed as official websites.']]);
+            $normalized = app(DomainNormalizer::class)->normalize($match->candidate_url);
+            DB::transaction(function () use ($tenant, $record, $match, $normalized, $actor, $resolution): void {
+                DB::table('discovery_candidates')->where('tenant_id', $tenant)->where('id', $record->candidate_id)->update([
+                    'original_url' => $normalized['normalized_url'], 'normalized_domain' => $normalized['normalized_domain'],
+                    'verification_state' => 'pending', 'lifecycle_status' => 'discovered', 'failure_code' => null, 'failure_summary' => null, 'updated_at' => now()]);
+                DB::table('website_resolution_candidates')->where('tenant_id', $tenant)->where('id', $match->id)->update(['status' => 'confirmed', 'reviewed_at' => now(), 'reviewed_by' => $actor, 'updated_at' => now()]);
+                DB::table('website_resolutions')->where('tenant_id', $tenant)->where('id', $resolution)->update([
+                    'state' => 'RESOLVED', 'resolved_candidate_id' => $match->id, 'resolved_domain' => $normalized['normalized_domain'],
+                    'score' => $match->score, 'confidence_band' => $match->confidence_band, 'updated_at' => now()]);
+                $sourceRef = 'resolution:'.$resolution.':'.$match->id;
+                DB::table('discovery_candidate_sources')->insertOrIgnore(['id' => (string) Str::uuid(), 'tenant_id' => $tenant,
+                    'candidate_id' => $record->candidate_id, 'discovery_run_id' => $record->discovery_run_id, 'source' => 'website_resolution',
+                    'source_reference' => $sourceRef, 'source_timestamp' => null, 'discovered_at' => now(),
+                    'source_query' => json_encode(['resolution_id' => $resolution]), 'source_metadata' => json_encode(['domain' => $normalized['normalized_domain'], 'confirmed_by' => $actor]), 'created_at' => now(), 'updated_at' => now()]);
+                VerifyDiscoveryCandidateJob::dispatch($tenant, $record->discovery_run_id, $record->candidate_id)->afterCommit();
+            });
+        } elseif ($data['action'] === 'reject') {
+            $match = DB::table('website_resolution_candidates')->where('tenant_id', $tenant)->where('resolution_id', $resolution)->where('id', $data['candidate_id'])->first();
+            abort_unless($match, 404);
+            DB::table('website_resolution_candidates')->where('tenant_id', $tenant)->where('id', $match->id)->update(['status' => 'rejected', 'reviewed_at' => now(), 'reviewed_by' => $actor, 'updated_at' => now()]);
+            DB::table('website_resolution_evidence')->insertOrIgnore(['id' => (string) Str::uuid(), 'tenant_id' => $tenant, 'resolution_id' => $resolution,
+                'resolution_candidate_id' => $match->id, 'source' => 'human_review', 'signal' => 'human_rejected', 'polarity' => 'negative', 'points' => 0,
+                'evidence_key' => hash('sha256', $resolution.'|'.$match->id.'|human_rejected'), 'source_reference' => 'user:'.$actor,
+                'summary' => mb_substr((string) ($data['reason'] ?? 'Reviewer rejected this candidate as not official.'), 0, 2000), 'details' => json_encode(['actor_id' => $actor]), 'observed_at' => now(), 'created_at' => now(), 'updated_at' => now()]);
+            $remaining = DB::table('website_resolution_candidates')->where('tenant_id', $tenant)->where('resolution_id', $resolution)->where('status', 'proposed')->exists();
+            if (! $remaining) DB::table('website_resolutions')->where('tenant_id', $tenant)->where('id', $resolution)->update(['state' => 'UNRESOLVED', 'failure_code' => 'CANDIDATES_REJECTED', 'failure_summary' => 'The reviewer rejected all candidate websites.', 'updated_at' => now()]);
+        } else {
+            DB::table('website_resolutions')->where('tenant_id', $tenant)->where('id', $resolution)->update(['state' => 'UNRESOLVED', 'failure_code' => 'HUMAN_MARKED_UNRESOLVED', 'failure_summary' => mb_substr((string) ($data['reason'] ?? 'Reviewer marked this business unresolved.'), 0, 500), 'updated_at' => now()]);
+        }
+        $this->audit($tenant, $actor, 'website_resolution_'.$data['action'], $resolution, ['candidate_id' => $data['candidate_id'] ?? null, 'reason' => $data['reason'] ?? null]);
+        return response()->json($this->resolutionPayload($tenant, DB::table('website_resolutions')->where('tenant_id', $tenant)->where('id', $resolution)->first()));
+    }
+
+    public function websiteResolutionMetrics(Request $request)
+    {
+        $tenant = app('tenant.id');
+        $runId = $request->validate(['run_id' => ['required', 'uuid']])['run_id'];
+        abort_unless(DB::table('discovery_runs')->where('tenant_id', $tenant)->where('id', $runId)->exists(), 404);
+        $counts = DB::table('website_resolutions')->where('tenant_id', $tenant)->where('discovery_run_id', $runId)->selectRaw('state, count(*) as total')->groupBy('state')->pluck('total', 'state');
+        return response()->json(['website_less' => DB::table('discovery_candidates')->where('tenant_id', $tenant)->where('discovery_run_id', $runId)->where('verification_state', 'not_required')->count(),
+            'attempted' => DB::table('website_resolutions')->where('tenant_id', $tenant)->where('discovery_run_id', $runId)->whereNotIn('state', ['PENDING'])->count(),
+            'candidate_domains_found' => DB::table('website_resolution_candidates as rc')->join('website_resolutions as r', function ($join) use ($tenant, $runId): void { $join->on('rc.resolution_id', '=', 'r.id')->where('rc.tenant_id', '=', $tenant); })->where('r.tenant_id', $tenant)->where('r.discovery_run_id', $runId)->count(),
+            'resolved' => (int) ($counts['RESOLVED'] ?? 0), 'ambiguous' => (int) ($counts['AMBIGUOUS'] ?? 0), 'unresolved' => (int) ($counts['UNRESOLVED'] ?? 0), 'failed' => (int) ($counts['FAILED'] ?? 0),
+            'verified_after_resolution' => DB::table('website_resolutions as r')->join('discovery_candidates as c', function ($join) use ($tenant): void { $join->on('c.id', '=', 'r.candidate_id')->where('c.tenant_id', '=', $tenant); })->where('r.tenant_id', $tenant)->where('r.discovery_run_id', $runId)->where('r.state', 'RESOLVED')->where('c.verification_state', 'verified')->count(),
+            'eligible_for_analysis' => DB::table('website_resolutions as r')->join('discovery_candidates as c', function ($join) use ($tenant): void { $join->on('c.id', '=', 'r.candidate_id')->where('c.tenant_id', '=', $tenant); })->where('r.tenant_id', $tenant)->where('r.discovery_run_id', $runId)->where('r.state', 'RESOLVED')->where('c.eligible_for_analysis', true)->count()]);
+    }
+
+    private function resolutionPayload(string $tenant, object $resolution): array
+    {
+        $resolution->identity_snapshot = is_array($resolution->identity_snapshot) ? $resolution->identity_snapshot : (json_decode((string) $resolution->identity_snapshot, true) ?: []);
+        $candidates = DB::table('website_resolution_candidates')->where('tenant_id', $tenant)->where('resolution_id', $resolution->id)->orderByDesc('score')->get();
+        foreach ($candidates as $candidate) {
+            $candidate->match_summary = is_array($candidate->match_summary) ? $candidate->match_summary : (json_decode((string) $candidate->match_summary, true) ?: []);
+            $candidate->evidence = DB::table('website_resolution_evidence')->where('tenant_id', $tenant)->where('resolution_candidate_id', $candidate->id)->orderByDesc('points')->get()
+                ->map(function ($evidence): object { $evidence->details = is_array($evidence->details) ? $evidence->details : (json_decode((string) $evidence->details, true) ?: []); return $evidence; });
+        }
+        $attempts = DB::table('website_resolution_attempts')->where('tenant_id', $tenant)->where('resolution_id', $resolution->id)->orderBy('attempt_number')->get()
+            ->map(function ($attempt): object { $attempt->metrics = is_array($attempt->metrics) ? $attempt->metrics : (json_decode((string) $attempt->metrics, true) ?: []); return $attempt; });
+        return ['resolution' => $resolution, 'candidates' => $candidates, 'attempts' => $attempts,
+            'evidence' => DB::table('website_resolution_evidence')->where('tenant_id', $tenant)->where('resolution_id', $resolution->id)->whereNull('resolution_candidate_id')->get()];
     }
 
     public function previewImport(Request $request, DomainNormalizer $domains)

@@ -58,7 +58,7 @@ final class UrlPolicy
         for ($redirects = 0; $redirects <= 3; $redirects++) {
             $budget?->consumeFetch();
             [$host, $ips] = $this->validatePublicHttpUrl($currentUrl);
-            if ($host !== $initial['host']) {
+            if ($host !== $initial['host'] && ! app(PublicSuffixDomainMatcher::class)->sameRegistrableDomain($initial['host'], $host)) {
                 throw new InvalidArgumentException('Cross-domain redirects are not allowed.');
             }
             if ($initial['scheme'] === 'https' && strtolower((string) parse_url($currentUrl, PHP_URL_SCHEME)) !== 'https') {
