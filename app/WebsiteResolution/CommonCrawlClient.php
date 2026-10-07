@@ -7,6 +7,7 @@ use Illuminate\Http\Client\Response;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
 use RuntimeException;
+use App\Crawling\UrlPolicy;
 
 final class CommonCrawlClient
 {
@@ -27,12 +28,45 @@ final class CommonCrawlClient
             foreach (preg_split('/\r?\n/', trim($response->body())) as $line) {
                 $row = json_decode($line, true);
                 if (! is_array($row) || empty($row['url']) || empty($row['timestamp'])) continue;
-                if (strtolower((string) parse_url($row['url'], PHP_URL_HOST)) !== strtolower($domain)
+                $captureHost = strtolower((string) parse_url($row['url'], PHP_URL_HOST));
+                if (($captureHost !== strtolower($domain) && ! app(\App\Crawling\PublicSuffixDomainMatcher::class)->sameRegistrableDomain($captureHost, strtolower($domain)))
                     || (int) ($row['status'] ?? 0) !== 200 || ! str_contains(strtolower((string) ($row['mime'] ?? '')), 'html')) continue;
-                $rows[] = ['url' => (string) $row['url'], 'timestamp' => (string) $row['timestamp'], 'mime' => (string) ($row['mime'] ?? ''), 'status' => (int) ($row['status'] ?? 0)];
+                $filename = (string) ($row['filename'] ?? '');
+                $offset = filter_var($row['offset'] ?? null, FILTER_VALIDATE_INT);
+                $length = filter_var($row['length'] ?? null, FILTER_VALIDATE_INT);
+                if (! preg_match('#^/crawl-data/CC-MAIN-[0-9-]+/segments/[A-Za-z0-9._/-]+\.warc\.gz$#', $filename)
+                    || str_contains($filename, '..') || $offset === false || $offset < 0 || $length === false || $length < 1 || $length > (int) config('website_resolution.common_crawl_max_capture_bytes', 1_000_000)) continue;
+                $rows[] = ['url' => (string) $row['url'], 'timestamp' => (string) $row['timestamp'], 'mime' => (string) ($row['mime'] ?? ''), 'status' => (int) $row['status'],
+                    'filename' => $filename, 'offset' => $offset, 'length' => $length];
             }
             return array_slice($rows, 0, (int) config('website_resolution.common_crawl_records_per_domain', 2));
         });
+    }
+
+    public function fetchCapture(array $capture, UrlPolicy $policy): string
+    {
+        $filename = (string) ($capture['filename'] ?? '');
+        $offset = filter_var($capture['offset'] ?? null, FILTER_VALIDATE_INT);
+        $length = filter_var($capture['length'] ?? null, FILTER_VALIDATE_INT);
+        $limit = min(1_000_000, max(1024, (int) config('website_resolution.common_crawl_max_capture_bytes', 1_000_000)));
+        if (! preg_match('#^/crawl-data/CC-MAIN-[0-9-]+/segments/[A-Za-z0-9._/-]+\.warc\.gz$#', $filename)
+            || str_contains($filename, '..') || $offset === false || $offset < 0 || $length === false || $length < 1 || $length > $limit || $offset > PHP_INT_MAX - $length) {
+            throw new RuntimeException('Common Crawl capture metadata was rejected.');
+        }
+        $end = $offset + $length - 1;
+        $response = $policy->fetch('https://data.commoncrawl.org'.$filename, timeoutSeconds: 20, requestHeaders: ['Range' => "bytes={$offset}-{$end}"]);
+        if ($response->status() !== 206 || strlen($response->body()) > $limit) throw new RuntimeException('Common Crawl capture response was unavailable or oversized.');
+        $record = @gzdecode($response->body(), $limit);
+        if (! is_string($record) || strlen($record) > $limit) throw new RuntimeException('Common Crawl WARC record could not be decoded within its limit.');
+        $warcHeaderEnd = strpos($record, "\r\n\r\n");
+        if ($warcHeaderEnd === false) throw new RuntimeException('Common Crawl WARC record header was invalid.');
+        $payload = substr($record, $warcHeaderEnd + 4);
+        $httpHeaderEnd = strpos($payload, "\r\n\r\n");
+        if ($httpHeaderEnd === false) throw new RuntimeException('Common Crawl HTTP payload was invalid.');
+        $httpHeaders = substr($payload, 0, $httpHeaderEnd);
+        if (! preg_match('/^HTTP\/\d(?:\.\d)?\s+2\d\d\b/m', $httpHeaders)
+            || ! preg_match('/^content-type:\s*text\/html\b/im', $httpHeaders)) throw new RuntimeException('Common Crawl payload is not a successful HTML page.');
+        return substr($payload, $httpHeaderEnd + 4, $limit);
     }
 
     private function collection(): string

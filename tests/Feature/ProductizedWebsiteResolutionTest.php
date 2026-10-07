@@ -307,7 +307,7 @@ class ProductizedWebsiteResolutionTest extends TestCase
         $source = new class($records) implements WebIndexIngestionSourceInterface {
             public function __construct(private array $rows) {}
             public function name(): string { return 'test_fixture'; }
-            public function documents(int $limit): iterable { yield from array_slice($this->rows, 0, $limit); }
+            public function documents(int $limit, array $options = [], ?array $cursor = null): iterable { yield from array_slice($this->rows, 0, $limit); }
             public function metrics(): array { return []; }
         };
         return app(LocalWebIndexIngestionService::class)->ingest($source, 50);

@@ -10,8 +10,14 @@ final class WikidataClient
 {
     public function officialWebsites(string $entityId): array
     {
+        return array_column($this->officialWebsiteEntities($entityId), 'url');
+    }
+
+    /** @return list<array{entity_id:string,label:?string,url:string}> */
+    public function officialWebsiteEntities(string $entityId): array
+    {
         if (! preg_match('/^Q[1-9][0-9]{0,11}$/', $entityId)) return [];
-        $cacheKey = 'website-resolution:wikidata:'.strtolower($entityId);
+        $cacheKey = 'website-resolution:wikidata:v2:'.strtolower($entityId);
         return Cache::remember($cacheKey, max(3600, (int) config('website_resolution.wikidata_cache_seconds', 604800)), function () use ($entityId): array {
             $response = Http::acceptJson()->withHeaders(['User-Agent' => (string) config('website_resolution.user_agent')])
                 ->connectTimeout(3)->timeout(8)->get('https://www.wikidata.org/w/api.php', [
@@ -20,12 +26,13 @@ final class WikidataClient
             if (! $response->successful() || strlen($response->body()) > 512_000) throw new RuntimeException('Wikidata source unavailable.');
             $entity = $response->json('entities.'.$entityId);
             $claims = (array) ($entity['claims'] ?? []);
+            $label = $entity['labels']['en']['value'] ?? null;
             $urls = [];
             foreach ((array) ($claims['P856'] ?? []) as $claim) {
                 $url = $claim['mainsnak']['datavalue']['value'] ?? null;
-                if (is_string($url) && $url !== '') $urls[] = $url;
+                if (is_string($url) && $url !== '') $urls[] = ['entity_id' => $entityId, 'label' => is_string($label) ? mb_substr($label, 0, 255) : null, 'url' => $url];
             }
-            return array_slice(array_values(array_unique($urls)), 0, 3);
+            return array_slice(array_values(collect($urls)->unique('url')->all()), 0, 3);
         });
     }
 }

@@ -22,6 +22,7 @@ use App\Http\Controllers\Api\V1\FollowUpRecommendationController;
 use App\Http\Controllers\Api\V1\MarketingConfigurationController;
 use App\Http\Controllers\Api\V1\SalesController;
 use App\Http\Controllers\Api\V1\LocalAcceptanceController;
+use App\Http\Controllers\Api\V1\WebIndexOperationsController;
 use App\Http\Middleware\ResolveTenant;
 use Illuminate\Support\Facades\Route;
 
@@ -44,6 +45,8 @@ Route::prefix('v1')->group(function (): void {
     Route::post('/websites/{website}/scan', [CompanyController::class, 'scan']);
     Route::get('/agent-runs', [AgentRunController::class, 'index']);
     Route::get('/agent-runs/{id}', [AgentRunController::class, 'show']);
+    Route::get('/operations/web-index', [WebIndexOperationsController::class, 'overview'])->middleware('throttle:60,1');
+    Route::post('/operations/web-index/runs', [WebIndexOperationsController::class, 'start'])->middleware('throttle:10,1');
     Route::get('/automation/summary', [OrchestrationController::class, 'summary']);
     Route::get('/automation/workflows', [OrchestrationController::class, 'index']);
     Route::post('/automation/workflows', [OrchestrationController::class, 'store']);
