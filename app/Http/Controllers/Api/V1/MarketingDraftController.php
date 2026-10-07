@@ -50,6 +50,7 @@ final class MarketingDraftController extends Controller
     {
         $key=substr((string)$request->header('Idempotency-Key',''),0,128);
         abort_if($key==='',422,'An Idempotency-Key header is required.');
+        abort_unless(DB::table('companies')->where('tenant_id', app('tenant.id'))->where('id', $input['company_id'])->where('status', '!=', 'discovery_candidate')->exists(), 404);
         $alreadyExists = DB::table('marketing_drafts')->where('tenant_id', app('tenant.id'))->where('idempotency_key', $key)->exists();
         $command = new GenerateMarketingDraftCommand(tenantId: app('tenant.id'), companyId: $input['company_id'], contactId: $input['contact_id'] ?? null,
             campaignId: $input['campaign_id'] ?? null, campaignObjective: $input['campaign_objective'] ?? null, actorId: (string) $request->user()->id,

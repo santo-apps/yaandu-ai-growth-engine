@@ -160,7 +160,7 @@ final class PhaseTwoBMarketingTest extends TestCase
     {
         [$tenant,$owner]=$this->workspace('marketing-isolation');[$other,$otherOwner,$otherCompany]=$this->workspace('marketing-other-company');
         $this->prompt($tenant->id,'MarketingAgent');$this->router(new StaticAIProvider([]));Sanctum::actingAs($owner);
-        $this->withHeaders(['X-Tenant-ID'=>$tenant->id,'Idempotency-Key'=>'cross-tenant-company'])->postJson('/api/v1/marketing-drafts',['company_id'=>$otherCompany->id])->assertUnprocessable();
+        $this->withHeaders(['X-Tenant-ID'=>$tenant->id,'Idempotency-Key'=>'cross-tenant-company'])->postJson('/api/v1/marketing-drafts',['company_id'=>$otherCompany->id])->assertNotFound();
         $this->assertDatabaseCount('marketing_drafts',0);
         $company=Company::create(['tenant_id'=>$tenant->id,'name'=>'Local Co','normalized_domain'=>'local.test','status'=>'new']);
         $this->router(new StaticAIProvider(['subject'=>'Hello','message'=>'A note','reasoning_summary'=>'Generic.','personalization_points'=>[],

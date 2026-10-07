@@ -3,6 +3,7 @@
 namespace App\Jobs;
 
 use App\Agents\AgentOrchestrator;
+use App\Jobs\RunAgentJob;
 use App\Crawling\CrawlerService;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldBeUnique;
@@ -20,7 +21,7 @@ class ScanWebsiteJob implements ShouldQueue, ShouldBeUnique
     public int $timeout = 360;
     public int $uniqueFor = 600;
 
-    public function __construct(public string $tenantId, public string $websiteId, public string $scanId, public string $runId, public ?string $actorId)
+    public function __construct(public string $tenantId, public string $websiteId, public string $scanId, public string $runId, public ?string $actorId, public bool $scoreAfterScan = false, public ?int $maxBrowserRenders = null)
     { $this->onQueue('crawl'); }
 
     public function uniqueId(): string { return $this->tenantId.':'.$this->scanId; }
@@ -30,8 +31,20 @@ class ScanWebsiteJob implements ShouldQueue, ShouldBeUnique
         $run = DB::table('agent_runs')->where('id', $this->runId)->where('tenant_id', $this->tenantId)->first();
         if (! $run || $run->status === 'succeeded' || $run->status === 'cancelled') return;
 
-        $crawler->crawl($this->tenantId, $this->websiteId, existingScanId: $this->scanId);
+        $crawler->crawl($this->tenantId, $this->websiteId, existingScanId: $this->scanId, maxBrowserRenders: $this->maxBrowserRenders);
         $agents->run('WebsiteIntelligenceAgent', $this->tenantId, ['website_scan_id' => $this->scanId], $this->actorId, $this->runId);
+        if ($this->scoreAfterScan) {
+            $companyId = DB::table('company_websites')->where('tenant_id', $this->tenantId)->where('id', $this->websiteId)->value('company_id');
+            if ($companyId) {
+                $scoreRunId = (string) Str::uuid();
+                $input = ['company_id' => $companyId];
+                DB::table('agent_runs')->insertOrIgnore(['id' => $scoreRunId, 'tenant_id' => $this->tenantId, 'agent_key' => 'LeadScoringAgent', 'status' => 'queued',
+                    'requested_by' => $this->actorId, 'input_hash' => hash('sha256', json_encode($input)), 'idempotency_key' => 'discovery-score:'.$this->scanId,
+                    'correlation_id' => (string) Str::uuid(), 'created_at' => now(), 'updated_at' => now()]);
+                $scoreRunId = DB::table('agent_runs')->where('tenant_id', $this->tenantId)->where('idempotency_key', 'discovery-score:'.$this->scanId)->value('id') ?: $scoreRunId;
+                RunAgentJob::dispatch($this->tenantId, 'LeadScoringAgent', $input, $this->actorId, $scoreRunId)->afterCommit();
+            }
+        }
     }
 
     public function failed(?\Throwable $exception): void

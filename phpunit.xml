@@ -2,5 +2,5 @@
 <phpunit xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="https://schema.phpunit.de/11.0/phpunit.xsd" bootstrap="vendor/autoload.php" colors="true">
   <testsuites><testsuite name="Unit"><directory>tests/Unit</directory></testsuite><testsuite name="Feature"><directory>tests/Feature</directory></testsuite></testsuites>
   <source><include><directory>app</directory></include></source>
-  <php><env name="APP_ENV" value="testing"/><env name="AI_DETERMINISTIC_ENABLED" value="true"/><env name="CACHE_STORE" value="array"/><env name="DB_CONNECTION" value="sqlite"/><env name="DB_DATABASE" value=":memory:"/><env name="QUEUE_CONNECTION" value="sync"/><env name="SESSION_DRIVER" value="array"/></php>
+  <php><env name="APP_ENV" value="testing"/><env name="AI_DETERMINISTIC_ENABLED" value="true"/><env name="DISCOVERY_ALLOW_DETERMINISTIC" value="true"/><env name="CACHE_STORE" value="array"/><env name="DB_CONNECTION" value="sqlite"/><env name="DB_DATABASE" value=":memory:"/><env name="QUEUE_CONNECTION" value="sync"/><env name="SESSION_DRIVER" value="array"/></php>
 </phpunit>

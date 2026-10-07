@@ -30,7 +30,7 @@ class AgentRunController extends Controller
 
     public function scoreCompany(Request $request, string $company)
     {
-        $company = Company::where('tenant_id', app('tenant.id'))->findOrFail($company);
+        $company = Company::where('tenant_id', app('tenant.id'))->where('status', '!=', 'discovery_candidate')->findOrFail($company);
 
         return $this->dispatch($request, 'LeadScoringAgent', ['company_id' => $company->id]);
     }

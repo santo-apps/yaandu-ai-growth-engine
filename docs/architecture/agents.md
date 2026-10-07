@@ -32,7 +32,7 @@ interface AgentInterface
 
 ### DiscoveryAgent
 
-Input: tenant-scoped discovery query, target geography/industry filters, permitted seed sources, and result limits. Output: normalized company candidates and source evidence. It uses registered discovery source adapters and deduplication services; it does not scrape arbitrary search results or bypass source restrictions. Candidate creation is idempotent and records source and observation time.
+Input: tenant-scoped discovery query, target geography/industry filters, permitted seed sources, and result limits. Output: normalized candidate records and source evidence. It uses registered discovery source adapters and deduplication services; it does not scrape arbitrary search results or bypass source restrictions. Candidate creation is idempotent and records source and observation time. Sprint 2 adapters are supplied seeds, confirmed user CSV/domain import, and an explicitly local/test-only fictional source. Verification is queued separately; acceptance reuses existing website intelligence and scoring workflows.
 
 ### WebsiteIntelligenceAgent
 

@@ -48,7 +48,7 @@ Controllers validate/authorize and delegate to application services. Jobs invoke
 
 ## Request and data flow
 
-1. An authenticated user selects a tenant-scoped discovery request or imports a permitted company seed.
+1. An authenticated user starts a tenant-scoped discovery search, supplies seed companies, or previews and confirms a CSV/domain import. Discovery persists reviewable candidates before promoting them to companies.
 2. Laravel validates the request and creates an `agent_runs` record, then dispatches a queued DiscoveryAgent run.
 3. Discovery stores normalized companies and candidate websites with provenance. The crawler applies URL policy and robots/sitemap rules, saves raw response metadata and artifacts, and creates a scan.
 4. WebsiteIntelligenceAgent receives bounded, sanitized page evidence. It stores interpretations and issue evidence separately from raw page data.

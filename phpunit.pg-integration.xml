@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<phpunit xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="https://schema.phpunit.de/11.0/phpunit.xsd" bootstrap="vendor/autoload.php" colors="true">
+  <testsuites><testsuite name="PostgreSQL and Redis Integration"><directory>tests/Integration</directory></testsuite></testsuites>
+  <source><include><directory>app</directory></include></source>
+  <php>
+    <env name="APP_ENV" value="testing"/>
+    <env name="DB_CONNECTION" value="pgsql"/>
+    <env name="QUEUE_CONNECTION" value="redis"/>
+    <env name="CACHE_STORE" value="redis"/>
+    <env name="SESSION_DRIVER" value="array"/>
+    <env name="DISCOVERY_ALLOW_DETERMINISTIC" value="true"/>
+    <env name="AI_DETERMINISTIC_ENABLED" value="true"/>
+    <env name="YAANDU_POSTGRES_REDIS_INTEGRATION" value="false"/>
+  </php>
+</phpunit>

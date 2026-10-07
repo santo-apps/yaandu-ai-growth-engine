@@ -40,16 +40,18 @@ final class DeterministicAIProvider implements AIProviderInterface
         $page = $request->evidence[0] ?? [];
         $url = (string) ($page['url'] ?? 'https://northstar-retail.fixture.test');
         $text = (string) ($page['text'] ?? '');
-        $excerpt = static fn (string $needle): string => stripos($text, $needle) !== false ? $needle : mb_substr($text, 0, 100);
+        $issues = [];
+        if (stripos($text, 'older storefront layout') !== false) {
+            $issues[] = ['type' => 'outdated_website', 'summary' => 'The site describes an older storefront layout.', 'source_url' => $url, 'evidence' => 'older storefront layout', 'severity' => 'high', 'confidence' => 0.94];
+        }
+        if (stripos($text, 'mobile navigation is difficult') !== false) {
+            $issues[] = ['type' => 'poor_mobile_ux', 'summary' => 'The page describes difficult mobile navigation.', 'source_url' => $url, 'evidence' => 'Mobile navigation is difficult', 'severity' => 'medium', 'confidence' => 0.92];
+        }
+        $insights = stripos($text, 'retail ecommerce business') !== false
+            ? [['statement' => 'The page identifies a retail ecommerce business.', 'kind' => 'business_fit', 'source_url' => $url, 'evidence' => 'Fictional retail ecommerce business', 'confidence' => 0.93]] : [];
 
-        return ['summary' => 'Fictional retail and ecommerce business with an outdated site and weak mobile experience.',
-            'issues' => [
-                ['type' => 'outdated_website', 'summary' => 'The public site uses an older storefront layout.', 'source_url' => $url, 'evidence' => $excerpt('older storefront layout'), 'severity' => 'high', 'confidence' => 0.94],
-                ['type' => 'poor_mobile_ux', 'summary' => 'The mobile experience is difficult to navigate.', 'source_url' => $url, 'evidence' => $excerpt('mobile navigation is difficult'), 'severity' => 'medium', 'confidence' => 0.92],
-            ],
-            'technologies' => [],
-            'insights' => [['statement' => 'Northstar operates a retail ecommerce business and could benefit from a clearer mobile buying journey.', 'kind' => 'business_fit', 'source_url' => $url, 'evidence' => $excerpt('retail ecommerce business'), 'confidence' => 0.93]],
-            'contacts' => []];
+        return ['summary' => 'Local deterministic analysis based only on the supplied fictional page evidence.',
+            'issues' => $issues, 'technologies' => [], 'insights' => $insights, 'contacts' => []];
     }
 
     private function marketing(AIRequest $request): array

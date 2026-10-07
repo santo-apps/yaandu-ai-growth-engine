@@ -36,7 +36,7 @@ final class PublicContactExtractor
                     ? Storage::disk(config('filesystems.default'))->get($page->object_key)
                     : (string) $page->extracted_text;
                 $visibleText = html_entity_decode(strip_tags(preg_replace('#<(script|style|noscript)\b[^>]*>.*?</\1>#is', ' ', $html) ?? $html));
-                $methods = [...$this->emails($html, $visibleText), ...$this->phones($html, $visibleText)];
+                $methods = [...$this->emails($html, $visibleText), ...$this->phones($html, $visibleText), ...$this->socialProfiles($html)];
 
                 foreach ($methods as $method) {
                     $existing = DB::table('contact_methods as methods')
@@ -56,7 +56,7 @@ final class PublicContactExtractor
                     ]);
                     DB::table('contact_methods')->insert([
                         'id' => (string) Str::uuid(), 'tenant_id' => $tenantId, 'contact_id' => $contactId,
-                        'type' => $method['type'], 'value' => $this->values->encrypt($method['value']),
+                        'type' => $method['type'], 'classification' => $method['classification'], 'value' => $this->values->encrypt($method['value']),
                         'value_hash' => $this->values->fingerprint($method['type'], $method['value']), 'source_url' => $sourceUrl,
                         'observed_at' => $observedAt, 'extraction_method' => $method['method'],
                         'confidence' => $method['confidence'], 'verification_status' => 'unverified',
@@ -78,7 +78,14 @@ final class PublicContactExtractor
         foreach ([...($mailto[1] ?? []), ...($visible[0] ?? [])] as $candidate) {
             $email = mb_strtolower(trim(rawurldecode(explode('?', $candidate)[0]), " \t\n\r\0\x0B.,;:()<>[]{}\"'"));
             if (! filter_var($email, FILTER_VALIDATE_EMAIL) || preg_match('/\.(png|jpe?g|gif|svg|webp)$/i', $email)) continue;
-            $emails[$email] = ['type' => 'email', 'value' => $email,
+            $local = explode('@', $email)[0];
+            $classification = match (true) {
+                in_array($local, ['sales', 'business', 'commercial'], true) => 'sales_email',
+                in_array($local, ['support', 'help', 'service'], true) => 'support_email',
+                in_array($local, ['info', 'hello', 'contact', 'office', 'admin', 'general'], true) => 'generic_business_email',
+                default => 'public_business_email',
+            };
+            $emails[$email] = ['type' => 'email', 'classification' => $classification, 'value' => $email,
                 'method' => str_contains(mb_strtolower($html), 'mailto:'.$email) ? 'public_mailto_or_page_text' : 'public_page_text',
                 'confidence' => str_contains(mb_strtolower($html), 'mailto:'.$email) ? 0.98 : 0.9];
         }
@@ -95,10 +102,30 @@ final class PublicContactExtractor
             $digits = preg_replace('/\D/', '', $value) ?? '';
             if (strlen($digits) < 8 || strlen($digits) > 15) continue;
             $normalized = (str_starts_with($value, '+') ? '+' : '').$digits;
-            $phones[$normalized] = ['type' => 'phone', 'value' => $value,
+            $phones[$normalized] = ['type' => 'phone', 'classification' => 'business_phone', 'value' => $value,
                 'method' => str_starts_with(mb_strtolower($candidate), 'tel:') ? 'public_tel_link' : 'public_page_text',
                 'confidence' => str_starts_with(mb_strtolower($candidate), 'tel:') ? 0.98 : 0.82];
         }
         return array_values($phones);
+    }
+
+    private function socialProfiles(string $html): array
+    {
+        preg_match_all("~<a\\b[^>]*href=[\"']([^\"']+)[\"'][^>]*>~i", $html, $matches);
+        $allowed = ['linkedin.com' => 'linkedin_company_profile', 'facebook.com' => 'facebook_company_profile', 'instagram.com' => 'instagram_company_profile', 'x.com' => 'public_social_profile', 'twitter.com' => 'public_social_profile'];
+        $profiles = [];
+        foreach ($matches[1] ?? [] as $href) {
+            $url = html_entity_decode(trim($href));
+            $parts = parse_url($url);
+            $host = strtolower($parts['host'] ?? '');
+            $classification = null;
+            foreach ($allowed as $domain => $kind) if ($host === $domain || str_ends_with($host, '.'.$domain)) { $classification = $kind; break; }
+            if (! $classification || ! in_array(strtolower($parts['scheme'] ?? ''), ['http', 'https'], true) || isset($parts['user']) || isset($parts['pass'])) continue;
+            $path = trim($parts['path'] ?? '', '/');
+            if ($path === '' || str_starts_with(strtolower($path), 'intent/')) continue;
+            $canonical = strtolower($parts['scheme']).'://'.$host.'/'.$path;
+            $profiles[$canonical] = ['type' => 'social_profile', 'classification' => $classification, 'value' => $canonical, 'method' => 'public_company_website_link', 'confidence' => 0.9];
+        }
+        return array_values($profiles);
     }
 }
