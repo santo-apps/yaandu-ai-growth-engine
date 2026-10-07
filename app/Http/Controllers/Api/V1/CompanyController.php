@@ -17,7 +17,7 @@ class CompanyController extends Controller
 {
     public function index(Request $request)
     {
-        return Company::query()->with('websites')->where('tenant_id', app('tenant.id'))
+        return Company::query()->with('websites')->where('tenant_id', app('tenant.id'))->where('status', '!=', 'discovery_candidate')
             ->when($request->string('search')->isNotEmpty(), fn ($q) => $q->whereRaw('lower(name) like ?', ['%'.mb_strtolower($request->string('search')->toString()).'%']))
             ->orderBy('name')->paginate(25);
     }
@@ -28,11 +28,12 @@ class CompanyController extends Controller
         $latestScores = DB::table('lead_scores')->where('tenant_id', $tenantId)->select('company_id', DB::raw('max(scored_at) as scored_at'))->groupBy('company_id');
 
         return response()->json([
-            'companies' => DB::table('companies')->where('tenant_id', $tenantId)->count(),
+            'companies' => DB::table('companies')->where('tenant_id', $tenantId)->where('status', '!=', 'discovery_candidate')->count(),
             'completed_scans' => DB::table('website_scans')->where('tenant_id', $tenantId)->where('status', 'completed')->count(),
             'qualified_leads' => DB::table('lead_scores as scores')->joinSub($latestScores, 'latest', function ($join): void {
                 $join->on('scores.company_id', '=', 'latest.company_id')->on('scores.scored_at', '=', 'latest.scored_at');
-            })->where('scores.tenant_id', $tenantId)->where('scores.score', '>=', 70)->distinct('scores.company_id')->count('scores.company_id'),
+            })->join('companies', function ($join) use ($tenantId): void { $join->on('companies.id', '=', 'scores.company_id')->where('companies.tenant_id', '=', $tenantId)->where('companies.status', '!=', 'discovery_candidate'); })
+                ->where('scores.tenant_id', $tenantId)->where('scores.score', '>=', 70)->distinct('scores.company_id')->count('scores.company_id'),
             'active_runs' => DB::table('agent_runs')->where('tenant_id', $tenantId)->whereIn('status', ['queued', 'running'])->count(),
             'meetings_requested' => DB::table('scheduling_requests')->where('tenant_id', $tenantId)->count(),
             'meetings_booked' => DB::table('meeting_bookings')->where('tenant_id', $tenantId)->where('status', 'SCHEDULED')->count(),
@@ -44,7 +45,7 @@ class CompanyController extends Controller
     {
         $tenantId = app('tenant.id');
         $contacts = DB::table('contacts')->join('companies', function ($join) use ($tenantId): void {
-            $join->on('companies.id', '=', 'contacts.company_id')->where('companies.tenant_id', '=', $tenantId);
+            $join->on('companies.id', '=', 'contacts.company_id')->where('companies.tenant_id', '=', $tenantId)->where('companies.status', '!=', 'discovery_candidate');
         })->where('contacts.tenant_id', $tenantId)
             ->when($request->filled('company_id'), fn ($query) => $query->where('contacts.company_id', $request->string('company_id')->toString()))
             ->select('contacts.*', 'companies.name as company_name')
@@ -67,7 +68,7 @@ class CompanyController extends Controller
     public function scores(Request $request)
     {
         return DB::table('lead_scores')->join('companies', function ($join): void {
-            $join->on('companies.id', '=', 'lead_scores.company_id')->on('companies.tenant_id', '=', 'lead_scores.tenant_id');
+            $join->on('companies.id', '=', 'lead_scores.company_id')->on('companies.tenant_id', '=', 'lead_scores.tenant_id')->where('companies.status', '!=', 'discovery_candidate');
         })->where('lead_scores.tenant_id', app('tenant.id'))
             ->when($request->filled('company_id'), fn ($query) => $query->where('lead_scores.company_id', $request->string('company_id')->toString()))
             ->select('lead_scores.*', 'companies.name as company_name', 'companies.normalized_domain')
@@ -79,6 +80,9 @@ class CompanyController extends Controller
         $data = $request->validate(['name' => ['required', 'string', 'max:255'], 'website' => ['nullable', 'url:http,https', 'max:2048'], 'industry' => ['nullable', 'string', 'max:150'], 'location' => ['nullable', 'string', 'max:255'], 'description' => ['nullable', 'string', 'max:5000']]);
         $tenantId = app('tenant.id');
         $domain = isset($data['website']) ? strtolower((string) parse_url($data['website'], PHP_URL_HOST)) : null;
+        if ($domain && DB::table('companies')->where('tenant_id', $tenantId)->where('normalized_domain', $domain)->where('status', 'discovery_candidate')->exists()) {
+            return response()->json(['message' => 'This domain is currently awaiting discovery review.'], 409);
+        }
         $company = Company::firstOrCreate(['tenant_id' => $tenantId, 'normalized_domain' => $domain], [
             'id' => (string) Str::uuid(), 'name' => $data['name'], 'industry' => $data['industry'] ?? null,
             'location' => $data['location'] ?? null, 'description' => $data['description'] ?? null, 'source' => 'manual', 'status' => 'new',
@@ -89,13 +93,13 @@ class CompanyController extends Controller
 
     public function show(string $company)
     {
-        return Company::where('tenant_id', app('tenant.id'))->with(['websites'])->findOrFail($company);
+        return Company::where('tenant_id', app('tenant.id'))->where('status', '!=', 'discovery_candidate')->with(['websites'])->findOrFail($company);
     }
 
     public function intelligence(string $company)
     {
         $tenantId = app('tenant.id');
-        $record = Company::where('tenant_id', $tenantId)->with('websites')->findOrFail($company);
+        $record = Company::where('tenant_id', $tenantId)->where('status', '!=', 'discovery_candidate')->with('websites')->findOrFail($company);
         $scan = DB::table('website_scans as scans')
             ->join('company_websites as websites', 'websites.id', '=', 'scans.company_website_id')
             ->where('scans.tenant_id', $tenantId)

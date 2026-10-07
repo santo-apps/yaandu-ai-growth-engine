@@ -22,7 +22,7 @@ class OpportunityController extends Controller
         $data = $request->validate(['company_id' => ['required', 'uuid'], 'stage' => ['sometimes', 'in:NEW,ENGAGED,DISCOVERY,QUALIFIED,MEETING_READY,PROPOSAL_READY,CLOSED,NOT_QUALIFIED'],
             'qualification' => ['sometimes', 'array']]);
         $tenantId = app('tenant.id');
-        abort_unless(DB::table('companies')->where('tenant_id', $tenantId)->where('id', $data['company_id'])->exists(), 404);
+        abort_unless(DB::table('companies')->where('tenant_id', $tenantId)->where('id', $data['company_id'])->where('status', '!=', 'discovery_candidate')->exists(), 404);
         $opportunity = SalesOpportunity::create(['tenant_id' => $tenantId, 'company_id' => $data['company_id'],
             'owner_user_id' => $request->user()->id, 'stage' => $data['stage'] ?? 'NEW', 'status' => 'open',
             'qualification' => $data['qualification'] ?? []]);

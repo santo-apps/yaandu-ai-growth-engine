@@ -98,7 +98,7 @@ class PhaseOneRemediationTest extends TestCase
         $tenantA = $this->tenant('discovery-a');
         $tenantB = $this->tenant('discovery-b');
         $this->app->instance(PublicAddressResolverInterface::class, $this->publicResolver());
-        $agent = new DiscoveryAgent(app(UrlPolicy::class));
+        $agent = new DiscoveryAgent(app(UrlPolicy::class), app(\App\Discovery\DomainNormalizer::class), app(\App\Discovery\DiscoverySourceRegistry::class), app(\App\Discovery\DiscoveryCandidateService::class));
         $orchestrator = new AgentOrchestrator([$agent]);
         $input = ['candidates' => [
             ['name' => 'Example Ltd', 'website' => 'https://example.test/', 'source' => 'seed'],

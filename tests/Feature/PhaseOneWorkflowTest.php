@@ -168,20 +168,23 @@ class PhaseOneWorkflowTest extends TestCase
             'status' => 'completed', 'max_depth' => 1, 'max_pages' => 5, 'created_at' => now(), 'updated_at' => now()]);
         $key = "tenants/{$tenant->id}/crawls/{$scanId}/page.html";
         Storage::fake('local');
-        Storage::disk('local')->put($key, '<a href="mailto:sales@public.test">Sales</a><a href="tel:+1-555-123-4567">Call us</a>');
+        Storage::disk('local')->put($key, '<a href="mailto:sales@public.test">Sales</a><a href="tel:+1-555-123-4567">Call us</a><a href="https://www.linkedin.com/company/public-company">Company LinkedIn</a>');
         DB::table('website_pages')->insert(['id' => (string) Str::uuid(), 'tenant_id' => $tenant->id, 'website_scan_id' => $scanId,
             'requested_url' => 'https://public.test/contact', 'final_url' => 'https://public.test/contact', 'object_key' => $key,
             'extracted_text' => 'Sales Call us', 'depth' => 1, 'created_at' => now(), 'updated_at' => now()]);
 
         $extractor = app(PublicContactExtractor::class);
-        self::assertSame(2, $extractor->extract($tenant->id, $scanId));
+        self::assertSame(3, $extractor->extract($tenant->id, $scanId));
         self::assertSame(0, $extractor->extract($tenant->id, $scanId));
-        $this->assertDatabaseCount('contacts', 2);
+        $this->assertDatabaseCount('contacts', 3);
         $storedEmail = DB::table('contact_methods')->where('tenant_id', $tenant->id)->where('type', 'email')->first();
         self::assertNotSame('sales@public.test', $storedEmail->value);
         self::assertSame('sales@public.test', app(ContactMethodValue::class)->decrypt($storedEmail->value));
         self::assertSame(app(ContactMethodValue::class)->fingerprint('email', 'sales@public.test'), $storedEmail->value_hash);
         $this->assertDatabaseHas('contact_methods', ['tenant_id' => $tenant->id, 'type' => 'phone', 'source_url' => 'https://public.test/contact']);
+        $this->assertDatabaseHas('contact_methods', ['tenant_id' => $tenant->id, 'type' => 'email', 'classification' => 'sales_email']);
+        $this->assertDatabaseHas('contact_methods', ['tenant_id' => $tenant->id, 'type' => 'phone', 'classification' => 'business_phone']);
+        $this->assertDatabaseHas('contact_methods', ['tenant_id' => $tenant->id, 'type' => 'social_profile', 'classification' => 'linkedin_company_profile']);
         self::assertSame(0, DB::table('contacts')->whereNotNull('name')->count());
     }
 

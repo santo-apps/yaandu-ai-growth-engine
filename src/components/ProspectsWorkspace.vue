@@ -1,111 +1,193 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
-import { humanize, salesRequest, unwrap } from '../salesApi'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { humanize, salesRequest, unwrap, csrfToken } from '../salesApi'
 
 const props = defineProps<{ tenantId: string }>()
 const emit = defineEmits<{ openProspect: [company: any] }>()
 const companies = ref<any[]>([])
-const scores = ref<any[]>([])
-const contacts = ref<any[]>([])
 const query = ref('')
-const industry = ref('')
-const location = ref('')
-const contactFilter = ref('any')
-const minScore = ref('')
-const statusFilter = ref('')
-const currentPage = ref(1)
-const lastPage = ref(1)
 const busy = ref(false)
+const saving = ref(false)
 const error = ref('')
 const notice = ref('')
-const addOpen = ref(false)
-const discoveryOpen = ref(false)
-const saving = ref(false)
+const showAdd = ref(false)
+const showDiscovery = ref(false)
+const discoveryTab = ref<'search' | 'results' | 'csv'>('search')
 const draft = ref({ name: '', website: '', industry: '', location: '' })
-const seed = ref({ name: '', website: '', industry: '', location: '' })
+const searchDraft = ref({ name: 'UAE Ecommerce Modernization Prospects', locations: 'UAE', industries: 'E-commerce / Retail, Retail', keywords: 'e-commerce, retail', websiteCriteria: 'outdated design, poor mobile experience, slow site, weak conversion', services: 'E-commerce modernization, performance optimization, AI customer engagement', companySize: 'Unknown', maxCandidates: 8, source: 'deterministic_local' })
+const runs = ref<any[]>([])
+const candidates = ref<any[]>([])
+const selected = ref<string[]>([])
+const candidateFilter = ref({ location: '', industry: '', status: '', contact: 'any', service: '', minScore: '' })
+const candidateDetail = ref<any>(null)
+const csvFile = ref<File | null>(null)
+const csvPreview = ref<any>(null)
+const csvConfirmed = ref(false)
+const csvIdempotencyKey = ref(crypto.randomUUID())
+let pollTimer: ReturnType<typeof setInterval> | undefined
 
-const scoreByCompany = computed(() => {
-  const latest = new Map<string, any>()
-  scores.value.forEach((row) => { if (!latest.has(row.company_id)) latest.set(row.company_id, row) })
-  return latest
-})
-const contactsByCompany = computed(() => {
-  const map = new Map<string, any[]>()
-  contacts.value.forEach((contact) => map.set(contact.company_id, [...(map.get(contact.company_id) ?? []), contact]))
-  return map
-})
-const industries = computed(() => [...new Set(companies.value.map((company) => company.industry).filter(Boolean))].sort())
-const locations = computed(() => [...new Set(companies.value.map((company) => company.location).filter(Boolean))].sort())
-const statuses = computed(() => [...new Set(companies.value.map((company) => company.status).filter(Boolean))].sort())
-const filtered = computed(() => companies.value.filter((company) => {
-  const score = scoreByCompany.value.get(company.id)?.score
-  const hasContact = (contactsByCompany.value.get(company.id) ?? []).length > 0
-  return (!industry.value || company.industry === industry.value)
-    && (!location.value || company.location === location.value)
-    && (!statusFilter.value || company.status === statusFilter.value)
-    && (contactFilter.value === 'any' || (contactFilter.value === 'yes' ? hasContact : !hasContact))
-    && (minScore.value === '' || (Number(score ?? -1) >= Number(minScore.value)))
-}))
+const latestRun = computed(() => runs.value[0] ?? null)
+const filteredCandidates = computed(() => candidates.value.filter((candidate) =>
+  (!candidateFilter.value.location || candidate.country === candidateFilter.value.location || candidate.city === candidateFilter.value.location)
+  && (!candidateFilter.value.industry || candidate.industry === candidateFilter.value.industry)
+  && (!candidateFilter.value.status || candidate.lifecycle_status === candidateFilter.value.status)
+  && (candidateFilter.value.contact === 'any' || (candidateFilter.value.contact === 'yes' ? Number(candidate.contact_count) > 0 : Number(candidate.contact_count) === 0))
+  && (!candidateFilter.value.service || candidate.recommended_service === candidateFilter.value.service)
+  && (candidateFilter.value.minScore === '' || Number(candidate.lead_score ?? -1) >= Number(candidateFilter.value.minScore))))
+const resultCounts = computed(() => latestRun.value?.counts ? (typeof latestRun.value.counts === 'string' ? JSON.parse(latestRun.value.counts) : latestRun.value.counts) : {})
 
-async function load(page = currentPage.value) {
+async function loadCompanies() {
   busy.value = true; error.value = ''
-  try {
-    const [companyResult, scoreResult, contactResult] = await Promise.all([
-      salesRequest(`/companies?search=${encodeURIComponent(query.value)}&page=${page}`, props.tenantId),
-      salesRequest('/lead-scores', props.tenantId), salesRequest('/contacts', props.tenantId),
-    ])
-    companies.value = unwrap(companyResult)
-    currentPage.value = companyResult.current_page ?? 1; lastPage.value = companyResult.last_page ?? 1
-    scores.value = unwrap(scoreResult)
-    contacts.value = unwrap(contactResult)
-  } catch (exception) { error.value = exception instanceof Error ? exception.message : 'Unable to load prospects.' }
+  try { companies.value = unwrap(await salesRequest(`/companies?search=${encodeURIComponent(query.value)}`, props.tenantId)) }
+  catch (e) { error.value = e instanceof Error ? e.message : 'Unable to load prospects.' }
   finally { busy.value = false }
+}
+
+async function loadDiscovery() {
+  try {
+    const [runResult, candidateResult] = await Promise.all([
+      salesRequest('/discovery/runs', props.tenantId),
+      salesRequest('/discovery/candidates', props.tenantId),
+    ])
+    runs.value = unwrap(runResult)
+    candidates.value = unwrap(candidateResult)
+    if (runs.value.some((run) => ['queued', 'running', 'verifying', 'analyzing'].includes(run.status))) {
+      if (!pollTimer) pollTimer = setInterval(() => { void loadDiscovery() }, 4000)
+    } else if (pollTimer) { clearInterval(pollTimer); pollTimer = undefined }
+  } catch (e) { error.value = e instanceof Error ? e.message : 'Unable to load discovery results.' }
 }
 
 async function saveProspect() {
   saving.value = true; error.value = ''; notice.value = ''
-  try {
-    await salesRequest('/companies', props.tenantId, 'POST', draft.value)
-    draft.value = { name: '', website: '', industry: '', location: '' }; addOpen.value = false
-    notice.value = 'Prospect added to your workspace.'; await load()
-  } catch (exception) { error.value = exception instanceof Error ? exception.message : 'Unable to add prospect.' }
+  try { await salesRequest('/companies', props.tenantId, 'POST', draft.value); draft.value = { name: '', website: '', industry: '', location: '' }; showAdd.value = false; notice.value = 'Prospect added.'; await loadCompanies() }
+  catch (e) { error.value = e instanceof Error ? e.message : 'Unable to add prospect.' }
   finally { saving.value = false }
 }
 
-async function addSeed() {
+function splitValues(value: string) { return value.split(',').map((entry) => entry.trim()).filter(Boolean) }
+function showEvidence(value: unknown) {
+  if (typeof value !== 'string') return value || 'No finding recorded'
+  try { return JSON.stringify(JSON.parse(value)) } catch { return value }
+}
+function scoreComponents(value: unknown): Array<[string, any]> {
+  if (typeof value === 'string') { try { value = JSON.parse(value) } catch { return [] } }
+  return value && typeof value === 'object' ? Object.entries(value as Record<string, any>) : []
+}
+async function startSearch() {
   saving.value = true; error.value = ''; notice.value = ''
   try {
-    const result = await salesRequest('/discovery-runs', props.tenantId, 'POST', { candidates: [{ ...seed.value, source: 'user_seed' }] })
-    notice.value = `Prospect registration queued. External company discovery is not available.`
-    seed.value = { name: '', website: '', industry: '', location: '' }; discoveryOpen.value = false
-    void result; await load()
-  } catch (exception) { error.value = exception instanceof Error ? exception.message : 'Unable to register prospect.' }
+    const search = await salesRequest('/discovery/searches', props.tenantId, 'POST', {
+      name: searchDraft.value.name, source: searchDraft.value.source,
+      locations: splitValues(searchDraft.value.locations), industries: splitValues(searchDraft.value.industries),
+      keywords: splitValues(searchDraft.value.keywords), website_criteria: splitValues(searchDraft.value.websiteCriteria),
+      desired_services: splitValues(searchDraft.value.services), company_size: searchDraft.value.companySize, max_candidates: Number(searchDraft.value.maxCandidates),
+    })
+    const run = await salesRequest(`/discovery/searches/${encodeURIComponent(search.id)}/runs`, props.tenantId, 'POST', { idempotency_key: crypto.randomUUID() })
+    notice.value = `Search queued. Candidate collection is limited to ${run.budget ? JSON.parse(run.budget).max_candidates : search.max_candidates} results.`
+    discoveryTab.value = 'results'; await loadDiscovery()
+  } catch (e) { error.value = e instanceof Error ? e.message : 'Unable to start prospect discovery.' }
   finally { saving.value = false }
 }
 
-watch(query, () => { currentPage.value = 1; void load(1) })
-watch(() => props.tenantId, () => { void load() })
-onMounted(() => { void load() })
+async function uploadCsv(preview: boolean) {
+  if (!csvFile.value) { error.value = 'Choose a CSV file first.'; return }
+  saving.value = true; error.value = ''; notice.value = ''
+  try {
+    const form = new FormData(); form.append('csv', csvFile.value)
+    if (!preview) { form.append('confirmed', '1'); form.append('idempotency_key', csvIdempotencyKey.value) }
+    const response = await fetch(`/api/v1/discovery/import${preview ? '/preview' : ''}`, {
+      method: 'POST', credentials: 'include', headers: { Accept: 'application/json', 'X-Tenant-ID': props.tenantId, 'X-XSRF-TOKEN': csrfToken() }, body: form,
+    })
+    const result = await response.json()
+    if (!response.ok) throw new Error(result.message ?? 'Unable to process this CSV.')
+    if (preview) { csvPreview.value = result; csvConfirmed.value = false }
+    else { csvConfirmed.value = true; notice.value = `Import queued: ${result.candidate_count} rows entered review. No outreach was sent.`; discoveryTab.value = 'results'; await loadDiscovery() }
+  } catch (e) { error.value = e instanceof Error ? e.message : 'Unable to process this CSV.' }
+  finally { saving.value = false }
+}
+
+function selectCsvFile(event: Event) {
+  csvFile.value = (event.target as HTMLInputElement).files?.[0] ?? null
+  csvPreview.value = null
+  csvConfirmed.value = false
+  csvIdempotencyKey.value = crypto.randomUUID()
+}
+
+async function openCandidate(candidate: any) {
+  candidateDetail.value = null; error.value = ''
+  try { candidateDetail.value = await salesRequest(`/discovery/candidates/${encodeURIComponent(candidate.id)}`, props.tenantId) }
+  catch (e) { error.value = e instanceof Error ? e.message : 'Unable to open candidate details.' }
+}
+
+async function review(candidate: any, action: 'accept' | 'reject') {
+  saving.value = true; error.value = ''; notice.value = ''
+  try {
+    const response = await salesRequest(`/discovery/candidates/${encodeURIComponent(candidate.id)}/review`, props.tenantId, 'POST', { action })
+    notice.value = action === 'accept' ? 'Candidate accepted into Prospects. Its reviewed intelligence and score are preserved; no outreach was sent.' : 'Candidate rejected.'
+    candidateDetail.value = null; await loadDiscovery(); await loadCompanies()
+    if (action === 'accept' && response.company) emit('openProspect', response.company)
+  } catch (e) { error.value = e instanceof Error ? e.message : `Unable to ${action} candidate.` }
+  finally { saving.value = false }
+}
+
+async function bulkReview(action: 'accept' | 'reject' | 'reverify' | 'analyze') {
+  if (!selected.value.length) return
+  saving.value = true; error.value = ''; notice.value = ''
+  try {
+    const result = await salesRequest('/discovery/candidates/bulk-review', props.tenantId, 'POST', { action, candidate_ids: selected.value })
+    const queued = Number(result.queued_count ?? result.results?.filter((row: any) => row.status === 'queued').length ?? 0)
+    const completed = Number(result.processed_count ?? result.results?.filter((row: any) => row.status === 'processed').length ?? 0)
+    const notActionable = Number(result.not_actionable_count ?? 0)
+    const noticeText = action === 'reverify' ? `${queued} website check${queued === 1 ? '' : 's'} queued` : action === 'analyze' ? `${queued} intelligence and scoring job${queued === 1 ? '' : 's'} queued` : `${completed} candidate${completed === 1 ? '' : 's'} ${action === 'accept' ? 'accepted' : 'rejected'}`
+    notice.value = `${noticeText}${notActionable ? ` · ${notActionable} not actionable` : ''}. No outreach was sent.`
+    selected.value = []; await loadDiscovery(); await loadCompanies()
+  } catch (e) { error.value = e instanceof Error ? e.message : 'Unable to review selected candidates.' }
+  finally { saving.value = false }
+}
+
+function toggleSelected(id: string) { selected.value = selected.value.includes(id) ? selected.value.filter((item) => item !== id) : [...selected.value, id] }
+function openProspect(company: any) { emit('openProspect', company) }
+watch(query, () => { void loadCompanies() })
+watch(() => props.tenantId, () => { void loadCompanies(); if (showDiscovery.value) void loadDiscovery() })
+onMounted(() => { void loadCompanies() })
+onBeforeUnmount(() => { if (pollTimer) clearInterval(pollTimer) })
 </script>
 
 <template>
-  <section class="sales-workspace">
-    <div class="sales-toolbar"><label class="sales-search"><span>⌕</span><input v-model="query" placeholder="Search prospects" aria-label="Search prospects" /></label><button class="quiet" @click="discoveryOpen = !discoveryOpen">Import / Discover <span class="coming-soon">Limited</span></button><button class="primary" @click="addOpen = !addOpen">＋ Add prospect</button></div>
-    <div v-if="discoveryOpen" class="sales-callout"><div><b>Register a prospect from a known company</b><p>Discovery accepts a company you provide. External prospect sourcing is not available yet.</p></div><form class="sales-inline-form" @submit.prevent="addSeed"><input v-model="seed.name" required maxlength="255" placeholder="Company name"/><input v-model="seed.website" required type="url" placeholder="https://company.com"/><input v-model="seed.industry" placeholder="Industry"/><input v-model="seed.location" placeholder="Location"/><button class="primary" :disabled="saving">{{ saving ? 'Queueing…' : 'Register prospect' }}</button></form></div>
-    <form v-if="addOpen" class="sales-callout sales-inline-form" @submit.prevent="saveProspect"><input v-model="draft.name" required maxlength="255" placeholder="Company name"/><input v-model="draft.website" type="url" placeholder="https://company.com"/><input v-model="draft.industry" placeholder="Industry"/><input v-model="draft.location" placeholder="Location"/><button class="primary" :disabled="saving">{{ saving ? 'Saving…' : 'Save prospect' }}</button></form>
-    <div v-if="notice" class="notice success-notice">{{ notice }}</div><div v-if="error" class="notice">{{ error }} <button @click="() => load()">Retry</button></div>
-    <div class="prospect-filterbar"><label>Industry<select v-model="industry"><option value="">All industries</option><option v-for="value in industries" :key="value">{{ value }}</option></select></label><label>Location<select v-model="location"><option value="">All locations</option><option v-for="value in locations" :key="value">{{ value }}</option></select></label><label>Status<select v-model="statusFilter"><option value="">All statuses</option><option v-for="value in statuses" :key="value" :value="value">{{ humanize(value) }}</option></select></label><label>Minimum score<select v-model="minScore"><option value="">Any score</option><option value="40">40+</option><option value="60">60+</option><option value="70">70+</option><option value="85">85+</option></select></label><label>Public contact<select v-model="contactFilter"><option value="any">Any</option><option value="yes">Available</option><option value="no">Unavailable</option></select></label><span class="filter-count">{{ filtered.length }} prospects · page {{ currentPage }} of {{ lastPage }}</span></div>
-    <div class="panel sales-table-panel"><div v-if="busy && !companies.length" class="sales-state"><span class="spinner"></span><b>Loading prospects</b><small>Preparing your tenant workspace…</small></div><div v-else-if="!filtered.length" class="sales-state"><span class="state-icon">⌕</span><b>{{ query ? 'No matching prospects' : 'No prospects yet' }}</b><small>{{ query ? 'Try a different search or filter.' : 'Add a prospect or register a known company to begin.' }}</small><button v-if="!query" class="primary" @click="addOpen = true">Add first prospect</button></div><div v-else class="table-wrap"><table class="sales-table"><thead><tr><th>PROSPECT</th><th>STATUS</th><th>LEAD SCORE</th><th>PUBLIC CONTACT</th><th>WEBSITE</th><th>NEXT ACTION</th></tr></thead><tbody><tr v-for="company in filtered" :key="company.id" class="clickable-row" @click="emit('openProspect', company)"><td><b>{{ company.name }}</b><small>{{ company.industry || 'Industry not recorded' }} · {{ company.location || 'Location not recorded' }}</small></td><td><span class="pill">{{ humanize(company.status) }}</span></td><td><span v-if="scoreByCompany.get(company.id)" class="sales-score">{{ scoreByCompany.get(company.id).score }}<small>/100</small></span><span v-else class="muted">Not scored</span></td><td><template v-if="contactsByCompany.get(company.id)?.length">{{ contactsByCompany.get(company.id)?.[0]?.name || contactsByCompany.get(company.id)?.[0]?.title || 'Public contact' }}<small>{{ contactsByCompany.get(company.id)?.[0]?.title || 'Contact details available' }}</small></template><span v-else class="muted">Not identified</span></td><td><span class="health-dot" :class="company.websites?.length ? 'is-known' : ''"></span>{{ company.websites?.length ? 'Added' : 'Not added' }}</td><td><span class="next-action">{{ scoreByCompany.get(company.id) ? 'Review prospect' : 'Assess fit' }} <span>→</span></span></td></tr></tbody></table></div></div>
-    <div v-if="lastPage > 1" class="pagination-controls"><button class="quiet" :disabled="currentPage <= 1 || busy" @click="load(currentPage - 1)">← Previous</button><span>Page {{ currentPage }} of {{ lastPage }}</span><button class="quiet" :disabled="currentPage >= lastPage || busy" @click="load(currentPage + 1)">Next →</button></div>
-    <p class="data-limit-note">Search is server-side. Industry, location, status, score, and contact filters apply to loaded company and lead/contact pages.</p>
+  <section class="prospects-workspace">
+    <div class="prospects-toolbar"><label class="prospect-search"><span>⌕</span><input v-model="query" placeholder="Search existing prospects" aria-label="Search prospects" /></label><button class="quiet" @click="showDiscovery = !showDiscovery; if (showDiscovery) loadDiscovery()">{{ showDiscovery ? 'Close discovery' : 'Find Prospects' }}</button><button class="primary" @click="showAdd = !showAdd">＋ Add prospect</button></div>
+    <form v-if="showAdd" class="discovery-card add-card" @submit.prevent="saveProspect"><h2>Add an existing company</h2><div class="discovery-form-grid"><label>Company name<input v-model="draft.name" required maxlength="255" /></label><label>Website<input v-model="draft.website" type="url" placeholder="https://company.com" /></label><label>Industry<input v-model="draft.industry" /></label><label>Location<input v-model="draft.location" /></label></div><button class="primary" :disabled="saving">{{ saving ? 'Saving…' : 'Save prospect' }}</button></form>
+    <section v-if="showDiscovery" class="discovery-shell">
+      <div class="discovery-intro"><div><span class="eyebrow">PROSPECT ACQUISITION</span><h2>Find and review prospects</h2><p>Discovery gathers candidates; verification checks public websites. You decide what becomes a prospect. Outreach is always a separate action.</p></div><span class="discovery-safe-pill">Review before acceptance</span></div>
+      <nav class="discovery-tabs" aria-label="Discovery tools"><button :class="{ active: discoveryTab === 'search' }" @click="discoveryTab = 'search'">New search</button><button :class="{ active: discoveryTab === 'results' }" @click="discoveryTab = 'results'; loadDiscovery()">Runs & candidates</button><button :class="{ active: discoveryTab === 'csv' }" @click="discoveryTab = 'csv'">Import CSV</button></nav>
+      <div v-if="discoveryTab === 'search'" class="discovery-card"><form @submit.prevent="startSearch"><div class="discovery-form-grid"><label>Search name<input v-model="searchDraft.name" required maxlength="160" /></label><div class="source-note"><b>TEST MODE · Fictional local source</b><small>Uses fictional businesses only. Import a CSV for genuine company domains.</small></div><label>Locations<input v-model="searchDraft.locations" placeholder="UAE, Dubai" /><small>Comma-separated</small></label><label>Industries<input v-model="searchDraft.industries" placeholder="E-commerce, Retail" /><small>Comma-separated</small></label><label>Company size<select v-model="searchDraft.companySize"><option>Unknown</option><option>SMB</option><option>Mid-market</option><option>Enterprise</option></select><small>Criterion recorded for sources that provide size data.</small></label><label>Keywords<input v-model="searchDraft.keywords" placeholder="retail, online shop" /><small>Comma-separated</small></label><label>Website signals<input v-model="searchDraft.websiteCriteria" placeholder="slow site, weak lead capture" /><small>Comma-separated</small></label><label class="wide-field">Desired Yaandu services<input v-model="searchDraft.services" placeholder="Website redesign, performance optimization" /><small>Comma-separated</small></label><label>Maximum candidates<input v-model.number="searchDraft.maxCandidates" type="number" min="1" max="100" /></label></div><div class="discovery-actions"><span>Website checks are bounded and use HTTP first. No browser rendering is launched for every prospect.</span><button class="primary" :disabled="saving">{{ saving ? 'Starting…' : 'Start discovery' }}</button></div></form></div>
+      <div v-else-if="discoveryTab === 'csv'" class="discovery-card csv-card"><div><h3>Import a company list</h3><p>CSV headers: <code>company_name, website, country, city, industry</code>. Website or domain is required. Preview does not create prospects.</p></div><div class="csv-upload-row"><input type="file" accept=".csv,text/csv" @change="selectCsvFile"/><button class="quiet" :disabled="saving || !csvFile" @click="uploadCsv(true)">{{ saving ? 'Checking…' : 'Preview CSV' }}</button><button v-if="csvPreview && !csvConfirmed" class="primary" :disabled="saving || !csvPreview.valid_count" @click="uploadCsv(false)">Confirm import</button></div><div v-if="csvPreview" class="csv-summary"><b>{{ csvPreview.valid_count }} valid</b><span>{{ csvPreview.duplicate_count }} duplicates</span><span>{{ csvPreview.invalid_count }} invalid</span><small>Duplicates in file: {{ csvPreview.rows.filter((row: any) => row.duplicate_type === 'within_file').length }} · Existing company/candidate: {{ csvPreview.rows.filter((row: any) => ['existing_company', 'existing_candidate'].includes(row.duplicate_type)).length }}</small><span>{{ csvPreview.total }} rows</span></div><div v-if="csvPreview" class="table-scroll"><table class="discovery-table"><thead><tr><th>Row</th><th>Company</th><th>Website</th><th>Location</th><th>Industry</th><th>Result</th></tr></thead><tbody><tr v-for="row in csvPreview.rows" :key="row.row"><td>{{ row.row }}</td><td>{{ row.company_name || 'Name to verify' }}</td><td>{{ row.website }}</td><td>{{ [row.city, row.country].filter(Boolean).join(', ') || '—' }}</td><td>{{ row.industry || '—' }}</td><td><span class="status-chip" :class="row.status">{{ humanize(row.status) }}</span><small v-if="row.reason">{{ row.reason }}</small></td></tr></tbody></table></div></div>
+      <div v-else class="discovery-results">
+        <div v-if="latestRun" class="run-summary"><div><span class="eyebrow">LATEST DISCOVERY RUN</span><h3>{{ latestRun.status === 'verifying' ? 'Checking public websites' : humanize(latestRun.status) }}</h3><p>{{ latestRun.started_at || latestRun.created_at }} · Limit {{ (typeof latestRun.budget === 'string' ? JSON.parse(latestRun.budget) : latestRun.budget)?.max_candidates ?? '—' }} candidates</p></div><div class="run-stats"><span><b>{{ resultCounts.found ?? candidates.length }}</b>Found</span><span><b>{{ resultCounts.duplicates ?? 0 }}</b>Duplicates</span><span><b>{{ resultCounts.invalid ?? 0 }}</b>Invalid</span><span><b>{{ resultCounts.verified ?? 0 }}</b>Verified</span><span><b>{{ resultCounts.analyzed ?? 0 }}</b>Analyzed</span><span><b>{{ resultCounts.scored ?? 0 }}</b>Scored</span><span><b>{{ resultCounts.accepted ?? 0 }}</b>Accepted</span><span><b>{{ resultCounts.rejected ?? 0 }}</b>Rejected</span><span><b>{{ resultCounts.failures ?? 0 }}</b>Failed</span></div></div>
+        <div class="candidate-filters"><label>Location<select v-model="candidateFilter.location"><option value="">All locations</option><option v-for="value in [...new Set(candidates.flatMap((item: any) => [item.country, item.city]).filter(Boolean))]" :key="value">{{ value }}</option></select></label><label>Industry<select v-model="candidateFilter.industry"><option value="">All industries</option><option v-for="value in [...new Set(candidates.map((item: any) => item.industry).filter(Boolean))]" :key="value">{{ value }}</option></select></label><label>Review status<select v-model="candidateFilter.status"><option value="">All statuses</option><option value="verified">Verified</option><option value="accepted">Accepted</option><option value="rejected">Rejected</option><option value="discovered">In progress</option></select></label><label>Public contact<select v-model="candidateFilter.contact"><option value="any">Any</option><option value="yes">Found</option><option value="no">Not found</option></select></label><label>Minimum score<select v-model="candidateFilter.minScore"><option value="">Any score</option><option value="40">40+</option><option value="60">60+</option><option value="70">70+</option></select></label><label>Recommended service<select v-model="candidateFilter.service"><option value="">Any service</option><option v-for="value in [...new Set(candidates.map((item: any) => item.recommended_service).filter(Boolean))]" :key="value">{{ value }}</option></select></label><span>{{ filteredCandidates.length }} candidates</span></div>
+        <div v-if="selected.length" class="bulk-review-bar"><span>{{ selected.length }} selected</span><button class="quiet" :disabled="saving" @click="bulkReview('reverify')">Retry website checks</button><button class="quiet" :disabled="saving" @click="bulkReview('analyze')">Run intelligence & scoring</button><button class="quiet" :disabled="saving" @click="bulkReview('reject')">Reject selected</button><button class="primary" :disabled="saving" @click="bulkReview('accept')">Accept selected</button></div>
+        <div v-if="filteredCandidates.length" class="table-scroll"><table class="discovery-table"><thead><tr><th aria-label="Select"></th><th>Company</th><th>Website & location</th><th>Industry</th><th>Finding & service</th><th>Lead score</th><th>Contact</th><th>Source / status</th></tr></thead><tbody><tr v-for="candidate in filteredCandidates" :key="candidate.id" @click="openCandidate(candidate)"><td @click.stop><input type="checkbox" :checked="selected.includes(candidate.id)" aria-label="Select candidate" @change="toggleSelected(candidate.id)" /></td><td><b>{{ candidate.company_name || 'Name not provided' }}</b><small>{{ candidate.normalized_domain || 'Invalid domain' }}</small></td><td>{{ candidate.country || candidate.city ? [candidate.city, candidate.country].filter(Boolean).join(', ') : 'Location unknown' }}<small>{{ candidate.original_url }}</small></td><td>{{ candidate.industry || 'Unknown' }}</td><td>{{ candidate.recommended_service || candidate.page_title || candidate.failure_summary || 'Website evidence pending' }}<small>{{ candidate.response_time_ms ? `${candidate.response_time_ms} ms first-page response` : candidate.meta_description || '' }}</small></td><td>{{ candidate.lead_score ?? 'Pending' }}</td><td>{{ candidate.contact_count ? `${candidate.contact_count} public contacts` : 'Not found yet' }}</td><td><small>{{ humanize(candidate.source) }}</small><span class="status-chip" :class="candidate.lifecycle_status">{{ humanize(candidate.verification_state === 'verified' ? candidate.lifecycle_status : candidate.verification_state) }}</span></td></tr></tbody></table></div><div v-else class="discovery-empty">{{ busy ? 'Loading candidates…' : 'No discovery candidates yet. Start a search or import a CSV.' }}</div>
+      </div>
+    </section>
+    <div v-if="notice" class="notice success-notice">{{ notice }}</div><div v-if="error" class="notice">{{ error }} <button class="quiet" @click="loadDiscovery">Retry</button></div>
+    <div class="prospect-list-heading"><div><h2>Your prospects</h2><p>Companies accepted into the tenant workspace.</p></div><span>{{ companies.length }} shown</span></div>
+    <div class="panel prospect-list-panel"><div v-if="busy && !companies.length" class="prospect-state">Loading prospects…</div><div v-else-if="!companies.length" class="prospect-state"><b>No prospects yet</b><span>Use Find Prospects to search or import a company list.</span></div><div v-else class="table-scroll"><table class="discovery-table"><thead><tr><th>Company</th><th>Website</th><th>Location</th><th>Industry</th><th>Status</th><th></th></tr></thead><tbody><tr v-for="company in companies" :key="company.id" @click="openProspect(company)"><td><b>{{ company.name }}</b></td><td>{{ company.normalized_domain || company.websites?.[0]?.host || '—' }}</td><td>{{ company.location || '—' }}</td><td>{{ company.industry || '—' }}</td><td><span class="status-chip accepted">{{ humanize(company.status) }}</span></td><td><button class="quiet" @click.stop="openProspect(company)">Open Prospect 360 →</button></td></tr></tbody></table></div></div>
+    <div v-if="candidateDetail" class="candidate-backdrop" @click.self="candidateDetail = null"><aside class="candidate-drawer" aria-label="Candidate details"><button class="drawer-close" @click="candidateDetail = null">Close</button><span class="eyebrow">DISCOVERY CANDIDATE</span><h2>{{ candidateDetail.candidate.company_name || 'Company candidate' }}</h2><a :href="candidateDetail.candidate.original_url" target="_blank" rel="noreferrer">{{ candidateDetail.candidate.original_url }}</a><dl><dt>Normalized domain</dt><dd>{{ candidateDetail.candidate.normalized_domain || 'Invalid' }}</dd><dt>Location / industry</dt><dd>{{ [candidateDetail.candidate.city, candidateDetail.candidate.country].filter(Boolean).join(', ') || 'Unknown' }} · {{ candidateDetail.candidate.industry || 'Industry unknown' }}</dd><dt>Discovered</dt><dd>{{ candidateDetail.candidate.discovered_at }}</dd><dt>Source</dt><dd>{{ humanize(candidateDetail.candidate.source) }}</dd><dt>Duplicate result</dt><dd>{{ humanize(candidateDetail.candidate.deduplication_state) }} · {{ candidateDetail.candidate.deduplication_reason || 'No duplicate found' }}</dd><dt>Website verification</dt><dd>{{ humanize(candidateDetail.candidate.verification_state) }} · HTTP {{ candidateDetail.candidate.http_status || '—' }}</dd><dt>Website title</dt><dd>{{ candidateDetail.candidate.page_title || 'Not available' }}</dd><dt>Mobile viewport</dt><dd>{{ candidateDetail.candidate.has_mobile_viewport === null ? 'Unknown' : candidateDetail.candidate.has_mobile_viewport ? 'Present' : 'Not found' }}</dd><dt>HTTPS</dt><dd>{{ candidateDetail.candidate.uses_https ? 'Yes' : 'No' }}</dd><dt>Recommended service</dt><dd>{{ candidateDetail.candidate.recommended_service || 'No evidence-backed match yet' }}</dd><dt>Recommendation evidence</dt><dd>{{ showEvidence(candidateDetail.candidate.recommendation_evidence) || candidateDetail.candidate.failure_summary || 'No finding recorded' }}</dd><dt>Public contacts</dt><dd>{{ candidateDetail.contacts?.length ? `${candidateDetail.contacts.length} public contacts with source provenance` : 'No public contact recorded' }}</dd><dt>Website intelligence</dt><dd>{{ candidateDetail.candidate.lifecycle_status === 'analyzed' || candidateDetail.candidate.lifecycle_status === 'reviewable' || candidateDetail.candidate.lifecycle_status === 'accepted' ? 'Complete' : candidateDetail.candidate.lifecycle_status === 'analysis_failed' ? 'Needs retry / review' : 'Pending' }}</dd><dt>Lead scoring</dt><dd>{{ candidateDetail.scores?.[0]?.score != null ? `Complete · ${candidateDetail.scores[0].score} / 100` : 'Pending' }}</dd><dt>Review readiness</dt><dd>{{ candidateDetail.candidate.lifecycle_status === 'reviewable' ? 'Ready for human review' : candidateDetail.candidate.lifecycle_status === 'accepted' ? 'Accepted' : candidateDetail.candidate.failure_summary || 'Not ready — processing is incomplete' }}</dd></dl><section v-if="candidateDetail.scores?.[0]?.components" class="candidate-evidence"><h3>Score contributions</h3><article v-for="[rule, contribution] in scoreComponents(candidateDetail.scores[0].components)" :key="rule"><b>{{ humanize(rule) }} · {{ contribution.status === 'confirmed_present' ? `+${contribution.points}` : contribution.status === 'confirmed_absent' ? '0 · absent' : 'Unknown' }}</b><small v-if="contribution.evidence">Evidence: {{ showEvidence(contribution.evidence) }}</small></article></section><section v-if="candidateDetail.website_issues?.length" class="candidate-evidence"><h3>Website intelligence findings</h3><article v-for="issue in candidateDetail.website_issues" :key="issue.id"><b>{{ humanize(issue.type) }} · {{ humanize(issue.severity) }}</b><p>{{ issue.summary }}</p><small>{{ showEvidence(issue.evidence) }}</small></article></section><section v-if="candidateDetail.findings?.length" class="candidate-evidence"><h3>Lead insights</h3><article v-for="finding in candidateDetail.findings" :key="finding.id"><b>{{ humanize(finding.kind) }}</b><p>{{ finding.statement }}</p></article></section><div v-if="candidateDetail.contacts?.length" class="candidate-contact-list"><article v-for="contact in candidateDetail.contacts" :key="contact.id"><b>{{ contact.name || 'Public business contact' }}</b><small>{{ contact.title || 'Role not stated' }} · {{ contact.source_url }}</small><span v-for="method in contact.methods || []" :key="method.id">{{ humanize(method.classification || method.type) }}: {{ method.value }} <small>{{ method.source_url }} · {{ method.confidence }} confidence</small></span></article></div><div v-if="candidateDetail.company && candidateDetail.company.status !== 'discovery_candidate'"><button class="quiet" @click="openProspect(candidateDetail.company)">Open Prospect 360 →</button></div><div v-if="['verified', 'existing_company'].includes(candidateDetail.candidate.verification_state) || candidateDetail.candidate.deduplication_state === 'existing_company'" class="drawer-actions"><button class="quiet" :disabled="saving" @click="review(candidateDetail.candidate, 'reject')">Reject</button><button class="primary" :disabled="saving || (candidateDetail.candidate.deduplication_state !== 'existing_company' && candidateDetail.candidate.lifecycle_status !== 'reviewable')" @click="review(candidateDetail.candidate, 'accept')">Accept candidate</button></div><p class="discovery-safety-note">Acceptance adds a prospect only. Campaign enrollment and outbound messages are not created.</p></aside></div>
   </section>
 </template>
 
 <style scoped>
-.sales-workspace{display:grid;gap:16px}.sales-toolbar{display:flex;gap:10px;align-items:center}.sales-search{display:flex;align-items:center;gap:9px;max-width:420px;flex:1;border:1px solid #e2e6ed;background:white;border-radius:10px;padding:0 12px;color:#6a7381}.sales-search input{border:0;outline:0;width:100%;min-height:42px}.sales-callout{display:grid;gap:13px;border:1px solid #dce7fc;background:#f8faff;padding:17px;border-radius:12px}.sales-callout p{color:#697386;margin:5px 0 0}.sales-inline-form{display:flex;flex-wrap:wrap;gap:8px}.sales-inline-form input{min-height:40px;border:1px solid #dfe4eb;border-radius:8px;padding:0 10px;flex:1;min-width:150px}.coming-soon{margin-left:5px;font-size:10px;text-transform:uppercase;color:#697386}.prospect-filterbar{display:flex;gap:12px;align-items:end;flex-wrap:wrap;padding:0 2px}.prospect-filterbar label{display:grid;gap:5px;color:#77808d;font-size:11px;font-weight:650}.prospect-filterbar select{height:36px;min-width:135px;border:1px solid #e1e5ec;border-radius:8px;background:white;padding:0 9px;color:#202938}.filter-count{margin-left:auto;color:#707989;font-size:12px;padding-bottom:9px}.sales-table-panel{min-height:220px;overflow:hidden}.sales-table{min-width:780px}.sales-table td:first-child b{display:block}.sales-table td small{display:block;margin-top:4px}.sales-score{font-size:16px;font-weight:700;color:#263d72}.sales-score small{display:inline!important;color:#8a93a1;font-size:10px}.muted{color:#8b94a1}.clickable-row{cursor:pointer}.clickable-row:hover{background:#f8faff}.health-dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:7px;background:#bcc2cc}.health-dot.is-known{background:#35a77b}.next-action{color:#3757a6;font-weight:600;white-space:nowrap}.next-action span{margin-left:8px}.sales-state{min-height:220px;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:8px;color:#536070;text-align:center}.sales-state b{color:#202938}.sales-state small{color:#88919e}.state-icon{font-size:25px}.spinner{width:24px;height:24px;border:2px solid #dfe5f0;border-top-color:#425eb6;border-radius:50%;animation:spin .8s linear infinite}.data-limit-note{margin:0;color:#8a93a1;font-size:11px}@keyframes spin{to{transform:rotate(360deg)}}
-@media(max-width:760px){.sales-toolbar{flex-wrap:wrap}.sales-search{min-width:100%;max-width:none}.prospect-filterbar{align-items:stretch}.prospect-filterbar label{flex:1;min-width:145px}.prospect-filterbar select{width:100%}.filter-count{margin-left:0}.sales-inline-form>*{width:100%}}
+.prospects-workspace{display:grid;gap:18px;min-width:0}.prospects-toolbar{display:flex;gap:10px;align-items:center}.prospect-search{display:flex;gap:8px;align-items:center;flex:1;max-width:460px;border:1px solid #e1e6ee;border-radius:10px;background:#fff;padding:0 12px;color:#697386}.prospect-search input{width:100%;height:42px;border:0;outline:0}.discovery-shell,.discovery-card,.add-card{min-width:0;border:1px solid #e1e7f0;border-radius:14px;background:#fff;padding:18px}.discovery-shell{display:grid;gap:16px;background:#f9fbfe}.discovery-intro,.prospect-list-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.discovery-intro h2,.prospect-list-heading h2{margin:4px 0;font-size:18px;color:#1b2b45}.discovery-intro p,.prospect-list-heading p{margin:0;color:#68778b;font-size:12px;line-height:1.5;max-width:720px}.eyebrow{font-size:9px;font-weight:750;letter-spacing:.12em;color:#77859a}.discovery-safe-pill{flex:none;border-radius:999px;padding:7px 10px;background:#ecf6f1;color:#277b5b;font-size:10px;font-weight:700}.discovery-tabs{display:flex;gap:6px;border-bottom:1px solid #e2e8f0;overflow:auto}.discovery-tabs button{border:0;background:transparent;padding:10px 12px;color:#68778b;white-space:nowrap}.discovery-tabs button.active{color:#2f4f95;border-bottom:2px solid #435fa9;font-weight:700}.discovery-form-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.discovery-form-grid label,.candidate-filters label{display:grid;gap:5px;font-size:11px;font-weight:650;color:#59687b;min-width:0}.discovery-form-grid input,.discovery-form-grid select,.candidate-filters select{width:100%;min-width:0;height:39px;border:1px solid #dfe5ed;border-radius:8px;padding:0 10px;background:#fff;color:#24334a}.discovery-form-grid small{font-size:10px;color:#8a95a4;font-weight:400}.wide-field{grid-column:1/-1}.discovery-actions,.csv-upload-row,.csv-summary,.bulk-review-bar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:14px}.discovery-actions span{flex:1;min-width:210px;color:#758197;font-size:10px}.csv-card p{font-size:12px;line-height:1.5;color:#68778b}.csv-upload-row input{max-width:100%}.csv-summary span,.csv-summary b{padding:7px 10px;border-radius:8px;background:#f1f4f8;font-size:11px}.table-scroll{max-width:100%;overflow-x:auto;border:1px solid #e5eaf1;border-radius:10px;background:#fff}.discovery-table{width:100%;min-width:850px;border-collapse:collapse;text-align:left;font-size:11px}.discovery-table th{background:#f6f8fb;color:#778398;font-size:9px;letter-spacing:.04em}.discovery-table th,.discovery-table td{padding:11px 10px;border-bottom:1px solid #edf0f4;vertical-align:middle}.discovery-table tbody tr{cursor:pointer}.discovery-table tbody tr:hover{background:#f8faff}.discovery-table td small{display:block;margin-top:4px;color:#8490a1;max-width:250px;overflow-wrap:anywhere}.status-chip{display:inline-flex;margin-top:4px;padding:4px 7px;border-radius:999px;background:#f0f2f6;color:#536174;font-size:9px;white-space:nowrap}.status-chip.verified,.status-chip.accepted,.status-chip.new{background:#eaf5ef;color:#247653}.status-chip.rejected,.status-chip.failed,.status-chip.invalid,.status-chip.unreachable,.status-chip.robots_denied{background:#fff0ed;color:#a84d3f}.candidate-filters{display:flex;align-items:end;gap:10px;flex-wrap:wrap}.candidate-filters label{min-width:130px}.candidate-filters>span{margin-left:auto;color:#78859a;font-size:10px;padding-bottom:9px}.run-summary{display:flex;justify-content:space-between;gap:20px;align-items:center;padding:13px;border:1px solid #e6ebf2;border-radius:11px;background:#fff}.run-summary h3{margin:4px 0;color:#263b5b;font-size:15px}.run-summary p{margin:0;color:#8490a1;font-size:10px}.run-stats{display:flex;gap:10px;flex-wrap:wrap}.run-stats span{display:grid;gap:3px;text-align:center;color:#758196;font-size:9px}.run-stats b{font-size:15px;color:#263b5b}.bulk-review-bar{margin:0;padding:9px 12px;background:#edf2fb;border-radius:9px}.bulk-review-bar span{flex:1;font-size:11px}.discovery-empty,.prospect-state{padding:36px 14px;text-align:center;color:#7c8899;font-size:12px}.prospect-state{display:grid;gap:8px}.prospect-state b{color:#243650}.prospect-list-heading{align-items:center}.prospect-list-heading>span{font-size:10px;color:#7c8899}.prospect-list-panel{overflow:hidden}.candidate-backdrop{position:fixed;inset:0;z-index:50;display:flex;justify-content:flex-end;background:#15223866}.candidate-drawer{width:min(520px,100vw);height:100%;overflow:auto;background:#fff;padding:24px;box-shadow:-12px 0 35px #16243a22}.candidate-drawer h2{margin:10px 0 5px;color:#20324c}.candidate-drawer>a{color:#405fa6;font-size:12px;overflow-wrap:anywhere}.drawer-close{float:right;border:0;background:#eff2f6;border-radius:7px;padding:7px 10px;color:#59687b}.candidate-drawer dl{display:grid;grid-template-columns:minmax(120px,.8fr) minmax(0,1.2fr);gap:8px 12px;margin:22px 0;font-size:11px}.candidate-drawer dt{color:#7a8798}.candidate-drawer dd{margin:0;color:#33435b;overflow-wrap:anywhere}.drawer-actions{display:flex;gap:9px;margin-top:16px}.discovery-safety-note{padding:10px;border-radius:8px;background:#f5f7fa;color:#6e7a8d;font-size:10px;line-height:1.5}.prospect-list-heading h2{font-size:16px}.add-card h2{font-size:15px;color:#263b5b}.notice{overflow-wrap:anywhere}
+.candidate-evidence{display:grid;gap:8px;margin:14px 0}.candidate-evidence h3{margin:0;color:#263b5b;font-size:13px}.candidate-evidence article{padding:10px;border:1px solid #e7ebf1;border-radius:8px}.candidate-evidence article b{font-size:11px}.candidate-evidence article p{margin:5px 0;color:#526176;font-size:11px}.candidate-evidence article small{color:#8490a1;font-size:10px;overflow-wrap:anywhere}
+@media(max-width:760px){.prospects-toolbar{flex-wrap:wrap}.prospect-search{flex-basis:100%;max-width:none}.discovery-shell,.discovery-card,.add-card{padding:13px}.discovery-intro{display:grid}.discovery-safe-pill{justify-self:start}.discovery-form-grid{grid-template-columns:1fr}.wide-field{grid-column:auto}.discovery-actions{align-items:stretch}.discovery-actions button{width:100%}.run-summary{align-items:flex-start;flex-direction:column}.run-stats{width:100%;justify-content:space-between}.candidate-filters label{flex:1}.candidate-filters>span{margin-left:0}.candidate-drawer{padding:17px}.candidate-drawer dl{grid-template-columns:1fr;gap:4px}.candidate-drawer dd{margin-bottom:8px}.drawer-actions{position:sticky;bottom:0;background:#fff;padding:10px 0}.csv-upload-row>*{width:100%;max-width:none}.prospect-list-heading{align-items:flex-start}}
 </style>
 
 <style scoped>
-.pagination-controls{display:flex;align-items:center;justify-content:center;gap:15px;color:#7c8592;font-size:11px}.pagination-controls button:disabled{opacity:.4;cursor:not-allowed}
+@media(max-width:900px){
+  .prospects-workspace,.discovery-shell,.discovery-card,.discovery-results{min-width:0;max-width:100%}
+  .discovery-intro{display:grid}
+  .discovery-safe-pill{justify-self:start}
+  .run-summary{align-items:flex-start;flex-direction:column}
+  .candidate-filters label{flex:1 1 140px}
+}
 </style>

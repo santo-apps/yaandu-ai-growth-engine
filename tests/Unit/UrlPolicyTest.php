@@ -68,4 +68,36 @@ class UrlPolicyTest extends TestCase
         $this->expectException(InvalidArgumentException::class);
         (new UrlPolicy($resolver))->fetch('https://example.test/');
     }
+
+    public function test_loopback_private_link_local_metadata_and_ipv6_targets_are_rejected(): void
+    {
+        $resolver = new class implements PublicAddressResolverInterface
+        {
+            public function resolve(string $host): array
+            {
+                return match (strtolower(trim($host, '[]'))) {
+                    'metadata.google.internal' => ['169.254.169.254'],
+                    'private.example' => ['10.0.0.8'],
+                    default => [trim($host, '[]')],
+                };
+            }
+        };
+        $policy = new UrlPolicy($resolver);
+        foreach (['http://localhost/', 'http://127.0.0.1/', 'http://10.0.0.8/', 'http://169.254.169.254/', 'http://[::1]/', 'http://[fc00::1]/', 'http://[fe80::1]/', 'http://metadata.google.internal/', 'https://private.example/'] as $url) {
+            try { $policy->validatePublicHttpUrl($url); self::fail('Expected unsafe target to be rejected: '.$url); }
+            catch (\InvalidArgumentException) { self::assertTrue(true); }
+        }
+    }
+
+    public function test_redirect_to_a_private_dns_answer_is_rejected_before_second_request(): void
+    {
+        $resolver = new class implements PublicAddressResolverInterface
+        {
+            private int $calls = 0;
+            public function resolve(string $host): array { return ++$this->calls === 1 ? ['8.8.8.8'] : ['192.168.0.4']; }
+        };
+        Http::fake(['https://example.test/*' => Http::response('', 302, ['Location' => '/private'])]);
+        try { (new UrlPolicy($resolver))->fetch('https://example.test/'); self::fail('Expected private redirect answer to be rejected.'); }
+        catch (InvalidArgumentException) { self::assertCount(1, Http::recorded()); }
+    }
 }

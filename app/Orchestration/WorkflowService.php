@@ -18,7 +18,9 @@ final class WorkflowService
     public function create(string $tenantId, array $input, ?string $actorId = null): object
     {
         foreach (['company_id' => 'companies', 'contact_id' => 'contacts', 'campaign_id' => 'campaigns', 'enrollment_id' => 'campaign_recipients', 'conversation_id' => 'conversations', 'opportunity_id' => 'sales_opportunities'] as $field => $table) {
-            if (! empty($input[$field]) && ! DB::table($table)->where('tenant_id', $tenantId)->where('id', $input[$field])->exists()) {
+            $record = ! empty($input[$field]) ? DB::table($table)->where('tenant_id', $tenantId)->where('id', $input[$field]) : null;
+            if ($field === 'company_id') $record?->where('status', '!=', 'discovery_candidate');
+            if ($record && ! $record->exists()) {
                 throw ValidationException::withMessages([$field => 'The selected record is not available in this tenant.']);
             }
         }
@@ -303,7 +305,7 @@ final class WorkflowService
             foreach (array_slice(array_unique($output['company_ids'] ?? []), 0, 100) as $companyId) {
                 $exists = DB::table('acquisition_workflows')->where('tenant_id', $tenantId)->where('company_id', $companyId)
                     ->whereNotIn('status', [WorkflowStatus::Completed->value, WorkflowStatus::Cancelled->value])->exists();
-                if (! $exists && DB::table('companies')->where('tenant_id', $tenantId)->where('id', $companyId)->exists()) {
+                if (! $exists && DB::table('companies')->where('tenant_id', $tenantId)->where('id', $companyId)->where('status', '!=', 'discovery_candidate')->exists()) {
                     $workflow = $this->create($tenantId, ['company_id' => $companyId]);
                     $this->append($tenantId, $workflow->id, 'company_discovered', 'agent', ['company_id' => $companyId, 'agent_key' => $agentKey, 'agent_run_id' => $agentRunId],
                         'agent-run:'.$agentRunId.':company:'.$companyId, null, $agentRunId);

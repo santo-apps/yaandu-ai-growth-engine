@@ -249,7 +249,9 @@ class CampaignController extends Controller
         $record = Campaign::where('tenant_id', app('tenant.id'))->where('status', CampaignStatus::Draft)->findOrFail($campaign);
         $data = $request->validate(['contact_id' => ['required', 'uuid'], 'contact_method_id' => ['nullable', 'uuid']]);
         $tenantId = app('tenant.id');
-        $contact = DB::table('contacts')->where('tenant_id', $tenantId)->where('id', $data['contact_id'])->first();
+        $contact = DB::table('contacts')->join('companies', function ($join) use ($tenantId): void {
+            $join->on('companies.id', '=', 'contacts.company_id')->where('companies.tenant_id', '=', $tenantId)->where('companies.status', '!=', 'discovery_candidate');
+        })->where('contacts.tenant_id', $tenantId)->where('contacts.id', $data['contact_id'])->select('contacts.*')->first();
         abort_unless($contact, 404);
         $query = DB::table('contact_methods')->where('tenant_id', $tenantId)->where('contact_id', $contact->id)->where('type', 'email');
         if (isset($data['contact_method_id'])) $query->where('id', $data['contact_method_id']);

@@ -67,7 +67,7 @@ final class DeterministicAIProviderSafetyTest extends TestCase
         $website = $provider->generate(new AIRequest('website_reasoning', 'Fixture only.', [[
             'url' => 'https://northstar-retail.fixture.test', 'text' => 'Retail ecommerce business with an older storefront layout. Mobile navigation is difficult.',
         ]], ['type' => 'object', 'required' => ['summary','issues','technologies','insights','contacts']]), 'fixture-model');
-        self::assertSame('Fictional retail and ecommerce business with an outdated site and weak mobile experience.', $website->data['summary']);
+        self::assertSame('Local deterministic analysis based only on the supplied fictional page evidence.', $website->data['summary']);
         self::assertStringContainsString('older storefront layout', $website->data['issues'][0]['evidence']);
         (new JsonSchemaValidator())->validate($website->data, ['type' => 'object', 'required' => ['summary','issues','technologies','insights','contacts']]);
 

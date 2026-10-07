@@ -12,7 +12,7 @@ final class CrawlerService
 {
     public function __construct(private readonly UrlPolicy $policy, private readonly RobotsRules $robots, private readonly SitemapParser $sitemaps, private readonly UrlResolver $resolver, private readonly PlaywrightScreenshotService $screenshots) {}
 
-    public function crawl(string $tenantId, string $websiteId, int $maxPages = 30, int $maxDepth = 2, ?string $existingScanId = null): string
+    public function crawl(string $tenantId, string $websiteId, int $maxPages = 30, int $maxDepth = 2, ?string $existingScanId = null, ?int $maxBrowserRenders = null): string
     {
         $website = DB::table('company_websites')->where('tenant_id', $tenantId)->where('id', $websiteId)->first();
         if (! $website) throw new RuntimeException('Website not found in this tenant.');
@@ -49,7 +49,7 @@ final class CrawlerService
             $robotsText = $this->fetchRobotsRules($root.'/robots.txt', $budget);
             $queue = [[$root, 0]];
             foreach ($this->sitemaps->urls($this->safeFetchBody($root.'/sitemap.xml', $budget), $maxPages) as $url) $queue[] = [$url, 1];
-            $seen = []; $host = strtolower($website->host); $saved = 0;
+        $seen = []; $host = strtolower($website->host); $saved = 0; $browserRenders = 0;
             while ($queue && $saved < $maxPages) {
                 $budget->assertTime();
                 [$url, $depth] = array_shift($queue);
@@ -74,7 +74,8 @@ final class CrawlerService
                     'http_status' => $response->status(), 'content_type' => $contentType,
                     'title' => $this->title($html), 'fetched_at' => now(), 'content_hash' => hash('sha256', $html), 'object_key' => $objectKey,
                     'extracted_text' => mb_substr($text, 0, 30000), 'depth' => $depth, 'created_at' => $existingPage?->created_at ?? now(), 'updated_at' => now()]);
-                if ($depth === 0) {
+                if ($depth === 0 && ($maxBrowserRenders === null || $browserRenders < $maxBrowserRenders)) {
+                    $browserRenders++;
                     $renderedHtml = $this->screenshots->capture($tenantId, $scanId, $pageId, $finalUrl, $budget->remainingSeconds());
                     $budget->assertTime();
                     if ($renderedHtml !== null && mb_strlen($text) < 200) {
