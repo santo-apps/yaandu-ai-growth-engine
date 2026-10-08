@@ -40,12 +40,12 @@ class ConversationWorkflowTest extends TestCase
 
         $this->withHeader('X-Tenant-ID', $tenant->id)
             ->postJson('/api/v1/conversations/'.$conversation->id.'/classify')
-            ->assertOk()->assertJsonPath('analysis.intent', 'interested')
+            ->assertOk()->assertJsonPath('analysis.intent', 'meeting_request')
             ->assertJsonPath('analysis.confidence', 0.97)
-            ->assertJsonPath('analysis.recommended_action', 'continue_qualification')
+            ->assertJsonPath('analysis.recommended_action', 'offer_scheduling')
             ->assertJsonPath('analysis.risk', 'none')
             ->assertJsonStructure(['analysis' => ['summary', 'reason', 'evidence_references']])
-            ->assertJsonPath('conversation.intent', 'interested');
+            ->assertJsonPath('conversation.intent', 'meeting_request');
     }
 
     public function test_classification_is_tenant_scoped_and_low_confidence_sets_human_review(): void

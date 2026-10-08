@@ -50,6 +50,10 @@ final class WorkflowService
             $this->stopTenant($tenantId);
             throw new \RuntimeException('AI execution is unavailable for this tenant.');
         }
+        if (! empty($input['campaign_id']) && DB::table('campaigns')->where('tenant_id', $tenantId)
+            ->where('id', $input['campaign_id'])->where('status', 'cancelled')->exists()) {
+            throw new \RuntimeException('Agent execution is stopped because the campaign was cancelled.');
+        }
         if (! empty($input['website_scan_id'])) {
             $companyId = DB::table('website_scans as s')->join('company_websites as w', function ($join): void { $join->on('w.id','=','s.company_website_id')->on('w.tenant_id','=','s.tenant_id'); })
                 ->where('s.tenant_id', $tenantId)->where('s.id', $input['website_scan_id'])->value('w.company_id');
@@ -61,8 +65,13 @@ final class WorkflowService
             if ($companyId) $input['company_id'] = $companyId;
         }
         $query = DB::table('acquisition_workflows')->where('tenant_id', $tenantId);
-        if (! empty($input['company_id'])) $query->where('company_id', $input['company_id']);
+        if (! empty($input['workflow_id'])) $query->where('id', $input['workflow_id']);
+        elseif (! empty($input['campaign_id'])) $query->where('campaign_id', $input['campaign_id']);
+        elseif (! empty($input['enrollment_id'])) $query->where('enrollment_id', $input['enrollment_id']);
+        elseif (! empty($input['opportunity_id'])) $query->where('opportunity_id', $input['opportunity_id']);
         elseif (! empty($input['conversation_id'])) $query->where('conversation_id', $input['conversation_id']);
+        elseif (! empty($input['company_id'])) $query->where('company_id', $input['company_id'])
+            ->whereNotIn('status', [WorkflowStatus::Cancelled->value, WorkflowStatus::Completed->value]);
         else $query = null;
         $workflow = $query?->orderByDesc('updated_at')->first();
         if ($workflow && (in_array($workflow->status, [WorkflowStatus::Paused->value, WorkflowStatus::Cancelled->value, WorkflowStatus::Completed->value], true)

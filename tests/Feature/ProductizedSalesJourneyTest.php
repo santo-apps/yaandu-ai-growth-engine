@@ -14,6 +14,7 @@ use App\Jobs\ProcessFollowUpReply;
 use App\Jobs\RunAgentJob;
 use App\Jobs\SendOutboundMessage;
 use App\Jobs\ProcessCampaignEnrollment;
+use App\Jobs\ProcessProspectImportRowJob;
 use App\Messaging\FakeOutboundMessagingProvider;
 use App\Messaging\FakeInboundMessagingProvider;
 use App\Messaging\InboundMessageEvent;
@@ -49,6 +50,7 @@ use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Queue;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Str;
+use Illuminate\Http\UploadedFile;
 use DateTimeImmutable;
 use Laravel\Sanctum\Sanctum;
 use Tests\TestCase;
@@ -60,7 +62,7 @@ final class ProductizedSalesJourneyTest extends TestCase
     public function test_http_product_journey_reaches_approved_ready_to_send_without_delivering_proposal(): void
     {
         Queue::fake();
-        $ctx = $this->preOutreachFixture('journey-positive');
+        $ctx = $this->preOutreachFixture('journey-positive', true);
         [$tenant,$owner,$company,$campaign,$workflow,$contact,$methodId,$service,$draft,$fakeOutbound] = $ctx;
         $headers=['X-Tenant-ID'=>$tenant->id];
         $this->withHeaders($headers)->postJson('/api/v1/marketing-drafts/'.$draft->id.'/approve',[])->assertOk()->assertJsonPath('status','approved');
@@ -137,6 +139,9 @@ final class ProductizedSalesJourneyTest extends TestCase
         self::assertSame('UNKNOWN',$qualification['AUTHORITY']['level']);
         self::assertSame('UNKNOWN',$qualification['BUDGET']['level']);
         self::assertGreaterThanOrEqual(60,(int)$opportunity->qualification_score);
+        $qualifiedResponse=$this->withHeaders($headers)->postJson('/api/v1/opportunities/'.$opportunity->id.'/qualified',[])->assertOk()->json();
+        self::assertSame('QUALIFIED',$qualifiedResponse['stage']);
+        $this->assertDatabaseHas('sales_opportunities',['tenant_id'=>$tenant->id,'id'=>$opportunity->id,'qualified_at'=>$qualifiedResponse['qualified_at']]);
 
         $this->consumeForCompany($tenant->id,$company->id,'reply_analyzed');
         $this->consumeForCompany($tenant->id,$company->id,'opportunity_created');
@@ -292,7 +297,7 @@ final class ProductizedSalesJourneyTest extends TestCase
         $this->assertDatabaseMissing('audit_logs',['tenant_id'=>$tenant->id,'action'=>'marketing_draft.approved','subject_id'=>$draft->id]);
     }
 
-    private function preOutreachFixture(string $slug): array
+    private function preOutreachFixture(string $slug, bool $importKnownDomain = false): array
     {
         $tenant=Tenant::create(['id'=>(string)Str::uuid(),'name'=>$slug,'slug'=>$slug]);
         $owner=User::create(['name'=>'Journey Owner','email'=>$slug.'@example.test','password'=>'hashed-test-password']);
@@ -328,6 +333,20 @@ final class ProductizedSalesJourneyTest extends TestCase
             '/robots.txt', '/sitemap.xml' => Http::response('', 404),
             default => Http::response('<html><body>Legacy desktop ecommerce site. Alex Buyer Director, contact us at buyer@'.$slug.'.test. No WhatsApp link.</body></html>', 200, ['Content-Type' => 'text/html']),
         });
+        if ($importKnownDomain) {
+            $headers = ['X-Tenant-ID' => $tenant->id];
+            $csv = "business_name,website,country,city,industry,source\nJourney Retail,https://{$slug}.test,IN,Chennai,Retail,deterministic acceptance fixture\n";
+            $preview = $this->withHeaders($headers)->postJson('/api/v1/pilot/import-batches/preview', [
+                'csv' => UploadedFile::fake()->createWithContent('sprint7-pilot.csv', $csv),
+            ])->assertCreated()->json();
+            self::assertSame(1, $preview['counts']['valid']);
+            $this->withHeaders($headers)->postJson('/api/v1/pilot/import-batches/'.$preview['id'].'/confirm', [
+                'idempotency_key' => 'sprint7-positive-import-'.$slug,
+            ])->assertAccepted()->assertJsonPath('queued_rows', 1);
+            $importRowId = DB::table('prospect_import_rows')->where('tenant_id', $tenant->id)->where('batch_id', $preview['id'])->value('id');
+            (new ProcessProspectImportRowJob($tenant->id, $importRowId, (string) $owner->id))->handle(app(ContactMethodValue::class));
+            $this->assertDatabaseHas('prospect_import_rows', ['tenant_id' => $tenant->id, 'id' => $importRowId, 'status' => 'completed']);
+        }
         $discovery=app(AgentOrchestrator::class)->run('DiscoveryAgent',$tenant->id,['candidates'=>[['name'=>'Journey Retail','website'=>'https://'.$slug.'.test','industry'=>'Retail','source'=>'user_seed']]],(string)$owner->id);
         $company=Company::where('tenant_id',$tenant->id)->findOrFail($discovery->data['company_ids'][0]);
         $website=DB::table('company_websites')->where('tenant_id',$tenant->id)->where('company_id',$company->id)->first();

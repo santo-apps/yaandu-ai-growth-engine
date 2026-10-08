@@ -39,6 +39,9 @@ final class DomainNormalizer
         }
         if (str_starts_with($host, 'www.')) $host = substr($host, 4);
         if ($host === '' || strlen($host) > 253) throw new InvalidArgumentException('The website domain is invalid.');
+        if (! filter_var($host, FILTER_VALIDATE_IP) && filter_var($host, FILTER_VALIDATE_DOMAIN, FILTER_FLAG_HOSTNAME) === false) {
+            throw new InvalidArgumentException('Enter a valid fully qualified public domain.');
+        }
         $scheme = strtolower($parts['scheme']);
         $displayHost = str_contains($host, ':') ? '['.$host.']' : $host;
         $path = $parts['path'] ?? '/';

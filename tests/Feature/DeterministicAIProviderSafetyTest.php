@@ -38,10 +38,29 @@ final class DeterministicAIProviderSafetyTest extends TestCase
         ], ['type' => 'object', 'required' => ['subject','message','reasoning_summary','personalization_points','evidence_references','confidence','recommended_call_to_action'],
             'properties' => ['subject' => ['type' => 'string'], 'message' => ['type' => 'string'], 'evidence_references' => ['type' => 'array']]]), 'fixture-model');
         self::assertSame('deterministic', $marketing->provider);
-        self::assertStringContainsString('Ananya', $marketing->data['message']);
-        self::assertStringContainsString('mobile', mb_strtolower($marketing->data['message']));
+        self::assertStringContainsString('Northstar Retail Systems Pvt Ltd', $marketing->data['subject']);
+        self::assertStringNotContainsString('Ananya', $marketing->data['message']);
+        self::assertStringNotContainsString('mobile', mb_strtolower($marketing->data['message']));
+        self::assertSame([], $marketing->data['personalization_points']);
         self::assertContains($evidenceId, $marketing->data['evidence_references']);
         self::assertContains($knowledgeId, $marketing->data['evidence_references']);
+
+        $issueId = (string) Str::uuid();
+        $grounded = $provider->generate(new AIRequest('content_generation', 'Fixture only.', [
+            'prospect' => ['company' => ['name' => 'Aster Medical'], 'evidence' => [['id' => $issueId, 'type' => 'website_issue', 'issue_type' => 'poor_mobile_ux']]],
+        ], ['type' => 'object', 'required' => ['subject','message','reasoning_summary','personalization_points','evidence_references','confidence','recommended_call_to_action'],
+            'properties' => ['subject' => ['type' => 'string'], 'message' => ['type' => 'string'], 'evidence_references' => ['type' => 'array']]]), 'fixture-model');
+        self::assertSame(['A mobile experience review may be useful.'], $grounded->data['personalization_points']);
+        self::assertSame([$issueId], $grounded->data['evidence_references']);
+        self::assertStringNotContainsString('Northstar', $grounded->data['message']);
+
+        $generic = $provider->generate(new AIRequest('content_generation', 'Fixture only.', [
+            'prospect' => ['company' => ['name' => 'Unanalyzed Business'], 'evidence' => []],
+        ], ['type' => 'object', 'required' => ['subject','message','reasoning_summary','personalization_points','evidence_references','confidence','recommended_call_to_action'],
+            'properties' => ['subject' => ['type' => 'string'], 'message' => ['type' => 'string'], 'evidence_references' => ['type' => 'array']]]), 'fixture-model');
+        self::assertStringNotContainsString('reviewed', mb_strtolower($generic->data['message']));
+        self::assertSame([], $generic->data['evidence_references']);
+        self::assertSame([], $generic->data['personalization_points']);
 
         $sales = $router->generate(new AIRequest('sales_reasoning', 'Fixture only.', [
             'conversation' => [['id' => $messageId, 'direction' => 'inbound', 'body' => 'Interested in modernization; can we meet?']],
@@ -78,10 +97,12 @@ final class DeterministicAIProviderSafetyTest extends TestCase
                 ['id' => $serviceId, 'name' => 'E-commerce modernization discovery', 'description' => 'Scope description.', 'standard_deliverables' => ['Modernization opportunity map']],
             ],
             'approved_tenant_knowledge' => [['id' => $knowledgeId]],
-            'prospect_data_untrusted' => ['evidence' => [['id' => $evidenceId]],
+            'prospect_data_untrusted' => ['company' => ['id' => (string) Str::uuid(), 'name' => 'Aster Medical Centre'], 'evidence' => [['id' => $evidenceId]],
                 'requirements' => ['requested_services' => ['E-commerce modernization discovery']]],
         ], ['type' => 'object', 'required' => ['executive_summary','client_understanding','recommended_solution','scope']]), 'fixture-model');
         self::assertSame([$serviceId], $proposal->data['recommended_solution']);
+        self::assertStringContainsString('Aster Medical Centre', $proposal->data['executive_summary']);
+        self::assertStringNotContainsString('Northstar', json_encode($proposal->data, JSON_THROW_ON_ERROR));
         self::assertSame([$evidenceId], $proposal->data['evidence_references']);
         self::assertSame([$knowledgeId], $proposal->data['knowledge_references']);
         self::assertStringNotContainsString('₹', $proposal->data['commercial_narrative']);
@@ -94,6 +115,29 @@ final class DeterministicAIProviderSafetyTest extends TestCase
         } catch (RuntimeException $exception) {
             self::assertStringContainsString('does not support task', $exception->getMessage());
         }
+    }
+
+    public function test_deterministic_reply_classifies_an_explicit_meeting_request(): void
+    {
+        config(['ai.local_acceptance.enabled' => true]);
+        $provider = new DeterministicAIProvider();
+        $messageId = (string) Str::uuid();
+        $message = ['id' => $messageId, 'direction' => 'inbound', 'body' => 'We are interested. Can we book a meeting next week?'];
+
+        $classification = $provider->generate(new AIRequest('sales_reasoning', 'Fixture only.', ['messages' => [$message]], [
+            'type' => 'object', 'required' => ['intent','confidence','summary','reason','risk','evidence_references'],
+            'properties' => ['summary' => ['type' => 'string']],
+        ]), 'fixture-model');
+        self::assertSame('meeting_request', $classification->data['intent']);
+        self::assertSame('The prospect explicitly requested a meeting.', $classification->data['summary']);
+
+        $recommendation = $provider->generate(new AIRequest('sales_reasoning', 'Fixture only.', ['conversation' => [$message]], [
+            'type' => 'object', 'required' => ['intent','confidence','reasoning_summary','draft_message','evidence_references'],
+            'properties' => ['intent' => ['type' => 'string']],
+        ]), 'fixture-model');
+        self::assertSame('meeting_request', $recommendation->data['intent']);
+        self::assertStringContainsString('explicitly requested a meeting', $recommendation->data['reasoning_summary']);
+        self::assertSame([$messageId], $recommendation->data['evidence_references']);
     }
 
     public function test_deterministic_provider_fails_closed_outside_local_or_testing_and_router_has_no_fake_fallback(): void
@@ -126,6 +170,23 @@ final class DeterministicAIProviderSafetyTest extends TestCase
         self::assertSame(1, Artisan::call('product:acceptance-reset'));
         self::assertDatabaseHas('tenants', ['id' => $tenant->id, 'slug' => 'ordinary-tenant']);
         $this->actingAs($owner)->withHeader('X-Tenant-ID', $tenant->id)->postJson('/api/v1/local-acceptance/reply', ['intent' => 'interested'])->assertNotFound();
+        $this->actingAs($owner)->withHeader('X-Tenant-ID', $tenant->id)->getJson('/api/v1/local-acceptance/status')->assertNotFound();
+    }
+
+    public function test_local_acceptance_controls_allow_only_the_explicit_sprint_seven_simulated_pilot(): void
+    {
+        config(['ai.local_acceptance.enabled' => true, 'pilot.allow_simulated_fixtures' => false]);
+        $tenant = Tenant::create(['name' => 'Sprint 7 simulation', 'slug' => 'sprint-7-simulated-pilot', 'status' => 'active',
+            'settings' => ['fixture_type' => 'yaandu_sprint_7_simulated_pilot', 'simulated' => true]]);
+        $owner = User::create(['name' => 'Pilot Owner', 'email' => 'pilot-acceptance-tools@example.test', 'password' => Hash::make('test-only-password')]);
+        $owner->tenants()->attach($tenant->id, ['role' => 'owner', 'status' => 'active']);
+
+        $this->actingAs($owner)->withHeader('X-Tenant-ID', $tenant->id)->getJson('/api/v1/local-acceptance/status')
+            ->assertOk()->assertJsonPath('mode', 'LOCAL ACCEPTANCE')->assertJsonPath('providers.outbound', 'FakeOutboundMessagingProvider');
+        $this->actingAs($owner)->withHeader('X-Tenant-ID', $tenant->id)->postJson('/api/v1/local-acceptance/reply', ['intent' => 'interested'])
+            ->assertStatus(409)->assertJsonPath('message', 'A fake outbound message for a local acceptance fixture must be marked sent before simulating a prospect reply.');
+
+        $tenant->update(['settings' => ['fixture_type' => 'unrecognized', 'simulated' => true]]);
         $this->actingAs($owner)->withHeader('X-Tenant-ID', $tenant->id)->getJson('/api/v1/local-acceptance/status')->assertNotFound();
     }
 

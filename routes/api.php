@@ -23,6 +23,7 @@ use App\Http\Controllers\Api\V1\MarketingConfigurationController;
 use App\Http\Controllers\Api\V1\SalesController;
 use App\Http\Controllers\Api\V1\LocalAcceptanceController;
 use App\Http\Controllers\Api\V1\WebIndexOperationsController;
+use App\Http\Controllers\Api\V1\PilotController;
 use App\Http\Middleware\ResolveTenant;
 use Illuminate\Support\Facades\Route;
 
@@ -37,6 +38,17 @@ Route::prefix('v1')->group(function (): void {
     Route::get('/me', fn () => request()->user());
     Route::get('/tenants', [AuthController::class, 'tenants']);
     Route::get('/dashboard/summary', [CompanyController::class, 'dashboard']);
+    Route::get('/pilot/dashboard', [PilotController::class, 'dashboard']);
+    Route::get('/pilot/operations', [PilotController::class, 'operations'])->middleware('throttle:60,1');
+    Route::get('/pilot/readiness', [PilotController::class, 'readiness'])->middleware('throttle:60,1');
+    Route::get('/pilot/cohorts', [PilotController::class, 'cohorts']);
+    Route::post('/pilot/cohorts', [PilotController::class, 'createCohort']);
+    Route::get('/pilot/import-batches', [PilotController::class, 'batches']);
+    Route::post('/pilot/import-batches/preview', [PilotController::class, 'previewImport'])->middleware('throttle:10,1');
+    Route::get('/pilot/import-batches/{batch}', [PilotController::class, 'batch']);
+    Route::post('/pilot/import-batches/{batch}/confirm', [PilotController::class, 'confirmImport'])->middleware('throttle:10,1');
+    Route::post('/pilot/import-batches/{batch}/retry', [PilotController::class, 'retryImport'])->middleware('throttle:10,1');
+    Route::get('/pilot/import-batches/{batch}/errors.csv', [PilotController::class, 'errorReport']);
     Route::get('/contacts', [CompanyController::class, 'contacts']);
     Route::get('/lead-scores', [CompanyController::class, 'scores']);
     Route::get('/website-screenshots/{screenshot}/content', [CompanyController::class, 'screenshotContent']);

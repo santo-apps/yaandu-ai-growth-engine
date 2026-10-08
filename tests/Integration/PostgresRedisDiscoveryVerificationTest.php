@@ -9,9 +9,11 @@ use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\Queue;
+use Illuminate\Support\Facades\Redis;
 use Illuminate\Support\Str;
 use Tests\TestCase;
 use Laravel\Sanctum\Sanctum;
+use Illuminate\Http\UploadedFile;
 
 /**
  * Opt-in integration test. Run only against the configured, migrated local PostgreSQL
@@ -26,6 +28,7 @@ final class PostgresRedisDiscoveryVerificationTest extends TestCase
         }
         self::assertSame('pgsql', DB::connection()->getDriverName(), 'This suite must execute against PostgreSQL.');
         self::assertSame('redis', config('queue.default'), 'This suite must enqueue through Redis.');
+        $this->isolateRedisQueue();
 
         $tenant = Tenant::create(['id' => (string) Str::uuid(), 'name' => 'PostgreSQL Candidate Discovery Integration',
             'slug' => 'pg-candidate-'.Str::lower(Str::random(12)), 'status' => 'active']);
@@ -82,7 +85,9 @@ final class PostgresRedisDiscoveryVerificationTest extends TestCase
 
         self::assertSame('pgsql', DB::connection()->getDriverName(), 'This suite must execute against PostgreSQL.');
         self::assertSame('redis', config('queue.default'), 'This suite must enqueue through Redis.');
+        $this->isolateRedisQueue();
         config(['discovery.allow_deterministic' => true, 'ai.local_acceptance.enabled' => true,
+            'pilot.allow_simulated_fixtures' => true,
             'ai.tasks.website_reasoning.provider' => 'deterministic', 'ai.tasks.website_reasoning.model' => 'local-acceptance-v1',
             'ai.tasks.lead_classification.provider' => 'deterministic', 'ai.tasks.lead_classification.model' => 'local-acceptance-v1']);
 
@@ -137,5 +142,61 @@ final class PostgresRedisDiscoveryVerificationTest extends TestCase
             $tenant->delete();
             $user->delete();
         }
+    }
+
+    public function test_sprint_seven_known_domain_import_is_tenant_scoped_and_processed_from_redis(): void
+    {
+        if (! (bool) env('YAANDU_POSTGRES_REDIS_INTEGRATION', false)) {
+            self::markTestSkipped('Set YAANDU_POSTGRES_REDIS_INTEGRATION=true to run against the dedicated local PostgreSQL/Redis integration environment.');
+        }
+        self::assertSame('pgsql', DB::connection()->getDriverName());
+        self::assertSame('redis', config('queue.default'));
+        $this->isolateRedisQueue();
+
+        $tenant = Tenant::create(['id' => (string) Str::uuid(), 'name' => 'Sprint 7 import integration', 'slug' => 's7-import-'.Str::lower(Str::random(12)), 'status' => 'active']);
+        $user = User::create(['name' => 'Sprint 7 Import Owner', 'email' => 's7-import-'.Str::lower(Str::random(12)).'@example.test', 'password' => Hash::make(Str::random(32))]);
+        $tenant->users()->attach($user->id, ['role' => 'owner', 'status' => 'active']);
+        Sanctum::actingAs($user);
+        try {
+            $headers = ['X-Tenant-ID' => $tenant->id];
+            $operations = $this->withHeaders($headers)->getJson('/api/v1/pilot/operations')->assertOk()->json();
+            self::assertSame('available', $operations['redis']);
+            // This integration suite intentionally stops Horizon and consumes jobs with one-off workers.
+            self::assertSame('inactive', $operations['horizon']['status']);
+            $cohort = $this->withHeaders($headers)->postJson('/api/v1/pilot/cohorts', ['name' => 'Postgres Redis import integration', 'status' => 'active'])->assertCreated()->json();
+            $preview = $this->withHeaders($headers)->postJson('/api/v1/pilot/import-batches/preview', [
+                'csv' => UploadedFile::fake()->createWithContent('s7-integration.csv', "business_name,website,country,source\nPG Integration Business,https://www.pg-import-fixture.test,IN,integration fixture\n"),
+                'cohort_id' => $cohort['id'],
+            ])->assertCreated()->json();
+            $this->withHeaders($headers)->postJson('/api/v1/pilot/import-batches/'.$preview['id'].'/confirm', ['idempotency_key' => 's7-pg-import-'.$tenant->id])->assertAccepted()->assertJsonPath('queued_rows', 1);
+            self::assertSame(1, \Illuminate\Support\Facades\Queue::connection('redis')->size('intake'));
+            self::assertSame(0, Artisan::call('queue:work', ['connection' => 'redis', '--queue' => 'intake', '--once' => true, '--tries' => 1]));
+
+            $company = DB::table('companies')->where('tenant_id', $tenant->id)->where('normalized_domain', 'pg-import-fixture.test')->first();
+            self::assertNotNull($company);
+            self::assertSame('user_supplied_import', DB::table('company_websites')->where('tenant_id', $tenant->id)->where('company_id', $company->id)->value('source'));
+            self::assertSame('unverified', DB::table('company_websites')->where('tenant_id', $tenant->id)->where('company_id', $company->id)->value('verification_status'));
+            self::assertSame('completed', DB::table('prospect_import_batches')->where('tenant_id', $tenant->id)->where('id', $preview['id'])->value('status'));
+            $this->withHeaders($headers)->postJson('/api/v1/pilot/import-batches/'.$preview['id'].'/confirm', ['idempotency_key' => 's7-pg-import-'.$tenant->id])->assertAccepted()->assertJsonPath('queued_rows', 0);
+            self::assertSame(0, \Illuminate\Support\Facades\Queue::connection('redis')->size('intake'));
+
+            $otherTenant = Tenant::create(['id' => (string) Str::uuid(), 'name' => 'Other Sprint 7 tenant', 'slug' => 's7-other-'.Str::lower(Str::random(12)), 'status' => 'active']);
+            $otherUser = User::create(['name' => 'Other Tenant', 'email' => 's7-other-'.Str::lower(Str::random(12)).'@example.test', 'password' => Hash::make(Str::random(32))]);
+            $otherTenant->users()->attach($otherUser->id, ['role' => 'owner', 'status' => 'active']);
+            Sanctum::actingAs($otherUser);
+            $this->withHeader('X-Tenant-ID', $otherTenant->id)->getJson('/api/v1/pilot/import-batches/'.$preview['id'])->assertNotFound();
+            self::assertSame(0, DB::table('companies')->where('tenant_id', $otherTenant->id)->count());
+            $otherTenant->delete(); $otherUser->delete();
+        } finally {
+            $tenant->delete();
+            $user->delete();
+        }
+    }
+
+    /** Use a fresh Redis key namespace per test so global queue observations cannot see other local work. */
+    private function isolateRedisQueue(): void
+    {
+        config(['database.redis.options.prefix' => 'yaandu_s7_it_'.Str::lower(Str::random(24)).'_']);
+        Redis::purge('default');
     }
 }

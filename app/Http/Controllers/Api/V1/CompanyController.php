@@ -94,7 +94,28 @@ class CompanyController extends Controller
 
     public function show(string $company)
     {
-        return Company::where('tenant_id', app('tenant.id'))->where('status', '!=', 'discovery_candidate')->with(['websites'])->findOrFail($company);
+        $tenantId = app('tenant.id');
+        $record = Company::where('tenant_id', $tenantId)->where('status', '!=', 'discovery_candidate')->with(['websites'])->findOrFail($company);
+        $record->setAttribute('import_provenance', DB::table('prospect_import_rows as rows')
+            ->join('prospect_import_batches as batches', function ($join): void {
+                $join->on('batches.id', '=', 'rows.batch_id')->on('batches.tenant_id', '=', 'rows.tenant_id');
+            })
+            ->leftJoin('users', 'users.id', '=', 'batches.created_by')
+            ->leftJoin('pilot_cohorts as cohorts', function ($join): void {
+                $join->on('cohorts.id', '=', 'batches.pilot_cohort_id')->on('cohorts.tenant_id', '=', 'batches.tenant_id');
+            })
+            ->where('rows.tenant_id', $tenantId)
+            ->where('rows.company_id', $record->id)
+            ->orderByDesc('rows.processed_at')
+            ->select([
+                'rows.id as import_row_id', 'rows.row_number', 'rows.original_name', 'rows.original_website',
+                'rows.normalized_domain', 'rows.source', 'rows.validation_status', 'rows.deduplication_status',
+                'rows.status as import_status', 'rows.created_at as received_at', 'rows.processed_at',
+                'batches.id as batch_id', 'batches.file_name', 'batches.confirmed_at',
+                'users.name as imported_by', 'cohorts.id as cohort_id', 'cohorts.name as cohort_name',
+            ])->first());
+
+        return $record;
     }
 
     public function websiteDiscovery(string $company)

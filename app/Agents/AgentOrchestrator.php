@@ -4,6 +4,7 @@ namespace App\Agents;
 
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Crypt;
+use Illuminate\Support\Facades\Log;
 use App\AI\JsonSchemaValidator;
 use Illuminate\Support\Str;
 use RuntimeException;
@@ -25,7 +26,6 @@ final class AgentOrchestrator
         $this->schemaValidator->validate($input, $agent->inputSchema());
         $encodedInput = json_encode($input, JSON_THROW_ON_ERROR);
         $inputHash = hash('sha256', $encodedInput);
-        app(\App\Orchestration\WorkflowService::class)->assertAgentExecutionAllowed($tenantId, $input);
         $runId = $existingRunId ?? (string) Str::uuid();
         $correlationId = null;
         if ($existingRunId) {
@@ -55,7 +55,10 @@ final class AgentOrchestrator
         }
         $this->event($runId, $tenantId, 'started', ['agent' => $name, 'correlation_id' => $correlationId]);
         $this->workflowEvent($tenantId, $runId, $name, $input, 'started');
+        $stage = 'workflow_policy';
         try {
+            app(\App\Orchestration\WorkflowService::class)->assertAgentExecutionAllowed($tenantId, $input);
+            $stage = 'agent_execution';
             $result = $agent->execute(new AgentContext($tenantId, $runId, $actorId, $correlationId), $input);
             $this->schemaValidator->validate($result->data, $agent->outputSchema());
             DB::table('agent_runs')->where('id', $runId)->where('tenant_id', $tenantId)->update(['status' => 'succeeded', 'error_code' => null, 'error_summary' => null, 'output_hash' => hash('sha256', json_encode($result->data)), 'summary' => $result->summary, 'finished_at' => now(), 'updated_at' => now()]);
@@ -64,6 +67,16 @@ final class AgentOrchestrator
             return $result;
         } catch (\Throwable $error) {
             $failure = AgentFailure::from($error, $correlationId);
+            if ($stage === 'workflow_policy') {
+                Log::warning('Agent execution blocked by workflow policy.', [
+                    'correlation_id' => $correlationId,
+                    'agent_name' => $name,
+                    'failure_stage' => $stage,
+                    'error_category' => 'WORKFLOW_POLICY_BLOCK',
+                    'exception_class' => $error::class,
+                    'retryable' => false,
+                ]);
+            }
             DB::table('agent_runs')->where('id', $runId)->where('tenant_id', $tenantId)->update(['status' => 'failed', 'error_code' => $failure->code, 'error_summary' => $failure->message, 'finished_at' => now(), 'updated_at' => now()]);
             $this->event($runId, $tenantId, 'failed', ['error_code' => $failure->code, 'safe_message' => $failure->message, 'correlation_id' => $correlationId]);
             $this->workflowEvent($tenantId, $runId, $name, $input, 'failed', null, [], $failure->code);

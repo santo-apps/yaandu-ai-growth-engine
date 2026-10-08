@@ -7,7 +7,9 @@ use App\AI\AIRequest;
 use App\AI\ApprovedPromptRepository;
 use App\AI\JsonSchemaValidator;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
 use RuntimeException;
+use Throwable;
 
 final class MarketingAgent implements AgentInterface
 {
@@ -23,6 +25,42 @@ final class MarketingAgent implements AgentInterface
 
     public function execute(AgentContext $context, array $input): AgentResult
     {
+        $stage = 'company_resolution';
+        $startedAt = hrtime(true);
+
+        try {
+            return $this->executeWithDiagnostics($context, $input, $stage);
+        } catch (Throwable $error) {
+            $provider = DB::table('ai_model_configurations')->where('tenant_id', $context->tenantId)
+                ->where('task_key', 'content_generation')->value('provider')
+                ?? config('ai.tasks.content_generation.provider');
+            $retryable = $stage === 'provider_generation'
+                && ($error instanceof \Illuminate\Http\Client\ConnectionException
+                    || str_contains(strtolower($error::class), 'timeout'));
+
+            Log::error('Marketing agent execution failed.', [
+                'correlation_id' => $context->correlationId,
+                'agent_name' => $this->name(),
+                'provider_id' => is_string($provider) ? $provider : null,
+                'provider_invoked' => $stage === 'provider_generation',
+                'failure_stage' => $stage,
+                'error_category' => match ($stage) {
+                    'prompt_configuration' => 'PROMPT_CONFIGURATION_MISSING',
+                    'provider_generation' => 'AI_PROVIDER_FAILURE',
+                    'output_validation' => 'AI_OUTPUT_INVALID',
+                    default => 'AGENT_EXECUTION_FAILED',
+                },
+                'exception_class' => $error::class,
+                'retryable' => $retryable,
+                'duration_ms' => (int) ((hrtime(true) - $startedAt) / 1_000_000),
+            ]);
+
+            throw $error;
+        }
+    }
+
+    private function executeWithDiagnostics(AgentContext $context, array $input, string &$stage): AgentResult
+    {
         $company = DB::table('companies')->where('tenant_id',$context->tenantId)->where('id',$input['company_id'])->first();
         if (! $company) throw new RuntimeException('Company was not found in this tenant.');
         $contact = null;
@@ -35,7 +73,9 @@ final class MarketingAgent implements AgentInterface
             $campaign = DB::table('campaigns')->where('tenant_id',$context->tenantId)->where('id',$input['campaign_id'])->first();
             if (! $campaign) throw new RuntimeException('Campaign was not found in this tenant.');
         }
+        $stage = 'prompt_configuration';
         $prompt = $this->prompts->get($context->tenantId, $this->name(), self::fallbackPolicy());
+        $stage = 'evidence_collection';
         $evidence = $this->evidence($context->tenantId, $company->id);
         $knowledge = DB::table('tenant_marketing_knowledge')->where('tenant_id',$context->tenantId)->where('status','approved')
             ->orderBy('kind')->limit(12)->get(['id','kind','title','content'])->map(fn($row)=>[
@@ -51,8 +91,10 @@ final class MarketingAgent implements AgentInterface
             'campaign'=>['objective'=>$input['campaign_objective'] ?? $campaign->objective ?? null,'name'=>$campaign->name ?? null],
             'evidence'=>$evidence,
         ]];
+        $stage = 'provider_generation';
         $response = $this->router->generate(new AIRequest('content_generation', self::fallbackPolicy()."\n\n".$prompt->systemInstruction."\n\nApproved generation template:\n".$prompt->template,
             $contextData, self::modelSchema(), 1000, 0.3, $context->correlationId, $context->tenantId));
+        $stage = 'output_validation';
         $data = $response->data;
         $validEvidence = array_column($evidence, 'id');
         $validKnowledge = array_column($knowledge, 'id');
