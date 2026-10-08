@@ -7,6 +7,7 @@ use App\Http\Controllers\Controller;
 use App\Models\Company;
 use App\Models\CompanyWebsite;
 use App\Jobs\ScanWebsiteJob;
+use App\WebsiteResolution\WebsiteResolutionService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Str;
 use Illuminate\Support\Facades\DB;
@@ -94,6 +95,41 @@ class CompanyController extends Controller
     public function show(string $company)
     {
         return Company::where('tenant_id', app('tenant.id'))->where('status', '!=', 'discovery_candidate')->with(['websites'])->findOrFail($company);
+    }
+
+    public function websiteDiscovery(string $company)
+    {
+        $tenant = app('tenant.id');
+        $record = Company::where('tenant_id', $tenant)->where('status', '!=', 'discovery_candidate')->findOrFail($company);
+        $candidate = DB::table('discovery_candidates')->where('tenant_id', $tenant)->where('company_id', $record->id)
+            ->whereNull('normalized_domain')->where('verification_state', 'not_required')->orderByDesc('created_at')->first();
+        $resolution = $candidate ? DB::table('website_resolutions')->where('tenant_id', $tenant)->where('candidate_id', $candidate->id)->orderByDesc('created_at')->first() : null;
+        if (! $resolution) return response()->json(['candidate' => $candidate, 'resolution' => null]);
+
+        $domains = DB::table('website_resolution_candidates')->where('tenant_id', $tenant)->where('resolution_id', $resolution->id)
+            ->orderByRaw('discovery_rank is null, discovery_rank asc')->orderByDesc('score')->get();
+        foreach ($domains as $domain) {
+            $domain->match_summary = is_array($domain->match_summary) ? $domain->match_summary : (json_decode((string) $domain->match_summary, true) ?: []);
+            $domain->evidence = DB::table('website_resolution_evidence')->where('tenant_id', $tenant)->where('resolution_candidate_id', $domain->id)->orderByDesc('points')->get();
+        }
+        $searchResults = DB::table('website_resolution_search_results')->where('tenant_id', $tenant)->where('resolution_id', $resolution->id)->orderBy('source')->orderBy('source_rank')->get();
+        $attempts = DB::table('website_resolution_attempts')->where('tenant_id', $tenant)->where('resolution_id', $resolution->id)->orderBy('attempt_number')->get();
+        $resolution->discovery_metrics = is_array($resolution->discovery_metrics) ? $resolution->discovery_metrics : (json_decode((string) $resolution->discovery_metrics, true) ?: []);
+        return response()->json(['candidate' => $candidate, 'resolution' => $resolution, 'candidates' => $domains,
+            'search_results' => $searchResults, 'attempts' => $attempts]);
+    }
+
+    public function findWebsite(Request $request, string $company, WebsiteResolutionService $resolutions)
+    {
+        $data = $request->validate(['idempotency_key' => ['required', 'string', 'min:8', 'max:128']]);
+        $tenant = app('tenant.id');
+        $record = Company::where('tenant_id', $tenant)->where('status', '!=', 'discovery_candidate')->findOrFail($company);
+        $resolution = $resolutions->requestForCompany($tenant, $record->id, (int) $request->user()->id, $data['idempotency_key']);
+        DB::table('audit_logs')->insert(['id' => (string) Str::uuid(), 'tenant_id' => $tenant, 'actor_user_id' => $request->user()->id,
+            'action' => 'company_website_discovery_requested', 'subject_type' => 'website_resolution', 'subject_id' => $resolution->id,
+            'metadata' => json_encode(['company_id' => $record->id]), 'created_at' => now()]);
+        return response()->json(['resolution_id' => $resolution->id, 'state' => $resolution->state,
+            'discovery_status' => $resolution->discovery_status], in_array($resolution->state, ['PENDING', 'SEARCHING'], true) ? 202 : 200);
     }
 
     public function intelligence(string $company)

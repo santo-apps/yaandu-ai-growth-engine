@@ -5,6 +5,7 @@ import { salesRequest } from '../salesApi'
 const props = defineProps<{ tenantId: string }>()
 type Run = { id: string; source: string; status: string; processed: number; inserted: number; updated: number; unchanged: number; failed: number; duplicates: number; unique_domains_added: number; bytes_processed: number; stored_bytes_delta: number; started_at: string; finished_at: string | null; checkpointed_at: string | null; failure_summary: string | null; metrics: Record<string, unknown> }
 const overview = ref<any>(null)
+const candidateDiscovery = ref<any>(null)
 const loading = ref(false)
 const saving = ref(false)
 const error = ref('')
@@ -17,7 +18,14 @@ const maxBytes = ref(10000000)
 
 async function load() {
   loading.value = true; error.value = ''
-  try { overview.value = await salesRequest('/operations/web-index', props.tenantId) }
+  try {
+    const [index, discovery] = await Promise.all([
+      salesRequest('/operations/web-index', props.tenantId),
+      salesRequest('/operations/candidate-discovery', props.tenantId),
+    ])
+    overview.value = index
+    candidateDiscovery.value = discovery
+  }
   catch (e) { error.value = e instanceof Error ? e.message : 'Unable to load corpus operations.' }
   finally { loading.value = false }
 }
@@ -58,6 +66,22 @@ onMounted(load)
         <article><small>STORED METADATA</small><b>{{ formatBytes(overview.corpus.stored_bytes) }}</b><span>Bounded identity fields and excerpts</span></article>
       </section>
 
+      <section v-if="candidateDiscovery" class="panel candidate-discovery-ops">
+        <div class="panel-heading"><div><h2>Candidate website discovery</h2><p>Tenant-scoped activity from open sources. Candidate domains remain unverified evidence until the existing verification and identity policy completes.</p></div></div>
+        <div class="corpus-metrics">
+          <article><small>DISCOVERY RUNS</small><b>{{ candidateDiscovery.totals.runs }}</b><span>{{ candidateDiscovery.totals.raw_results }} retained raw results</span></article>
+          <article><small>CANDIDATE DOMAINS</small><b>{{ candidateDiscovery.totals.candidate_domains }}</b><span>{{ candidateDiscovery.totals.source_calls_last_50 }} source calls in recent runs</span></article>
+          <article><small>MEDIAN / P95 LATENCY</small><b>{{ candidateDiscovery.latency.median_ms_last_50 ?? '—' }}<small v-if="candidateDiscovery.latency.median_ms_last_50 !== null"> ms</small></b><span>P95 {{ candidateDiscovery.latency.p95_ms_last_50 ?? '—' }} ms · n={{ candidateDiscovery.latency.sample_size }}</span></article>
+          <article><small>CACHE HITS</small><b>{{ candidateDiscovery.totals.cache_hits_last_50 }}</b><span>{{ candidateDiscovery.totals.provider_calls_last_50 }} external requests · {{ candidateDiscovery.totals.cache_hit_percent_last_50 }}% avoided via cache</span></article>
+        </div>
+        <div class="candidate-ops-grid">
+          <div><h3>Resolution states</h3><p v-if="!Object.keys(candidateDiscovery.states).length" class="empty-table">No candidate discovery runs yet.</p><dl v-else><template v-for="(count, state) in candidateDiscovery.states" :key="state"><dt>{{ label(String(state)) }}</dt><dd>{{ count }}</dd></template></dl></div>
+          <div><h3>Source health</h3><p v-if="!candidateDiscovery.sources.length" class="empty-table">No source calls recorded yet.</p><article v-for="item in candidateDiscovery.sources" :key="item.source"><b>{{ label(item.source) }}</b><span>{{ item.calls }} calls · {{ item.failures }} failures</span></article></div>
+          <div><h3>Failure breakdown</h3><p v-if="!candidateDiscovery.failure_breakdown.length" class="empty-table">No discovery failures recorded.</p><article v-for="item in candidateDiscovery.failure_breakdown" :key="item.failure_code"><b>{{ label(item.failure_code) }}</b><span>{{ item.total }}</span></article></div>
+        </div>
+        <div class="corpus-runs-panel"><h3>Recent candidate discovery runs</h3><div class="table-scroll"><table><thead><tr><th>Business</th><th>Status</th><th>Candidates</th><th>Latency</th><th>Started</th><th>Failure</th></tr></thead><tbody><tr v-for="run in candidateDiscovery.runs" :key="run.id"><td>{{ run.business_name || 'Business identity' }}</td><td>{{ label(run.discovery_status || run.state) }}</td><td>{{ run.candidate_count }}</td><td>{{ run.discovery_metrics?.latency_ms ?? '—' }} ms</td><td>{{ new Date(run.created_at).toLocaleString() }}</td><td>{{ run.failure_summary || '—' }}</td></tr><tr v-if="!candidateDiscovery.runs.length"><td colspan="6" class="empty-table">No candidate discovery runs yet.</td></tr></tbody></table></div></div>
+      </section>
+
       <section class="panel corpus-ingest-panel">
         <div class="panel-heading"><div><h2>Grow public business coverage</h2><p>Choose a bounded source and region. Public web evidence is shared across workspaces; prospect and sales decisions remain tenant-scoped.</p></div><button class="quiet" @click="load">↻ Refresh</button></div>
         <form class="corpus-run-form" @submit.prevent="startIngestion">
@@ -90,6 +114,10 @@ onMounted(load)
     </template>
   </section>
 </template>
+
+<style scoped>
+.candidate-discovery-ops{display:grid;gap:16px}.candidate-discovery-ops h3{font-size:13px;margin:0 0 9px}.candidate-ops-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}.candidate-ops-grid>div{min-width:0;background:#fafbfd;border:1px solid #e9edf2;border-radius:10px;padding:13px}.candidate-ops-grid dl{display:grid;grid-template-columns:1fr auto;gap:8px;margin:0}.candidate-ops-grid dt,.candidate-ops-grid span{color:#77808d;font-size:11px}.candidate-ops-grid dd{margin:0;font-size:12px;font-weight:650}.candidate-ops-grid article{display:flex;justify-content:space-between;gap:9px;padding:7px 0;border-bottom:1px solid #edf0f4}.candidate-ops-grid article:last-child{border-bottom:0}.candidate-ops-grid article b{font-size:11px}.candidate-discovery-ops .table-scroll{overflow-x:auto}.candidate-discovery-ops table{width:100%;border-collapse:collapse;font-size:11px}.candidate-discovery-ops th,.candidate-discovery-ops td{text-align:left;padding:9px;border-bottom:1px solid #edf0f4;vertical-align:top}.candidate-discovery-ops td:last-child{max-width:240px;overflow-wrap:anywhere}.candidate-discovery-ops .corpus-runs-panel{min-width:0}@media(max-width:760px){.candidate-ops-grid{grid-template-columns:1fr}}
+</style>
 
 <style scoped>
 .corpus-ops{display:grid;gap:14px;min-width:0}.corpus-metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}.corpus-metrics article,.corpus-source-grid article{min-width:0;padding:15px;border:1px solid #e2e8f0;border-radius:12px;background:#fff;display:grid;gap:6px}.corpus-metrics small{font-size:9px;letter-spacing:.08em;color:#78869a;font-weight:750}.corpus-metrics b{font-size:25px;color:#263b5b}.corpus-metrics span,.corpus-source-grid span,.corpus-source-grid small{font-size:10px;line-height:1.4;color:#728096;overflow-wrap:anywhere}.corpus-ops .panel{min-width:0;padding:16px;border:1px solid #e2e8f0;border-radius:12px;background:#fff}.panel-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.panel-heading h2{margin:0 0 5px;font-size:15px;color:#263b5b}.panel-heading p{margin:0;color:#768398;font-size:11px;line-height:1.5;max-width:740px}.corpus-run-form{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin-top:16px}.corpus-run-form label{display:grid;gap:5px;font-size:10px;color:#56647a;font-weight:650}.corpus-run-form input,.corpus-run-form select{min-width:0;width:100%;height:38px;padding:0 9px;border:1px solid #dfe5ed;border-radius:7px;background:#fff;color:#26364e}.corpus-run-form .primary{align-self:end;height:38px}.corpus-policy-note{margin:12px 0 0;color:#758196;font-size:10px;line-height:1.5}.corpus-source-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px;margin-top:12px}.corpus-source-grid b{font-size:11px;color:#33445d}.corpus-runs-table{max-width:100%;overflow:auto;margin-top:12px;border:1px solid #e7ebf0;border-radius:8px}.corpus-runs-table table{width:100%;min-width:850px;border-collapse:collapse;text-align:left;font-size:10px}.corpus-runs-table th,.corpus-runs-table td{padding:10px;border-bottom:1px solid #edf0f4;vertical-align:top}.corpus-runs-table th{background:#f7f9fb;color:#78869a;font-size:9px;white-space:nowrap}.corpus-runs-table td small{display:block;margin-top:4px;color:#79879a}.corpus-run-error{color:#aa4b42!important;max-width:280px}.pill.running,.pill.pending{background:#edf3ff;color:#3159a5}.pill.failed{background:#fff0ed;color:#a84d3f}.pill.partially_completed{background:#fff7e8;color:#8a641f}.corpus-ops .empty-table{padding:26px 12px;text-align:center;color:#778497;font-size:11px}

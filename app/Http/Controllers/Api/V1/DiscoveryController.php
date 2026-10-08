@@ -177,7 +177,7 @@ final class DiscoveryController extends Controller
 
     public function bulkResolveWebsites(Request $request, WebsiteResolutionService $resolutions)
     {
-        $data = $request->validate(['candidate_ids' => ['required', 'array', 'min:1', 'max:'.(int) config('website_resolution.max_businesses_per_request', 10)],
+        $data = $request->validate(['candidate_ids' => ['required', 'array', 'min:1', 'max:'.(int) config('candidate_discovery.max_bulk_businesses', 25)],
             'candidate_ids.*' => ['required', 'uuid', 'distinct'], 'idempotency_key' => ['required', 'string', 'min:8', 'max:100']]);
         $tenant = app('tenant.id');
         $validCount = DB::table('discovery_candidates')->where('tenant_id', $tenant)->whereIn('id', $data['candidate_ids'])
@@ -190,8 +190,12 @@ final class DiscoveryController extends Controller
         }
         $this->audit($tenant, $request->user()->id, 'website_resolution_bulk_requested', null, ['business_count' => count($result)]);
         return response()->json(['resolution_ids' => $result, 'business_count' => count($result),
-            'estimated_source_lookups' => count($result) * min(3, (int) config('website_resolution.max_source_lookups_per_business', 3)),
-            'budgets' => ['max_businesses' => (int) config('website_resolution.max_businesses_per_request', 10), 'max_sources_per_business' => (int) config('website_resolution.max_source_lookups_per_business', 3), 'max_domains_per_business' => (int) config('website_resolution.max_candidate_domains_per_business', 5)]], 202);
+            'estimated_source_lookups' => count($result) * min(8, (int) config('candidate_discovery.max_sources_per_business', 5)),
+            'budgets' => ['max_businesses' => (int) config('candidate_discovery.max_bulk_businesses', 25),
+                'max_queries_per_business' => (int) config('candidate_discovery.max_queries_per_business', 5),
+                'max_sources_per_business' => (int) config('candidate_discovery.max_sources_per_business', 5),
+                'max_domains_per_business' => (int) config('candidate_discovery.max_candidate_domains_per_business', 10),
+                'max_verifications_per_business' => (int) config('candidate_discovery.verification_candidates_per_business', 5)]], 202);
     }
 
     public function websiteResolution(string $resolution)
@@ -271,7 +275,8 @@ final class DiscoveryController extends Controller
     private function resolutionPayload(string $tenant, object $resolution): array
     {
         $resolution->identity_snapshot = is_array($resolution->identity_snapshot) ? $resolution->identity_snapshot : (json_decode((string) $resolution->identity_snapshot, true) ?: []);
-        $candidates = DB::table('website_resolution_candidates')->where('tenant_id', $tenant)->where('resolution_id', $resolution->id)->orderByDesc('score')->get();
+        $candidates = DB::table('website_resolution_candidates')->where('tenant_id', $tenant)->where('resolution_id', $resolution->id)
+            ->orderByRaw('discovery_rank is null, discovery_rank asc')->orderByDesc('score')->get();
         foreach ($candidates as $candidate) {
             $candidate->match_summary = is_array($candidate->match_summary) ? $candidate->match_summary : (json_decode((string) $candidate->match_summary, true) ?: []);
             $candidate->evidence = DB::table('website_resolution_evidence')->where('tenant_id', $tenant)->where('resolution_candidate_id', $candidate->id)->orderByDesc('points')->get()
@@ -279,7 +284,13 @@ final class DiscoveryController extends Controller
         }
         $attempts = DB::table('website_resolution_attempts')->where('tenant_id', $tenant)->where('resolution_id', $resolution->id)->orderBy('attempt_number')->get()
             ->map(function ($attempt): object { $attempt->metrics = is_array($attempt->metrics) ? $attempt->metrics : (json_decode((string) $attempt->metrics, true) ?: []); return $attempt; });
+        $searchResults = DB::table('website_resolution_search_results')->where('tenant_id', $tenant)->where('resolution_id', $resolution->id)
+            ->orderBy('source')->orderBy('source_rank')->get()->map(function ($result): object {
+                $result->metadata = is_array($result->metadata) ? $result->metadata : (json_decode((string) $result->metadata, true) ?: []);
+                return $result;
+            });
         return ['resolution' => $resolution, 'candidates' => $candidates, 'attempts' => $attempts,
+            'search_results' => $searchResults,
             'evidence' => DB::table('website_resolution_evidence')->where('tenant_id', $tenant)->where('resolution_id', $resolution->id)->whereNull('resolution_candidate_id')->get()];
     }
 

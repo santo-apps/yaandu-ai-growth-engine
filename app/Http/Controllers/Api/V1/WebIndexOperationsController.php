@@ -82,6 +82,57 @@ final class WebIndexOperationsController
                 'categories' => array_keys((array) config('discovery.osm_categories', []))]];
     }
 
+    public function candidateDiscovery(Request $request): array
+    {
+        $this->authorizeManager($request);
+        $tenant = app('tenant.id');
+        $resolutions = DB::table('website_resolutions')->where('tenant_id', $tenant);
+        $states = (clone $resolutions)->selectRaw('state, count(*) as total')->groupBy('state')->pluck('total', 'state');
+        $attemptRows = DB::table('website_resolution_attempts')->where('tenant_id', $tenant)
+            ->selectRaw("source, state, count(*) as calls, sum(case when state in ('failed','partial') then 1 else 0 end) as failures")
+            ->groupBy('source', 'state')->orderBy('source')->get();
+        $sources = $attemptRows->groupBy('source')->map(fn ($rows, $source): array => [
+            'source' => $source,
+            'calls' => (int) $rows->sum('calls'),
+            'failures' => (int) $rows->sum('failures'),
+        ])->values();
+        $runRows = (clone $resolutions)->orderByDesc('created_at')->limit(50)
+            ->get(['id', 'candidate_id', 'state', 'discovery_status', 'failure_code', 'failure_summary', 'discovery_metrics', 'created_at', 'finished_at']);
+        $latencies = [];
+        $cacheHits = 0;
+        $sourceCalls = 0;
+        $sourceFailures = 0;
+        $providerCalls = 0;
+        $queryCount = 0;
+        foreach ($runRows as $run) {
+            $metrics = is_array($run->discovery_metrics) ? $run->discovery_metrics : (json_decode((string) $run->discovery_metrics, true) ?: []);
+            $run->discovery_metrics = $metrics;
+            $cacheHits += (int) ($metrics['cache_hits'] ?? 0);
+            $sourceCalls += (int) ($metrics['source_calls'] ?? 0);
+            $sourceFailures += (int) ($metrics['source_failures'] ?? 0);
+            $providerCalls += (int) ($metrics['provider_calls'] ?? 0);
+            $queryCount += (int) ($metrics['queries'] ?? 0);
+            if (isset($metrics['latency_ms'])) $latencies[] = (int) $metrics['latency_ms'];
+            $run->business_name = DB::table('discovery_candidates')->where('tenant_id', $tenant)->where('id', $run->candidate_id)->value('company_name');
+            $run->candidate_count = DB::table('website_resolution_candidates')->where('tenant_id', $tenant)->where('resolution_id', $run->id)->count();
+        }
+        sort($latencies);
+        $count = count($latencies);
+        $middle = intdiv($count, 2);
+        $median = $count ? ($count % 2 ? $latencies[$middle] : (int) round(($latencies[$middle - 1] + $latencies[$middle]) / 2)) : null;
+        $p95 = $count ? $latencies[max(0, (int) ceil($count * .95) - 1)] : null;
+        $failureBreakdown = (clone $resolutions)->whereNotNull('failure_code')->selectRaw('failure_code, count(*) as total')->groupBy('failure_code')->orderByDesc('total')->limit(20)->get();
+        $resultCount = DB::table('website_resolution_search_results')->where('tenant_id', $tenant)->count();
+        return [
+            'totals' => ['runs' => (clone $resolutions)->count(), 'candidate_domains' => DB::table('website_resolution_candidates')->where('tenant_id', $tenant)->count(),
+                'raw_results' => $resultCount, 'source_calls_last_50' => $sourceCalls, 'source_failures_last_50' => $sourceFailures,
+                'queries_last_50' => $queryCount, 'cache_hits_last_50' => $cacheHits, 'provider_calls_last_50' => $providerCalls,
+                'cache_hit_percent_last_50' => $providerCalls ? round(100 * $cacheHits / ($cacheHits + $providerCalls), 1) : 0],
+            'states' => $states, 'sources' => $sources, 'failure_breakdown' => $failureBreakdown,
+            'latency' => ['median_ms_last_50' => $median, 'p95_ms_last_50' => $p95, 'sample_size' => $count], 'runs' => $runRows,
+        ];
+    }
+
     /** @return array<string,int> */
     private function qualityClassifications(): array
     {

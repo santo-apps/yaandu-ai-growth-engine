@@ -1,0 +1,22 @@
+[
+  {"benchmark_id":"IN-001","business_name":"Chumbak","city":"Chennai","country":"India","category":"lifestyle retail"},
+  {"benchmark_id":"IN-002","business_name":"Apollo Hospitals","city":"Chennai","country":"India","category":"healthcare"},
+  {"benchmark_id":"IN-003","business_name":"Mount Road Sangam","city":"Chennai","country":"India","category":"restaurant"},
+  {"benchmark_id":"IN-004","business_name":"Kumaraguru College of Technology","city":"Coimbatore","country":"India","category":"education"},
+  {"benchmark_id":"IN-005","business_name":"PSR Silks","city":"Coimbatore","country":"India","category":"textile retail"},
+  {"benchmark_id":"IN-006","business_name":"Pothys","city":"Coimbatore","country":"India","category":"fashion and textile retail"},
+  {"benchmark_id":"IN-007","business_name":"The Chennai Silks","city":"Coimbatore","country":"India","category":"fashion and textile retail"},
+  {"benchmark_id":"IN-008","business_name":"Oorjaa","city":"Bengaluru","country":"India","category":"lighting and interior retail"},
+  {"benchmark_id":"IN-009","business_name":"The Purple Turtles","city":"Bengaluru","country":"India","category":"home decor and furniture retail"},
+  {"benchmark_id":"IN-010","business_name":"Goodgudi Retail","city":"Bengaluru","country":"India","category":"gifting and lifestyle retail"},
+  {"benchmark_id":"AE-001","business_name":"Al Hallab","city":"Dubai","country":"UAE","category":"restaurant and sweets"},
+  {"benchmark_id":"AE-002","business_name":"Magrudy's","city":"Dubai","country":"UAE","category":"book and stationery retail"},
+  {"benchmark_id":"AE-003","business_name":"Sharaf DG","city":"Dubai","country":"UAE","category":"electronics retail"},
+  {"benchmark_id":"AE-004","business_name":"Royal Furniture","city":"Dubai","country":"UAE","category":"furniture and interiors"},
+  {"benchmark_id":"AE-005","business_name":"Ajmal Perfumes","city":"Dubai","country":"UAE","category":"perfumery retail"},
+  {"benchmark_id":"AE-006","business_name":"Emirates Pride Perfumes","city":"Dubai","country":"UAE","category":"perfumery manufacturing and retail"},
+  {"benchmark_id":"AE-007","business_name":"Aster DM Healthcare","city":"Dubai","country":"UAE","category":"healthcare"},
+  {"benchmark_id":"AE-008","business_name":"NMC Healthcare","city":"Dubai","country":"UAE","category":"healthcare"},
+  {"benchmark_id":"AE-009","business_name":"Mediclinic Middle East","city":"Dubai","country":"UAE","category":"healthcare"},
+  {"benchmark_id":"AE-010","business_name":"Emirates Rawabi Company","city":"Dubai","country":"UAE","category":"food manufacturing"}
+]
