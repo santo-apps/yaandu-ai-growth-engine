@@ -143,6 +143,28 @@ class PhaseOneWorkflowTest extends TestCase
             ->assertOk()->assertJsonFragment(['task_key' => 'website_reasoning', 'provider' => 'openai', 'model' => 'safe-model', 'parameters' => ['temperature' => 0.4, 'max_output_tokens' => 2048]]);
     }
 
+    public function test_deterministic_provider_is_selectable_only_when_local_acceptance_is_explicitly_enabled(): void
+    {
+        [$tenant, $user] = $this->tenantAndUser('ai-local-acceptance');
+        $user->tenants()->attach($tenant->id, ['role' => 'owner', 'status' => 'active']);
+        Sanctum::actingAs($user);
+        $headers = ['X-Tenant-ID' => $tenant->id];
+
+        config(['ai.local_acceptance.enabled' => false]);
+        $this->withHeaders($headers)->postJson('/api/v1/ai-configurations', [
+            'task_key' => 'content_generation', 'provider' => 'deterministic', 'model' => 'local-acceptance-v1', 'enabled' => true,
+        ])->assertUnprocessable();
+        $this->withHeaders($headers)->getJson('/api/v1/ai-configurations')->assertOk()
+            ->assertJsonPath('0.available_providers', ['openai', 'anthropic', 'gemini']);
+
+        config(['ai.local_acceptance.enabled' => true]);
+        $this->withHeaders($headers)->getJson('/api/v1/ai-configurations')->assertOk()
+            ->assertJsonPath('0.available_providers', ['openai', 'anthropic', 'gemini', 'deterministic']);
+        $this->withHeaders($headers)->postJson('/api/v1/ai-configurations', [
+            'task_key' => 'content_generation', 'provider' => 'deterministic', 'model' => 'local-acceptance-v1', 'enabled' => true,
+        ])->assertCreated()->assertJsonPath('provider', 'deterministic');
+    }
+
     public function test_dashboard_summary_is_tenant_scoped_and_uses_latest_score(): void
     {
         [$tenant, $user] = $this->tenantAndUser('dashboard-tenant');

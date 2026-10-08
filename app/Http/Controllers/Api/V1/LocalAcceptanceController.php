@@ -20,16 +20,36 @@ final class LocalAcceptanceController extends Controller
     {
         $tenantId = app('tenant.id');
         $this->authorizeAcceptance($fixture, $tenantId);
-        $message = DB::table('outbound_messages')->where('tenant_id', $tenantId)->orderByDesc('created_at')->first(['id', 'status', 'provider']);
-        $conversation = DB::table('conversations')->where('tenant_id', $tenantId)->orderByDesc('updated_at')->first(['id']);
+        $messageContext = DB::table('outbound_messages as messages')
+            ->join('campaign_recipients as recipients', function ($join): void {
+                $join->on('recipients.tenant_id', '=', 'messages.tenant_id')->on('recipients.id', '=', 'messages.campaign_recipient_id');
+            })->join('companies', function ($join): void {
+                $join->on('companies.tenant_id', '=', 'recipients.tenant_id')->on('companies.id', '=', 'recipients.company_id');
+            })->where('messages.tenant_id', $tenantId)->where('messages.provider', 'fake')
+            ->where(function ($query): void {
+                $query->where('companies.source', 'local_acceptance_fixture')
+                    ->orWhere('companies.source', 'like', 'csv_import:sprint7_simulated_fixture%');
+            })->orderByDesc('messages.created_at')->select([
+                'messages.id', 'messages.status', 'messages.provider', 'messages.campaign_id', 'recipients.contact_id', 'recipients.company_id',
+            ])->first();
+        $message = $messageContext ? (object) ['id' => $messageContext->id, 'status' => $messageContext->status, 'provider' => $messageContext->provider] : null;
+        $conversation = $messageContext ? DB::table('conversations')->where('tenant_id', $tenantId)
+            ->where('company_id', $messageContext->company_id)->where('contact_id', $messageContext->contact_id)->orderByDesc('updated_at')->first(['id']) : null;
+        $inboundCount = $conversation ? DB::table('conversation_messages')->where('tenant_id', $tenantId)
+            ->where('conversation_id', $conversation->id)->where('direction', 'inbound')->count() : 0;
+        $opportunity = $messageContext ? DB::table('sales_opportunities')->where('tenant_id', $tenantId)
+            ->where('company_id', $messageContext->company_id)->orderByDesc('created_at')->first(['id']) : null;
 
         return response()->json(['mode' => 'LOCAL ACCEPTANCE', 'providers' => ['ai' => 'DeterministicAIProvider', 'outbound' => 'FakeOutboundMessagingProvider',
-            'scheduling' => 'FakeSchedulingProvider'], 'queue' => config('queue.default'), 'company_id' => DB::table('companies')->where('tenant_id', $tenantId)->value('id'),
-            'campaign_id' => DB::table('campaigns')->where('tenant_id', $tenantId)->value('id'), 'campaign_status' => DB::table('campaigns')->where('tenant_id', $tenantId)->value('status'),
-            'message' => $message, 'inbound_count' => DB::table('conversation_messages')->where('tenant_id', $tenantId)->where('direction', 'inbound')->count(),
-            'conversation_id' => $conversation?->id, 'opportunity_id' => DB::table('sales_opportunities')->where('tenant_id', $tenantId)->value('id'),
-            'meeting_id' => DB::table('meeting_bookings')->where('tenant_id', $tenantId)->value('id'), 'proposal_id' => DB::table('proposals')->where('tenant_id', $tenantId)->value('id'),
-            'proposal_delivery_count' => DB::table('proposal_deliveries')->where('tenant_id', $tenantId)->count()]);
+            'scheduling' => 'FakeSchedulingProvider'], 'queue' => config('queue.default'), 'company_id' => $messageContext?->company_id,
+            'campaign_id' => $messageContext?->campaign_id,
+            'campaign_status' => $messageContext ? DB::table('campaigns')->where('tenant_id', $tenantId)->where('id', $messageContext->campaign_id)->value('status') : null,
+            'message' => $message, 'inbound_count' => $inboundCount,
+            'conversation_id' => $conversation?->id, 'opportunity_id' => $opportunity?->id,
+            'meeting_id' => $opportunity ? DB::table('meeting_bookings')->where('tenant_id', $tenantId)->where('sales_opportunity_id', $opportunity->id)->orderByDesc('created_at')->value('id') : null,
+            'proposal_id' => $opportunity ? DB::table('proposals')->where('tenant_id', $tenantId)->where('sales_opportunity_id', $opportunity->id)->orderByDesc('created_at')->value('id') : null,
+            'proposal_delivery_count' => $opportunity ? DB::table('proposal_deliveries')->where('tenant_id', $tenantId)->whereIn('proposal_id',
+                DB::table('proposals')->where('tenant_id', $tenantId)->where('sales_opportunity_id', $opportunity->id)->select('id'))->count() : 0]);
     }
 
     /** Simulates the provider's signed status webhook using the ordinary webhook boundary. */
@@ -60,15 +80,26 @@ final class LocalAcceptanceController extends Controller
         $tenantId = app('tenant.id');
         $this->authorizeAcceptance($fixture, $tenantId);
         $data = $request->validate(['intent' => ['required', 'in:interested,unsubscribe']]);
-        abort_unless(DB::table('outbound_messages')->where('tenant_id', $tenantId)->where('provider', 'fake')->where('status', 'sent')->exists(),
-            409, 'A fake outbound message must be marked sent before simulating a prospect reply.');
-        $contactMethod = DB::table('contact_methods')->where('tenant_id', $tenantId)->where('type', 'email')->first();
+        $message = DB::table('outbound_messages as messages')
+            ->join('campaign_recipients as recipients', function ($join): void {
+                $join->on('recipients.id', '=', 'messages.campaign_recipient_id')->on('recipients.tenant_id', '=', 'messages.tenant_id');
+            })->join('companies', function ($join): void {
+                $join->on('companies.id', '=', 'recipients.company_id')->on('companies.tenant_id', '=', 'recipients.tenant_id');
+            })->where('messages.tenant_id', $tenantId)->where('messages.provider', 'fake')->where('messages.status', 'sent')
+            ->where(function ($query): void {
+                $query->where('companies.source', 'local_acceptance_fixture')
+                    ->orWhere('companies.source', 'like', 'csv_import:sprint7_simulated_fixture%');
+            })
+            ->orderByDesc('messages.sent_at')->first(['messages.id', 'recipients.contact_method_id']);
+        abort_unless($message, 409, 'A fake outbound message for a local acceptance fixture must be marked sent before simulating a prospect reply.');
+        $contactMethod = DB::table('contact_methods')->where('tenant_id', $tenantId)->where('id', $message->contact_method_id)->where('type', 'email')->first();
         abort_unless($contactMethod, 404);
         $contactEmail = $values->decrypt($contactMethod->value);
+        abort_unless(str_ends_with(strtolower($contactEmail), '.fixture.test'), 404);
         $bodyText = $data['intent'] === 'unsubscribe'
             ? 'UNSUBSCRIBE'
             : 'We are interested in discussing ecommerce modernization and improving our mobile experience. Can we book a meeting next week and receive a proposal? Our budget is still being reviewed.';
-        $payload = ['tenant_id' => $tenantId, 'event_id' => 'local-acceptance-reply-v1', 'sender_email' => $contactEmail,
+        $payload = ['tenant_id' => $tenantId, 'event_id' => 'local-acceptance-reply-'.$message->id, 'sender_email' => $contactEmail,
             'body' => $bodyText, 'occurred_at' => now()->toIso8601String()];
         $body = json_encode($payload, JSON_THROW_ON_ERROR);
         $provider = $providers->forTenant($tenantId, 'fake');

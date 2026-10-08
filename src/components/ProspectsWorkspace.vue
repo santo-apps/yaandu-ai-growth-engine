@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { humanize, salesRequest, unwrap, csrfToken } from '../salesApi'
+import ProspectImportPanel from './ProspectImportPanel.vue'
 
-const props = defineProps<{ tenantId: string }>()
+const props = defineProps<{ tenantId: string; manager: boolean }>()
 const emit = defineEmits<{ openProspect: [company: any] }>()
 const companies = ref<any[]>([])
 const query = ref('')
@@ -215,6 +216,7 @@ onBeforeUnmount(() => { if (pollTimer) clearInterval(pollTimer) })
 <template>
   <section class="prospects-workspace">
     <div class="prospects-toolbar"><label class="prospect-search"><span>⌕</span><input v-model="query" placeholder="Search existing prospects" aria-label="Search prospects" /></label><button class="quiet" @click="showDiscovery = !showDiscovery; if (showDiscovery) loadDiscovery()">{{ showDiscovery ? 'Close discovery' : 'Find Prospects' }}</button><button class="primary" @click="showAdd = !showAdd">＋ Add prospect</button></div>
+    <ProspectImportPanel :tenant-id="tenantId" :manager="manager" />
     <form v-if="showAdd" class="discovery-card add-card" @submit.prevent="saveProspect"><h2>Add an existing company</h2><div class="discovery-form-grid"><label>Company name<input v-model="draft.name" required maxlength="255" /></label><label>Website<input v-model="draft.website" type="url" placeholder="https://company.com" /></label><label>Industry<input v-model="draft.industry" /></label><label>Location<input v-model="draft.location" /></label></div><button class="primary" :disabled="saving">{{ saving ? 'Saving…' : 'Save prospect' }}</button></form>
     <section v-if="showDiscovery" class="discovery-shell">
       <div class="discovery-intro"><div><span class="eyebrow">PROSPECT ACQUISITION</span><h2>Find and review prospects</h2><p>Discovery gathers candidates; verification checks public websites. You decide what becomes a prospect. Outreach is always a separate action.</p></div><span class="discovery-safe-pill">Review before acceptance</span></div>

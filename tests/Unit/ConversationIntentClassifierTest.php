@@ -61,10 +61,10 @@ class ConversationIntentClassifierTest extends TestCase
             ['direction' => 'inbound', 'body' => 'We are interested in improving our ecommerce experience. Can we book a meeting?'],
         ]);
 
-        self::assertSame('interested', $result['intent']);
-        self::assertSame('continue_qualification', $result['recommended_action']);
+        self::assertSame('meeting_request', $result['intent']);
+        self::assertSame('offer_scheduling', $result['recommended_action']);
         self::assertFalse($result['requires_human']);
-        self::assertStringContainsString('expressed interest', $result['summary']);
+        self::assertStringContainsString('explicitly requested a meeting', $result['summary']);
     }
 
     public function test_malformed_provider_output_still_fails_closed(): void

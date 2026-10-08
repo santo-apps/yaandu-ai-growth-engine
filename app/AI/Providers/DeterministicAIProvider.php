@@ -60,12 +60,31 @@ final class DeterministicAIProvider implements AIProviderInterface
         $references = array_values(array_filter(array_map(static fn ($item) => $item['id'] ?? null, $evidence)));
         $knowledge = Arr::get($request->evidence, 'approved_yaandu_knowledge', []);
         $references = array_values(array_unique([...$references, ...array_filter(array_map(static fn ($item) => $item['id'] ?? null, $knowledge))]));
-        $name = (string) (Arr::get($request->evidence, 'prospect.company.name') ?? 'Northstar Retail Systems Pvt Ltd');
+        $name = trim(strip_tags((string) (Arr::get($request->evidence, 'prospect.company.name') ?? 'your business')));
+        $name = mb_substr(preg_replace('/[\r\n\t]+/u', ' ', $name) ?? 'your business', 0, 180);
+        $points = [];
+        foreach ($evidence as $item) {
+            $type = $item['type'] ?? null;
+            $issue = $item['issue_type'] ?? null;
+            $point = match ($issue ?? $type) {
+                'outdated_website' => 'A website modernization review may be useful.',
+                'poor_mobile_ux' => 'A mobile experience review may be useful.',
+                'poor_lead_capture' => 'A customer enquiry flow review may be useful.',
+                'technology' => 'The website technology was included in the review.',
+                default => null,
+            };
+            if ($point !== null) $points[] = $point;
+        }
+        $points = array_slice(array_values(array_unique($points)), 0, 10);
 
-        return ['subject' => 'A mobile-first modernization idea for Northstar',
-            'message' => "Hi Ananya,\n\nI reviewed the public Northstar storefront and noticed its older layout and difficult mobile navigation. Those details can make it harder for shoppers to move from browsing to a confident enquiry.\n\nYaandu helps retail teams modernize ecommerce experiences, improve performance, and explore AI-enabled customer engagement. Would a short discussion about your modernization priorities be useful?\n\nRegards,\nYaandu Growth Team",
-            'reasoning_summary' => 'Local acceptance copy grounded in the fictional prospect website evidence and approved Yaandu service knowledge for '.$name.'.',
-            'personalization_points' => ['Older storefront layout observed on the public site', 'Mobile navigation is difficult'],
+        $hasProspectEvidence = $evidence !== [];
+
+        return ['subject' => ($hasProspectEvidence ? 'A digital experience idea for ' : 'A digital experience idea · ').$name,
+            'message' => $hasProspectEvidence
+                ? "Hello,\n\nI reviewed the public information available for {$name}. If improving the website experience or customer enquiry journey is a current priority, would a short conversation be useful?\n\nRegards,\nYaandu Growth Team"
+                : "Hello,\n\nWould a short conversation about your website and customer enquiry experience be useful?\n\nRegards,\nYaandu Growth Team",
+            'reasoning_summary' => 'Local deterministic draft uses the supplied company identity and only the evidence references provided to this run.',
+            'personalization_points' => $points,
             'evidence_references' => $references, 'confidence' => 0.94,
             'recommended_call_to_action' => 'Invite the prospect to a short, human-reviewed discussion.'];
     }
@@ -83,17 +102,18 @@ final class DeterministicAIProvider implements AIProviderInterface
             }
             $body = mb_strtolower((string) ($lastInbound['body'] ?? ''));
             $unsubscribed = str_contains($body, 'unsubscribe') || str_contains($body, 'stop emailing') || str_contains($body, 'stop contacting');
-            $intent = $unsubscribed ? 'unsubscribe' : 'interested';
+            $meetingRequested = str_contains($body, 'book a meeting') || str_contains($body, 'schedule a meeting') || str_contains($body, 'meet next week');
+            $intent = $unsubscribed ? 'unsubscribe' : ($meetingRequested ? 'meeting_request' : 'interested');
 
             return [
                 'intent' => $intent,
                 'confidence' => 0.97,
                 'summary' => $unsubscribed
                     ? 'The prospect asked to stop receiving outreach.'
-                    : 'The prospect expressed interest in discussing the modernization opportunity.',
+                    : ($meetingRequested ? 'The prospect explicitly requested a meeting.' : 'The prospect expressed interest in discussing the modernization opportunity.'),
                 'reason' => $unsubscribed
                     ? 'The newest inbound message explicitly asks to stop further outreach.'
-                    : 'The newest inbound message expresses interest; persisted scheduling state remains authoritative for meeting actions.',
+                    : ($meetingRequested ? 'The newest inbound message explicitly asks to book a meeting.' : 'The newest inbound message expresses interest; persisted scheduling state remains authoritative for meeting actions.'),
                 'risk' => 'none',
                 'evidence_references' => [],
             ];
@@ -101,10 +121,16 @@ final class DeterministicAIProvider implements AIProviderInterface
         if (array_key_exists('qualification_evidence', $request->outputSchema['properties'] ?? [])) {
             $conversation = Arr::get($request->evidence, 'prospect_context_untrusted.conversation.messages', []);
             $inboundIds = [];
-            foreach ($conversation as $message) if (($message['direction'] ?? null) === 'inbound' && isset($message['id'])) $inboundIds[] = $message['id'];
+            $lastInboundBody = '';
+            foreach ($conversation as $message) {
+                if (($message['direction'] ?? null) !== 'inbound') continue;
+                if (isset($message['id'])) $inboundIds[] = $message['id'];
+                $lastInboundBody = mb_strtolower((string) ($message['body'] ?? ''));
+            }
             $website = Arr::get($request->evidence, 'prospect_context_untrusted.verified_company_evidence.0.id');
             $reference = static fn (?string $id): array => $id ? [$id] : [];
-            return ['intent' => 'INTERESTED', 'confidence' => 0.96,
+            $meetingRequested = str_contains($lastInboundBody, 'book a meeting') || str_contains($lastInboundBody, 'schedule a meeting') || str_contains($lastInboundBody, 'meet next week');
+            return ['intent' => $meetingRequested ? 'MEETING_REQUEST' : 'INTERESTED', 'confidence' => 0.96,
                 'qualification' => ['NEED' => 'STRONG', 'FIT' => 'STRONG', 'AUTHORITY' => 'UNKNOWN', 'TIMELINE' => 'STRONG', 'BUDGET' => 'UNKNOWN'],
                 'qualification_evidence' => ['NEED' => $reference($inboundIds[array_key_last($inboundIds)] ?? null), 'FIT' => $reference($website),
                     'AUTHORITY' => [], 'TIMELINE' => $reference($inboundIds[array_key_last($inboundIds)] ?? null), 'BUDGET' => []],
@@ -117,16 +143,20 @@ final class DeterministicAIProvider implements AIProviderInterface
 
         $last = is_array($messages) && $messages !== [] ? end($messages) : [];
         $body = mb_strtolower((string) ($last['body'] ?? ''));
-        $intent = str_contains($body, 'unsubscribe') || str_contains($body, 'stop emailing') ? 'unsubscribe' : 'interested';
+        $unsubscribed = str_contains($body, 'unsubscribe') || str_contains($body, 'stop emailing');
+        $meetingRequested = str_contains($body, 'book a meeting') || str_contains($body, 'schedule a meeting') || str_contains($body, 'meet next week');
+        $intent = $unsubscribed ? 'unsubscribe' : ($meetingRequested ? 'meeting_request' : 'interested');
         return ['intent' => $intent, 'confidence' => 0.97,
-            'reasoning_summary' => $intent === 'interested' ? 'The prospect asked to discuss modernization and requested a meeting and proposal.' : 'The prospect asked to stop receiving outreach.',
-            'draft_message' => $intent === 'interested' ? 'Thanks, Ananya. We can discuss the modernization goals you outlined and prepare a grounded scope for review.' : '',
+            'reasoning_summary' => $unsubscribed ? 'The prospect asked to stop receiving outreach.'
+                : ($meetingRequested ? 'The prospect explicitly requested a meeting.' : 'The prospect expressed interest in discussing modernization.'),
+            'draft_message' => $intent === 'interested' ? 'Thanks for sharing your modernization priorities. We can discuss the goals you outlined and prepare a grounded scope for review.' : '',
             'evidence_references' => isset($last['id']) ? [$last['id']] : []];
     }
 
     private function proposal(AIRequest $request): array
     {
         $services = Arr::get($request->evidence, 'approved_tenant_services', []);
+        $companyName = trim((string) Arr::get($request->evidence, 'prospect_data_untrusted.company.name', '')) ?: 'the prospect';
         $requestedServices = array_map(static fn ($name) => mb_strtolower(trim((string) $name), 'UTF-8'),
             Arr::get($request->evidence, 'prospect_data_untrusted.requirements.requested_services', []));
         $service = null;
@@ -144,13 +174,13 @@ final class DeterministicAIProvider implements AIProviderInterface
         $evidenceId = $evidence[0]['id'] ?? null;
         $deliverables = array_values(array_slice($service['standard_deliverables'] ?? [], 0, 3));
 
-        return ['executive_summary' => 'A focused engagement to modernize Northstar Retail Systems’ ecommerce experience and improve its mobile buying journey.',
-            'client_understanding' => 'Northstar is exploring storefront modernization and wants a smoother mobile experience, with room to assess performance and customer engagement opportunities.',
+        return ['executive_summary' => "A focused engagement to modernize {$companyName}’s ecommerce experience and improve its mobile buying journey.",
+            'client_understanding' => "{$companyName} is exploring storefront modernization and wants a smoother mobile experience, with room to assess performance and customer engagement opportunities.",
             'objectives' => ['Modernize the ecommerce storefront', 'Improve mobile usability', 'Identify performance and customer engagement opportunities'],
             'recommended_solution' => [$service['id']],
             'scope' => [['service_id' => $service['id'], 'description' => $service['description'] ?? $service['name'], 'deliverables' => $deliverables]],
-            'deliverables' => $deliverables, 'assumptions' => ['Final priorities will be confirmed with Northstar.'],
-            'dependencies' => ['Northstar will provide relevant storefront and analytics context for discovery.'],
+            'deliverables' => $deliverables, 'assumptions' => ["Final priorities will be confirmed with {$companyName}."],
+            'dependencies' => ["{$companyName} will provide relevant storefront and analytics context for discovery."],
             'exclusions' => ['Third-party platform and media fees are excluded.'],
             'implementation_approach' => ['Review storefront and mobile journeys.', 'Prioritize modernization and performance opportunities.', 'Present customer-engagement options for human review.'],
             'timeline_narrative' => 'Schedule and milestones will be agreed after discovery.',

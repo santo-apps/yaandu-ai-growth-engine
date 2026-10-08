@@ -3,6 +3,9 @@
 namespace Tests\Feature;
 
 use App\AI\AIModelRouter;
+use App\AI\AIProviderInterface;
+use App\AI\AIRequest;
+use App\AI\AIResponse;
 use App\Models\Campaign;
 use App\Models\Company;
 use App\Models\Conversation;
@@ -17,6 +20,7 @@ use App\Orchestration\AcquisitionWorkflowCoordinator;
 use App\Jobs\CoordinateAcquisitionWorkflowEvent;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
 use Laravel\Sanctum\Sanctum;
 use Tests\Fakes\StaticAIProvider;
@@ -180,6 +184,118 @@ final class PhaseTwoBMarketingTest extends TestCase
             'evidence_references'=>[],'confidence'=>.8,'recommended_call_to_action'=>'Would a summary help?']));
         $this->withHeaders($headers)->postJson('/api/v1/marketing-drafts',['company_id'=>$company->id])->assertCreated();
         $this->assertDatabaseCount('marketing_drafts',1);$this->assertDatabaseCount('agent_runs',1);
+    }
+
+    public function test_missing_approved_prompt_fails_closed_with_safe_stage_diagnostics_and_no_outreach(): void
+    {
+        [$tenant,$owner,$company]=$this->workspace('marketing-diagnostic-prompt');
+        $this->router(new StaticAIProvider([]));
+        Log::spy();
+        Sanctum::actingAs($owner);
+
+        $this->withHeaders(['X-Tenant-ID'=>$tenant->id,'Idempotency-Key'=>'missing-prompt-diagnostic'])
+            ->postJson('/api/v1/marketing-drafts',['company_id'=>$company->id])
+            ->assertUnprocessable()->assertJsonPath('message','A safe marketing draft could not be created.');
+
+        Log::shouldHaveReceived('error')->once()->with('Marketing agent execution failed.', \Mockery::on(function (array $context): bool {
+            self::assertSame('MarketingAgent', $context['agent_name']);
+            self::assertSame('prompt_configuration', $context['failure_stage']);
+            self::assertSame('PROMPT_CONFIGURATION_MISSING', $context['error_category']);
+            self::assertSame(\RuntimeException::class, $context['exception_class']);
+            self::assertFalse($context['provider_invoked']);
+            self::assertFalse($context['retryable']);
+            self::assertArrayHasKey('correlation_id', $context);
+            self::assertArrayHasKey('duration_ms', $context);
+            self::assertArrayNotHasKey('prompt', $context);
+            self::assertArrayNotHasKey('message', $context);
+            return true;
+        }));
+        $this->assertDatabaseCount('marketing_drafts',0);
+        $this->assertDatabaseCount('outbound_messages',0);
+        $this->assertDatabaseHas('agent_runs',['tenant_id'=>$tenant->id,'agent_key'=>'MarketingAgent','status'=>'failed']);
+    }
+
+    public function test_cancelled_prior_campaign_workflow_does_not_block_draft_for_a_new_campaign(): void
+    {
+        [$tenant,$owner,$company]=$this->workspace('marketing-new-campaign-after-cancel');
+        $cancelled=Campaign::create(['tenant_id'=>$tenant->id,'name'=>'Cancelled prior campaign','status'=>'cancelled']);
+        $workflow=app(WorkflowService::class)->create($tenant->id,['company_id'=>$company->id,'campaign_id'=>$cancelled->id]);
+        DB::table('acquisition_workflows')->where('tenant_id',$tenant->id)->where('id',$workflow->id)->update([
+            'status'=>'CANCELLED','current_stage'=>WorkflowStage::Outreach->value,'updated_at'=>now(),
+        ]);
+        $newCampaign=Campaign::create(['tenant_id'=>$tenant->id,'name'=>'New campaign','status'=>'draft']);
+        $this->prompt($tenant->id,'MarketingAgent');
+        $this->router(new StaticAIProvider(['subject'=>'A useful idea','message'=>'Would a short conversation be useful?','reasoning_summary'=>'Generic fixture copy.',
+            'personalization_points'=>[],'evidence_references'=>[],'confidence'=>.8,'recommended_call_to_action'=>'Invite a conversation.']));
+        Sanctum::actingAs($owner);
+
+        $this->withHeaders(['X-Tenant-ID'=>$tenant->id,'Idempotency-Key'=>'new-campaign-after-cancel'])
+            ->postJson('/api/v1/marketing-drafts',['company_id'=>$company->id,'campaign_id'=>$newCampaign->id])
+            ->assertCreated()->assertJsonPath('campaign_id',$newCampaign->id);
+
+        $this->assertDatabaseHas('agent_runs',['tenant_id'=>$tenant->id,'agent_key'=>'MarketingAgent','status'=>'succeeded']);
+        $this->assertDatabaseCount('outbound_messages',0);
+    }
+
+    public function test_policy_block_is_logged_and_terminal_agent_run_is_not_left_queued(): void
+    {
+        [$tenant,$owner,$company]=$this->workspace('marketing-cancelled-campaign-policy');
+        $campaign=Campaign::create(['tenant_id'=>$tenant->id,'name'=>'Cancelled campaign','status'=>'cancelled']);
+        $this->prompt($tenant->id,'MarketingAgent');
+        $this->router(new StaticAIProvider(['subject'=>'A useful idea','message'=>'Would a short conversation be useful?','reasoning_summary'=>'Fixture copy.',
+            'personalization_points'=>[],'evidence_references'=>[],'confidence'=>.8,'recommended_call_to_action'=>'Invite a conversation.']));
+        Log::spy();
+        Sanctum::actingAs($owner);
+
+        $response=$this->withHeaders(['X-Tenant-ID'=>$tenant->id,'Idempotency-Key'=>'cancelled-campaign-policy'])
+            ->postJson('/api/v1/marketing-drafts',['company_id'=>$company->id,'campaign_id'=>$campaign->id])
+            ->assertUnprocessable()->assertJsonPath('message','A safe marketing draft could not be created.');
+        $run=DB::table('agent_runs')->where('tenant_id',$tenant->id)->where('correlation_id',$response->json('correlation_id'))->first();
+
+        self::assertNotNull($run);
+        self::assertSame('failed',$run->status);
+        $this->assertDatabaseHas('agent_events',['tenant_id'=>$tenant->id,'agent_run_id'=>$run->id,'event_key'=>'failed']);
+        Log::shouldHaveReceived('warning')->once()->with('Agent execution blocked by workflow policy.', \Mockery::on(function(array $context):bool{
+            self::assertSame('workflow_policy',$context['failure_stage']);
+            self::assertSame('WORKFLOW_POLICY_BLOCK',$context['error_category']);
+            self::assertFalse($context['retryable']);
+            self::assertArrayNotHasKey('message',$context);
+            return true;
+        }));
+        $this->assertDatabaseCount('marketing_drafts',0);
+        $this->assertDatabaseCount('outbound_messages',0);
+    }
+
+    public function test_provider_failure_logs_safe_diagnostics_without_exposing_exception_text(): void
+    {
+        [$tenant,$owner,$company]=$this->workspace('marketing-diagnostic-provider');
+        $this->prompt($tenant->id,'MarketingAgent');
+        $provider=new class implements AIProviderInterface {
+            public function providerKey(): string { return 'conversation-test'; }
+            public function capabilities(): array { return ['structured_json']; }
+            public function generate(AIRequest $request,string $model): AIResponse { throw new \RuntimeException('sensitive provider response must not be logged'); }
+        };
+        $this->app->instance(AIModelRouter::class,new AIModelRouter([$provider],[
+            'content_generation'=>['provider'=>'conversation-test','model'=>'test-model'],
+        ]));
+        Log::spy();
+        Sanctum::actingAs($owner);
+
+        $this->withHeaders(['X-Tenant-ID'=>$tenant->id,'Idempotency-Key'=>'provider-failure-diagnostic'])
+            ->postJson('/api/v1/marketing-drafts',['company_id'=>$company->id])
+            ->assertUnprocessable()->assertJsonPath('message','A safe marketing draft could not be created.');
+
+        Log::shouldHaveReceived('error')->once()->with('Marketing agent execution failed.', \Mockery::on(function (array $context): bool {
+            self::assertSame('provider_generation', $context['failure_stage']);
+            self::assertSame('AI_PROVIDER_FAILURE', $context['error_category']);
+            self::assertSame(\RuntimeException::class, $context['exception_class']);
+            self::assertTrue($context['provider_invoked']);
+            self::assertFalse($context['retryable']);
+            self::assertStringNotContainsString('sensitive provider response', json_encode($context));
+            return true;
+        }));
+        $this->assertDatabaseCount('marketing_drafts',0);
+        $this->assertDatabaseCount('outbound_messages',0);
     }
 
     public function test_coordinator_uses_marketing_application_service_and_replay_is_idempotent():void

@@ -43,6 +43,10 @@ final class CrawlerService
                 'status' => 'running', 'max_depth' => $maxDepth, 'max_pages' => $maxPages, 'crawler_version' => 'http-v1',
                 'policy_snapshot' => json_encode($policySnapshot), 'started_at' => now(), 'created_at' => now(), 'updated_at' => now()]);
         }
+        if (app()->environment(['local', 'testing']) && config('pilot.allow_simulated_fixtures', false)
+            && str_ends_with(strtolower((string) parse_url($website->url, PHP_URL_HOST)), '.fixture.test')) {
+            return $this->crawlSimulatedPilotFixture($tenantId, $website, $scanId);
+        }
         $budget = new CrawlBudget($maxAttempts, $maxDuration);
         try {
             $root = rtrim($website->url, '/');
@@ -98,6 +102,30 @@ final class CrawlerService
             DB::table('website_scans')->where('tenant_id', $tenantId)->where('id', $scanId)->update(['status' => 'failed', 'error_code' => 'CRAWL_FAILED', 'error_summary' => 'The website scan could not be completed.', 'finished_at' => now(), 'updated_at' => now()]);
             throw $e;
         }
+    }
+
+    private function crawlSimulatedPilotFixture(string $tenantId, object $website, string $scanId): string
+    {
+        $company = DB::table('companies')->where('tenant_id', $tenantId)->where('id', $website->company_id)->first(['name']);
+        $html = '<!doctype html><html><head><title>SIMULATED ONLY · '.e((string) ($company->name ?? 'Fictional business')).'</title></head><body>'
+            .'<main><h1>SIMULATED ONLY: fictional retail ecommerce business</h1>'
+            .'<p>Fixture observation: older storefront layout. Mobile navigation is difficult. '
+            .'This local evidence is synthetic and contains no real performance or customer measurements.</p>'
+            .'<a href="/contact">Contact</a></main></body></html>';
+        $pageId = (string) Str::uuid();
+        $objectKey = "tenants/{$tenantId}/crawls/{$scanId}/{$pageId}.html";
+        Storage::disk(config('filesystems.default'))->put($objectKey, $html);
+        DB::table('website_pages')->insert(['id' => $pageId, 'tenant_id' => $tenantId, 'website_scan_id' => $scanId,
+            'requested_url' => $website->url, 'final_url' => $website->url, 'canonical_url' => $website->url, 'http_status' => 200,
+            'content_type' => 'text/html', 'title' => 'SIMULATED ONLY · '.mb_substr((string) ($company->name ?? 'Fictional business'), 0, 400),
+            'fetched_at' => now(), 'content_hash' => hash('sha256', $html), 'object_key' => $objectKey,
+            'extracted_text' => mb_substr($this->extractText($html), 0, 30000), 'depth' => 0, 'created_at' => now(), 'updated_at' => now()]);
+        DB::table('website_scans')->where('tenant_id', $tenantId)->where('id', $scanId)->update([
+            'status' => 'completed', 'crawler_version' => 'pilot-simulated-fixture-v1',
+            'policy_snapshot' => json_encode(['simulated_fixture' => true, 'network_requests' => 0, 'robots_fetch' => 'not_applicable_fixture']),
+            'finished_at' => now(), 'updated_at' => now(),
+        ]);
+        return $scanId;
     }
 
     private function safeFetchBody(string $url, CrawlBudget $budget): string

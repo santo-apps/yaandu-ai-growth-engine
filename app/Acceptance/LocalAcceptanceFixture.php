@@ -20,15 +20,15 @@ final class LocalAcceptanceFixture
 {
     public const TENANT_SLUG = 'sprint-1c-local-acceptance';
     public const USER_EMAIL = 'sprint-1c-acceptance@example.test';
-    public const USER_PASSWORD = 'Local-Acceptance-2026!';
     public const COMPANY_DOMAIN = 'northstar-retail.fixture.test';
 
     public function reset(): array
     {
         $this->assertAllowed();
-        return DB::transaction(function (): array {
+        $password = Str::random(48);
+        return DB::transaction(function () use ($password): array {
             $this->removeOnlyPriorFixture();
-            $owner = $this->owner();
+            $owner = $this->owner($password);
             $tenant = Tenant::create(['name' => 'LOCAL ACCEPTANCE · Sprint 1C', 'slug' => self::TENANT_SLUG, 'status' => 'active',
                 'settings' => ['fixture_type' => 'yaandu_sprint_1c_local_acceptance', 'scoring' => ['icp' => ['industries' => ['Retail', 'E-commerce'], 'keywords' => ['ecommerce', 'mobile']]]]]);
             $owner->tenants()->attach($tenant->id, ['role' => 'owner', 'status' => 'active']);
@@ -141,7 +141,7 @@ final class LocalAcceptanceFixture
             if ($draft->status !== 'draft' || $forbidden) throw new LogicException('Acceptance fixture did not reach its required pre-outreach starting state.');
 
             return ['tenant_id' => $tenant->id, 'company_id' => $company->id, 'campaign_id' => $campaign->id,
-                'contact_id' => $contactId, 'draft_id' => $draft->id, 'email' => self::USER_EMAIL, 'password' => self::USER_PASSWORD,
+                'contact_id' => $contactId, 'draft_id' => $draft->id, 'email' => self::USER_EMAIL, 'password' => $password,
                 'company' => $company->name];
         });
     }
@@ -156,8 +156,16 @@ final class LocalAcceptanceFixture
     public function isAcceptanceTenant(string $tenantId): bool
     {
         $tenant = Tenant::whereKey($tenantId)->first();
-        return $tenant !== null && $tenant->slug === self::TENANT_SLUG
-            && ($tenant->settings['fixture_type'] ?? null) === 'yaandu_sprint_1c_local_acceptance';
+        if ($tenant === null) return false;
+
+        $settings = $tenant->settings ?? [];
+        $sprintOneFixture = $tenant->slug === self::TENANT_SLUG
+            && ($settings['fixture_type'] ?? null) === 'yaandu_sprint_1c_local_acceptance';
+        $sprintSevenFixture = $tenant->slug === 'sprint-7-simulated-pilot'
+            && ($settings['fixture_type'] ?? null) === 'yaandu_sprint_7_simulated_pilot'
+            && ($settings['simulated'] ?? false) === true;
+
+        return $sprintOneFixture || $sprintSevenFixture;
     }
 
     private function removeOnlyPriorFixture(): void
@@ -170,7 +178,7 @@ final class LocalAcceptanceFixture
         $existing->delete(); // Tenant-scoped foreign keys cascade; no other tenant is selected or affected.
     }
 
-    private function owner(): User
+    private function owner(string $password): User
     {
         $owner = User::where('email', self::USER_EMAIL)->first();
         if ($owner && DB::table('tenant_user')->where('user_id', $owner->id)->exists()) {
@@ -178,7 +186,7 @@ final class LocalAcceptanceFixture
         }
         if (! $owner) $owner = new User(['name' => 'Sprint 1C Acceptance Owner', 'email' => self::USER_EMAIL]);
         $owner->name = 'Sprint 1C Acceptance Owner';
-        $owner->password = Hash::make(self::USER_PASSWORD);
+        $owner->password = Hash::make($password);
         $owner->save();
         return $owner;
     }

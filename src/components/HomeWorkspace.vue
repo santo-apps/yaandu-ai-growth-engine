@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
 import { humanize, salesRequest, unwrap } from '../salesApi'
+import PilotDashboard from './PilotDashboard.vue'
 
 const props = defineProps<{ tenantId: string; manager: boolean }>()
 const emit = defineEmits<{ openProspects: []; openProspect: [company: any]; openInbox: [conversationId?: string]; openPipeline: [opportunityId?: string]; openMeetings: []; openProposals: []; openApprovals: [] }>()
@@ -46,6 +47,7 @@ onMounted(() => { void load() })
 
 <template>
   <section class="home-workspace">
+    <PilotDashboard v-if="manager" :tenant-id="tenantId" />
     <div v-if="error" class="notice">{{ error }} <button @click="load">Retry</button></div>
     <div class="home-stats"><button class="home-stat" @click="emit('openProspects')"><small>PROSPECTS</small><b>{{ loading ? '—' : summary.companies ?? companies.length }}</b><span>In your workspace →</span></button><button class="home-stat" @click="emit('openProspects')"><small>QUALIFIED</small><b>{{ loading ? '—' : summary.qualified_leads ?? '—' }}</b><span>Score of 70 or above</span></button><button class="home-stat" @click="emit('openPipeline')"><small>OPEN OPPORTUNITIES</small><b>{{ loading ? '—' : opportunities.filter((item) => !['CLOSED','NOT_QUALIFIED'].includes(item.stage)).length }}</b><span>Across your pipeline →</span></button><button class="home-stat" @click="emit('openMeetings')"><small>UPCOMING MEETINGS</small><b>{{ loading ? '—' : summary.upcoming_meetings ?? upcomingMeetings.length }}</b><span>Scheduled conversations →</span></button></div>
     <div class="home-action-layout"><section class="panel action-center"><div class="panel-heading"><div><h2>Action center</h2><p>Sales work with an available next step.</p></div><span class="action-count">{{ attention.length }}</span></div><div v-if="loading && !attention.length" class="sales-state"><span class="spinner"></span><b>Loading your work</b></div><div v-else-if="!attention.length" class="sales-state"><span class="state-icon">✓</span><b>You’re all caught up</b><small>New replies and review work will appear here when available.</small><button class="primary" @click="emit('openProspects')">Review prospects</button></div><button v-for="item in attention" :key="`${item.kind}-${item.label}`" class="action-row" @click="item.click()"><span class="action-type">{{ item.kind }}</span><span class="action-copy"><b>{{ item.label }}</b><small>{{ item.context }}</small></span><span class="action-link">{{ item.action }} →</span></button></section>
