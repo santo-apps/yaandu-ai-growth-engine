@@ -38,7 +38,7 @@ final class ResolveWebsiteCandidateJob implements ShouldQueue, ShouldBeUnique
         DB::table('website_resolutions')->where('tenant_id', $this->tenantId)->where('id', $this->resolutionId)
             ->whereIn('state', ['PENDING', 'SEARCHING', 'CANDIDATES_FOUND', 'VERIFYING'])
             ->update(['state' => 'FAILED', 'failure_code' => 'JOB_EXECUTION_FAILED',
-                'failure_summary' => 'Website resolution stopped unexpectedly. It can be retried safely.', 'finished_at' => now(), 'updated_at' => now()]);
+                'discovery_status' => 'FAILED', 'failure_summary' => 'Website resolution stopped unexpectedly. It can be retried safely.', 'finished_at' => now(), 'updated_at' => now()]);
     }
 
     public function handle(WebsiteResolutionSourceRegistry $sources, DomainNormalizer $domains, UrlPolicy $policy,
@@ -46,12 +46,16 @@ final class ResolveWebsiteCandidateJob implements ShouldQueue, ShouldBeUnique
         DirectoryDomainClassifier $directory): void
     {
         $resolution = DB::table('website_resolutions')->where('tenant_id', $this->tenantId)->where('id', $this->resolutionId)->first();
-        if (! $resolution || ! in_array($resolution->state, ['PENDING', 'FAILED'], true)) return;
+        if (! $resolution || ! in_array($resolution->state, ['PENDING', 'FAILED', 'CANDIDATES_FOUND', 'PARTIALLY_COMPLETED'], true)) return;
+        $preDiscovered = in_array($resolution->state, ['CANDIDATES_FOUND', 'PARTIALLY_COMPLETED'], true)
+            && ($resolution->discovery_status ?? 'PENDING') !== 'PENDING';
+        $discoveryWasPartial = ($resolution->discovery_status ?? null) === 'PARTIALLY_COMPLETED';
         $snapshot = is_array($resolution->identity_snapshot) ? $resolution->identity_snapshot : (json_decode((string) $resolution->identity_snapshot, true) ?: []);
         DB::table('website_resolutions')->where('tenant_id', $this->tenantId)->where('id', $this->resolutionId)->update([
-            'state' => 'SEARCHING', 'started_at' => now(), 'failure_code' => null, 'failure_summary' => null, 'updated_at' => now()]);
+            'state' => $preDiscovered ? 'VERIFYING' : 'SEARCHING', 'discovery_status' => $preDiscovered ? 'VERIFYING' : $resolution->discovery_status,
+            'started_at' => now(), 'failure_code' => null, 'failure_summary' => null, 'updated_at' => now()]);
         $allCandidates = []; $failures = []; $lookupCount = 0;
-        $sourceNames = ['osm_website_evidence', 'wikidata', 'local_web_index'];
+        $sourceNames = $preDiscovered ? [] : ['osm_website_evidence', 'wikidata', 'local_web_index'];
         if (app()->environment('testing')) $sourceNames[] = 'deterministic';
         $deadline = microtime(true) + min(60, max(1, (int) config('website_resolution.max_duration_seconds', 60)));
         foreach ($sourceNames as $sourceName) {
@@ -84,6 +88,13 @@ final class ResolveWebsiteCandidateJob implements ShouldQueue, ShouldBeUnique
             $stored[$id] = ['id' => $id, 'url' => $normalized['normalized_url'], 'normalized_domain' => $normalized['normalized_domain'], 'candidate_type' => $hint['candidate_type'] ?? 'business'];
             $this->saveEvidence($id, (string) ($hint['source'] ?? 'unknown'), (array) ($hint['evidence'] ?? []), (string) ($hint['source_reference'] ?? ''));
         }
+        if ($preDiscovered) {
+            foreach (DB::table('website_resolution_candidates')->where('tenant_id', $this->tenantId)->where('resolution_id', $this->resolutionId)
+                ->orderByRaw('discovery_rank is null, discovery_rank asc')->limit((int) config('candidate_discovery.verification_candidates_per_business', 5))->get() as $candidate) {
+                $stored[$candidate->id] = ['id' => $candidate->id, 'url' => $candidate->candidate_url,
+                    'normalized_domain' => $candidate->normalized_domain, 'candidate_type' => $candidate->candidate_type];
+            }
+        }
 
         if ($lookupCount < (int) config('website_resolution.max_source_lookups_per_business', 3) && $stored && microtime(true) < $deadline && ! app()->environment('testing')) {
             $lookupCount++;
@@ -106,7 +117,9 @@ final class ResolveWebsiteCandidateJob implements ShouldQueue, ShouldBeUnique
                     'state' => 'failed', 'failure_code' => 'SOURCE_UNAVAILABLE', 'failure_summary' => $failures['common_crawl'], 'finished_at' => now(), 'updated_at' => now()]);
             }
         }
-        $rows = DB::table('website_resolution_candidates')->where('tenant_id', $this->tenantId)->where('resolution_id', $this->resolutionId)->get();
+        $rows = DB::table('website_resolution_candidates')->where('tenant_id', $this->tenantId)->where('resolution_id', $this->resolutionId)
+            ->when($preDiscovered, fn ($query) => $query->orderByRaw('discovery_rank is null, discovery_rank asc')->limit((int) config('candidate_discovery.verification_candidates_per_business', 5)))
+            ->get();
         if ($rows->isNotEmpty()) DB::table('website_resolutions')->where('tenant_id', $this->tenantId)->where('id', $this->resolutionId)->update(['state' => 'CANDIDATES_FOUND', 'updated_at' => now()]);
         $results = [];
         if ($rows->isNotEmpty()) {
@@ -143,6 +156,7 @@ final class ResolveWebsiteCandidateJob implements ShouldQueue, ShouldBeUnique
         }
         DB::table('website_resolutions')->where('tenant_id', $this->tenantId)->where('id', $this->resolutionId)->update([
             'state' => $state, 'resolved_candidate_id' => $resolvedCandidateId, 'resolved_domain' => $resolvedDomain,
+            'discovery_status' => $discoveryWasPartial ? 'PARTIALLY_COMPLETED' : ($preDiscovered ? 'COMPLETED' : $resolution->discovery_status),
             'score' => $top['score'] ?? null, 'confidence_band' => $top['confidence_band'] ?? null,
             'failure_code' => $failureCode, 'failure_summary' => $failureSummary, 'finished_at' => now(), 'updated_at' => now()]);
     }

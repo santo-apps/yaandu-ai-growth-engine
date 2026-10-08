@@ -19,6 +19,61 @@ use Laravel\Sanctum\Sanctum;
  */
 final class PostgresRedisDiscoveryVerificationTest extends TestCase
 {
+    public function test_explicit_website_discovery_persists_raw_evidence_and_replays_idempotently_through_redis(): void
+    {
+        if (! (bool) env('YAANDU_POSTGRES_REDIS_INTEGRATION', false)) {
+            self::markTestSkipped('Set YAANDU_POSTGRES_REDIS_INTEGRATION=true to run against the dedicated local PostgreSQL/Redis integration environment.');
+        }
+        self::assertSame('pgsql', DB::connection()->getDriverName(), 'This suite must execute against PostgreSQL.');
+        self::assertSame('redis', config('queue.default'), 'This suite must enqueue through Redis.');
+
+        $tenant = Tenant::create(['id' => (string) Str::uuid(), 'name' => 'PostgreSQL Candidate Discovery Integration',
+            'slug' => 'pg-candidate-'.Str::lower(Str::random(12)), 'status' => 'active']);
+        $user = User::create(['name' => 'Candidate Integration Owner', 'email' => 'pg-candidate-'.Str::lower(Str::random(12)).'@example.test',
+            'password' => Hash::make(Str::random(32))]);
+        $tenant->users()->attach($user->id, ['role' => 'owner', 'status' => 'active']);
+        config(['candidate_discovery.wikidata_search_enabled' => false, 'candidate_discovery.deterministic_fixtures' => [
+            'integration furniture' => ['mode' => 'directory', 'result_url' => 'https://directory.example/directory/listing/integration-furniture',
+                'target_url' => null, 'title' => 'Directory evidence fixture', 'snippet' => 'Untrusted deterministic evidence.'],
+        ]]);
+        $idempotencyKey = 'pg-redis-candidate-'.Str::lower(Str::random(16));
+
+        try {
+            $company = Company::create(['id' => (string) Str::uuid(), 'tenant_id' => $tenant->id, 'name' => 'Integration Furniture',
+                'location' => 'Dubai', 'industry' => 'Furniture', 'source' => 'integration_fixture', 'status' => 'new']);
+            Sanctum::actingAs($user);
+            $response = $this->withHeader('X-Tenant-ID', $tenant->id)->postJson('/api/v1/companies/'.$company->id.'/website-discovery', [
+                'idempotency_key' => $idempotencyKey,
+            ])->assertAccepted();
+            $resolutionId = $response->json('resolution_id');
+            self::assertSame(1, Queue::connection('redis')->size('candidate-discovery'));
+            self::assertSame(0, Artisan::call('queue:work', ['connection' => 'redis', '--queue' => 'candidate-discovery', '--once' => true, '--tries' => 1]));
+
+            $resolution = DB::table('website_resolutions')->where('tenant_id', $tenant->id)->where('id', $resolutionId)->first();
+            self::assertSame('NO_CANDIDATES', $resolution->discovery_status, 'A directory page without an explicit external link remains evidence, not a candidate. Actual: '.json_encode([
+                'resolution' => $resolution, 'candidates' => DB::table('website_resolution_candidates')->where('tenant_id', $tenant->id)->where('resolution_id', $resolutionId)->get()->toArray(),
+                'raw' => DB::table('website_resolution_search_results')->where('tenant_id', $tenant->id)->where('resolution_id', $resolutionId)->get()->toArray(),
+            ]));
+            $rawResults = DB::table('website_resolution_search_results')->where('tenant_id', $tenant->id)->where('resolution_id', $resolutionId)->get();
+            self::assertCount(1, $rawResults, 'The deterministic directory source must persist raw result evidence. Attempts: '.json_encode(
+                DB::table('website_resolution_attempts')->where('tenant_id', $tenant->id)->where('resolution_id', $resolutionId)->get()->toArray()));
+            self::assertDatabaseHas('website_resolution_search_results', ['tenant_id' => $tenant->id, 'resolution_id' => $resolutionId,
+                'result_type' => 'DIRECTORY', 'target_url' => null]);
+
+            $this->withHeader('X-Tenant-ID', $tenant->id)->postJson('/api/v1/companies/'.$company->id.'/website-discovery', [
+                'idempotency_key' => $idempotencyKey,
+            ])->assertOk()->assertJsonPath('resolution_id', $resolutionId);
+            self::assertSame(0, Queue::connection('redis')->size('candidate-discovery'), 'A completed idempotent replay must not enqueue a duplicate job.');
+            self::assertSame(0, DB::table('campaign_recipients')->where('tenant_id', $tenant->id)->count());
+            self::assertSame(0, DB::table('outbound_messages')->where('tenant_id', $tenant->id)->count());
+            self::assertSame(0, DB::table('meeting_bookings')->where('tenant_id', $tenant->id)->count());
+            self::assertSame(0, DB::table('proposals')->where('tenant_id', $tenant->id)->count());
+        } finally {
+            $tenant->delete();
+            $user->delete();
+        }
+    }
+
     public function test_authenticated_discovery_run_is_serialized_to_redis_and_verified_in_postgres(): void
     {
         if (! (bool) env('YAANDU_POSTGRES_REDIS_INTEGRATION', false)) {

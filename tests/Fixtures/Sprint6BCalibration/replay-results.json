@@ -1,0 +1,449 @@
+{
+  "benchmark_version": "S6-CALIBRATION-V1",
+  "blind_sha256": "86cabe9ed3f10c118516b101d7505fe8c2dc33a461ee7f28a3129cfc2c507295",
+  "ground_truth_sha256": "959b420c640afd005934b711998258518035e6456ad31e834a61b602fabc01f7",
+  "sprint5": {
+    "replay": "Sprint 5 committed source path",
+    "version": "c646becc1c1a4b50c8e0005dc7854b28e14fc424",
+    "inputs_sha256": "86cabe9ed3f10c118516b101d7505fe8c2dc33a461ee7f28a3129cfc2c507295",
+    "labels_used_only_after_replay": true,
+    "results": [
+      {
+        "benchmark_id": "IN-001",
+        "candidates": [],
+        "correct_domain_present": false,
+        "correct_domain_rank": null,
+        "resolution_state": "UNRESOLVED",
+        "latency_ms": 4,
+        "source_failures": 0,
+        "source_calls": 3
+      },
+      {
+        "benchmark_id": "IN-002",
+        "candidates": [],
+        "correct_domain_present": false,
+        "correct_domain_rank": null,
+        "resolution_state": "UNRESOLVED",
+        "latency_ms": 132,
+        "source_failures": 0,
+        "source_calls": 3
+      },
+      {
+        "benchmark_id": "IN-003",
+        "candidates": [],
+        "correct_domain_present": false,
+        "correct_domain_rank": null,
+        "resolution_state": "UNRESOLVED",
+        "latency_ms": 8,
+        "source_failures": 0,
+        "source_calls": 3
+      },
+      {
+        "benchmark_id": "IN-004",
+        "candidates": [],
+        "correct_domain_present": false,
+        "correct_domain_rank": null,
+        "resolution_state": "UNRESOLVED",
+        "latency_ms": 8,
+        "source_failures": 0,
+        "source_calls": 3
+      },
+      {
+        "benchmark_id": "IN-005",
+        "candidates": [],
+        "correct_domain_present": false,
+        "correct_domain_rank": null,
+        "resolution_state": "UNRESOLVED",
+        "latency_ms": 7,
+        "source_failures": 0,
+        "source_calls": 3
+      },
+      {
+        "benchmark_id": "IN-006",
+        "candidates": [],
+        "correct_domain_present": false,
+        "correct_domain_rank": null,
+        "resolution_state": "UNRESOLVED",
+        "latency_ms": 0,
+        "source_failures": 0,
+        "source_calls": 3
+      },
+      {
+        "benchmark_id": "IN-007",
+        "candidates": [],
+        "correct_domain_present": false,
+        "correct_domain_rank": null,
+        "resolution_state": "UNRESOLVED",
+        "latency_ms": 6,
+        "source_failures": 0,
+        "source_calls": 3
+      },
+      {
+        "benchmark_id": "IN-008",
+        "candidates": [],
+        "correct_domain_present": false,
+        "correct_domain_rank": null,
+        "resolution_state": "UNRESOLVED",
+        "latency_ms": 0,
+        "source_failures": 0,
+        "source_calls": 3
+      },
+      {
+        "benchmark_id": "IN-009",
+        "candidates": [],
+        "correct_domain_present": false,
+        "correct_domain_rank": null,
+        "resolution_state": "UNRESOLVED",
+        "latency_ms": 4,
+        "source_failures": 0,
+        "source_calls": 3
+      },
+      {
+        "benchmark_id": "IN-010",
+        "candidates": [],
+        "correct_domain_present": false,
+        "correct_domain_rank": null,
+        "resolution_state": "UNRESOLVED",
+        "latency_ms": 4,
+        "source_failures": 0,
+        "source_calls": 3
+      },
+      {
+        "benchmark_id": "AE-001",
+        "candidates": [],
+        "correct_domain_present": false,
+        "correct_domain_rank": null,
+        "resolution_state": "UNRESOLVED",
+        "latency_ms": 4,
+        "source_failures": 0,
+        "source_calls": 3
+      },
+      {
+        "benchmark_id": "AE-002",
+        "candidates": [],
+        "correct_domain_present": false,
+        "correct_domain_rank": null,
+        "resolution_state": "UNRESOLVED",
+        "latency_ms": 0,
+        "source_failures": 0,
+        "source_calls": 3
+      },
+      {
+        "benchmark_id": "AE-003",
+        "candidates": [],
+        "correct_domain_present": false,
+        "correct_domain_rank": null,
+        "resolution_state": "UNRESOLVED",
+        "latency_ms": 4,
+        "source_failures": 0,
+        "source_calls": 3
+      },
+      {
+        "benchmark_id": "AE-004",
+        "candidates": [],
+        "correct_domain_present": false,
+        "correct_domain_rank": null,
+        "resolution_state": "UNRESOLVED",
+        "latency_ms": 4,
+        "source_failures": 0,
+        "source_calls": 3
+      },
+      {
+        "benchmark_id": "AE-005",
+        "candidates": [],
+        "correct_domain_present": false,
+        "correct_domain_rank": null,
+        "resolution_state": "UNRESOLVED",
+        "latency_ms": 4,
+        "source_failures": 0,
+        "source_calls": 3
+      },
+      {
+        "benchmark_id": "AE-006",
+        "candidates": [],
+        "correct_domain_present": false,
+        "correct_domain_rank": null,
+        "resolution_state": "UNRESOLVED",
+        "latency_ms": 4,
+        "source_failures": 0,
+        "source_calls": 3
+      },
+      {
+        "benchmark_id": "AE-007",
+        "candidates": [],
+        "correct_domain_present": false,
+        "correct_domain_rank": null,
+        "resolution_state": "UNRESOLVED",
+        "latency_ms": 4,
+        "source_failures": 0,
+        "source_calls": 3
+      },
+      {
+        "benchmark_id": "AE-008",
+        "candidates": [],
+        "correct_domain_present": false,
+        "correct_domain_rank": null,
+        "resolution_state": "UNRESOLVED",
+        "latency_ms": 4,
+        "source_failures": 0,
+        "source_calls": 3
+      },
+      {
+        "benchmark_id": "AE-009",
+        "candidates": [],
+        "correct_domain_present": false,
+        "correct_domain_rank": null,
+        "resolution_state": "UNRESOLVED",
+        "latency_ms": 5,
+        "source_failures": 0,
+        "source_calls": 3
+      },
+      {
+        "benchmark_id": "AE-010",
+        "candidates": [],
+        "correct_domain_present": false,
+        "correct_domain_rank": null,
+        "resolution_state": "UNRESOLVED",
+        "latency_ms": 5,
+        "source_failures": 0,
+        "source_calls": 3
+      }
+    ],
+    "summary": {
+      "candidate_bearing": 0,
+      "correct_domain_recall": 0,
+      "top_1": 0,
+      "top_3": 0,
+      "top_5": 0,
+      "no_candidate": 20,
+      "incorrect_suggestions": 0,
+      "incorrect_automatic_assignments": 0,
+      "average_candidates_per_business": 0.0,
+      "median_latency_ms": 4.0,
+      "p95_latency_ms": 8,
+      "source_failures": 0
+    }
+  },
+  "sprint6": {
+    "replay": "Sprint 6 candidate-domain discovery service",
+    "version": "uncommitted working-tree Sprint 6 implementation at HEAD c646becc1c1a4b50c8e0005dc7854b28e14fc424",
+    "inputs_sha256": "86cabe9ed3f10c118516b101d7505fe8c2dc33a461ee7f28a3129cfc2c507295",
+    "labels_used_only_after_replay": true,
+    "results": [
+      {
+        "benchmark_id": "IN-001",
+        "candidates": [],
+        "correct_domain_present": false,
+        "correct_domain_rank": null,
+        "resolution_state": "PARTIALLY_COMPLETED",
+        "latency_ms": 1134,
+        "source_failures": 2,
+        "source_calls": 5
+      },
+      {
+        "benchmark_id": "IN-002",
+        "candidates": [],
+        "correct_domain_present": false,
+        "correct_domain_rank": null,
+        "resolution_state": "PARTIALLY_COMPLETED",
+        "latency_ms": 576,
+        "source_failures": 2,
+        "source_calls": 5
+      },
+      {
+        "benchmark_id": "IN-003",
+        "candidates": [],
+        "correct_domain_present": false,
+        "correct_domain_rank": null,
+        "resolution_state": "PARTIALLY_COMPLETED",
+        "latency_ms": 562,
+        "source_failures": 2,
+        "source_calls": 5
+      },
+      {
+        "benchmark_id": "IN-004",
+        "candidates": [],
+        "correct_domain_present": false,
+        "correct_domain_rank": null,
+        "resolution_state": "PARTIALLY_COMPLETED",
+        "latency_ms": 603,
+        "source_failures": 2,
+        "source_calls": 5
+      },
+      {
+        "benchmark_id": "IN-005",
+        "candidates": [],
+        "correct_domain_present": false,
+        "correct_domain_rank": null,
+        "resolution_state": "PARTIALLY_COMPLETED",
+        "latency_ms": 697,
+        "source_failures": 2,
+        "source_calls": 5
+      },
+      {
+        "benchmark_id": "IN-006",
+        "candidates": [],
+        "correct_domain_present": false,
+        "correct_domain_rank": null,
+        "resolution_state": "PARTIALLY_COMPLETED",
+        "latency_ms": 684,
+        "source_failures": 2,
+        "source_calls": 5
+      },
+      {
+        "benchmark_id": "IN-007",
+        "candidates": [],
+        "correct_domain_present": false,
+        "correct_domain_rank": null,
+        "resolution_state": "PARTIALLY_COMPLETED",
+        "latency_ms": 572,
+        "source_failures": 2,
+        "source_calls": 5
+      },
+      {
+        "benchmark_id": "IN-008",
+        "candidates": [],
+        "correct_domain_present": false,
+        "correct_domain_rank": null,
+        "resolution_state": "PARTIALLY_COMPLETED",
+        "latency_ms": 682,
+        "source_failures": 2,
+        "source_calls": 5
+      },
+      {
+        "benchmark_id": "IN-009",
+        "candidates": [],
+        "correct_domain_present": false,
+        "correct_domain_rank": null,
+        "resolution_state": "PARTIALLY_COMPLETED",
+        "latency_ms": 843,
+        "source_failures": 2,
+        "source_calls": 5
+      },
+      {
+        "benchmark_id": "IN-010",
+        "candidates": [],
+        "correct_domain_present": false,
+        "correct_domain_rank": null,
+        "resolution_state": "PARTIALLY_COMPLETED",
+        "latency_ms": 1213,
+        "source_failures": 2,
+        "source_calls": 5
+      },
+      {
+        "benchmark_id": "AE-001",
+        "candidates": [],
+        "correct_domain_present": false,
+        "correct_domain_rank": null,
+        "resolution_state": "PARTIALLY_COMPLETED",
+        "latency_ms": 637,
+        "source_failures": 2,
+        "source_calls": 5
+      },
+      {
+        "benchmark_id": "AE-002",
+        "candidates": [],
+        "correct_domain_present": false,
+        "correct_domain_rank": null,
+        "resolution_state": "PARTIALLY_COMPLETED",
+        "latency_ms": 700,
+        "source_failures": 2,
+        "source_calls": 5
+      },
+      {
+        "benchmark_id": "AE-003",
+        "candidates": [],
+        "correct_domain_present": false,
+        "correct_domain_rank": null,
+        "resolution_state": "PARTIALLY_COMPLETED",
+        "latency_ms": 527,
+        "source_failures": 2,
+        "source_calls": 5
+      },
+      {
+        "benchmark_id": "AE-004",
+        "candidates": [],
+        "correct_domain_present": false,
+        "correct_domain_rank": null,
+        "resolution_state": "PARTIALLY_COMPLETED",
+        "latency_ms": 556,
+        "source_failures": 2,
+        "source_calls": 5
+      },
+      {
+        "benchmark_id": "AE-005",
+        "candidates": [],
+        "correct_domain_present": false,
+        "correct_domain_rank": null,
+        "resolution_state": "PARTIALLY_COMPLETED",
+        "latency_ms": 662,
+        "source_failures": 2,
+        "source_calls": 5
+      },
+      {
+        "benchmark_id": "AE-006",
+        "candidates": [],
+        "correct_domain_present": false,
+        "correct_domain_rank": null,
+        "resolution_state": "PARTIALLY_COMPLETED",
+        "latency_ms": 813,
+        "source_failures": 2,
+        "source_calls": 5
+      },
+      {
+        "benchmark_id": "AE-007",
+        "candidates": [],
+        "correct_domain_present": false,
+        "correct_domain_rank": null,
+        "resolution_state": "PARTIALLY_COMPLETED",
+        "latency_ms": 1054,
+        "source_failures": 2,
+        "source_calls": 5
+      },
+      {
+        "benchmark_id": "AE-008",
+        "candidates": [],
+        "correct_domain_present": false,
+        "correct_domain_rank": null,
+        "resolution_state": "PARTIALLY_COMPLETED",
+        "latency_ms": 734,
+        "source_failures": 2,
+        "source_calls": 5
+      },
+      {
+        "benchmark_id": "AE-009",
+        "candidates": [],
+        "correct_domain_present": false,
+        "correct_domain_rank": null,
+        "resolution_state": "PARTIALLY_COMPLETED",
+        "latency_ms": 637,
+        "source_failures": 2,
+        "source_calls": 5
+      },
+      {
+        "benchmark_id": "AE-010",
+        "candidates": [],
+        "correct_domain_present": false,
+        "correct_domain_rank": null,
+        "resolution_state": "PARTIALLY_COMPLETED",
+        "latency_ms": 705,
+        "source_failures": 2,
+        "source_calls": 5
+      }
+    ],
+    "summary": {
+      "candidate_bearing": 0,
+      "correct_domain_recall": 0,
+      "top_1": 0,
+      "top_3": 0,
+      "top_5": 0,
+      "no_candidate": 20,
+      "incorrect_suggestions": 0,
+      "incorrect_automatic_assignments": 0,
+      "average_candidates_per_business": 0.0,
+      "median_latency_ms": 683.0,
+      "p95_latency_ms": 1134,
+      "source_failures": 40
+    }
+  }
+}

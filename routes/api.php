@@ -42,10 +42,13 @@ Route::prefix('v1')->group(function (): void {
     Route::get('/website-screenshots/{screenshot}/content', [CompanyController::class, 'screenshotContent']);
     Route::apiResource('companies', CompanyController::class)->only(['index', 'store', 'show']);
     Route::get('/companies/{company}/intelligence', [CompanyController::class, 'intelligence']);
+    Route::get('/companies/{company}/website-discovery', [CompanyController::class, 'websiteDiscovery']);
+    Route::post('/companies/{company}/website-discovery', [CompanyController::class, 'findWebsite'])->middleware('throttle:10,1');
     Route::post('/websites/{website}/scan', [CompanyController::class, 'scan']);
     Route::get('/agent-runs', [AgentRunController::class, 'index']);
     Route::get('/agent-runs/{id}', [AgentRunController::class, 'show']);
     Route::get('/operations/web-index', [WebIndexOperationsController::class, 'overview'])->middleware('throttle:60,1');
+    Route::get('/operations/candidate-discovery', [WebIndexOperationsController::class, 'candidateDiscovery'])->middleware('throttle:60,1');
     Route::post('/operations/web-index/runs', [WebIndexOperationsController::class, 'start'])->middleware('throttle:10,1');
     Route::get('/automation/summary', [OrchestrationController::class, 'summary']);
     Route::get('/automation/workflows', [OrchestrationController::class, 'index']);
