@@ -96,11 +96,12 @@ class CompanyController extends Controller
     {
         $tenantId = app('tenant.id');
         $record = Company::where('tenant_id', $tenantId)->where('status', '!=', 'discovery_candidate')->with(['websites'])->findOrFail($company);
-        $record->setAttribute('import_provenance', DB::table('prospect_import_rows as rows')
+        $provenance = DB::table('prospect_import_rows as rows')
             ->join('prospect_import_batches as batches', function ($join): void {
                 $join->on('batches.id', '=', 'rows.batch_id')->on('batches.tenant_id', '=', 'rows.tenant_id');
             })
             ->leftJoin('users', 'users.id', '=', 'batches.created_by')
+            ->leftJoin('users as reviewers', 'reviewers.id', '=', 'rows.reviewed_by')
             ->leftJoin('pilot_cohorts as cohorts', function ($join): void {
                 $join->on('cohorts.id', '=', 'batches.pilot_cohort_id')->on('cohorts.tenant_id', '=', 'batches.tenant_id');
             })
@@ -110,10 +111,32 @@ class CompanyController extends Controller
             ->select([
                 'rows.id as import_row_id', 'rows.row_number', 'rows.original_name', 'rows.original_website',
                 'rows.normalized_domain', 'rows.source', 'rows.validation_status', 'rows.deduplication_status',
+                'rows.source_url', 'rows.collected_at', 'rows.provenance_note', 'rows.review_status', 'rows.intelligence_rating',
+                'rows.lead_score_rating', 'rows.recommendation_rating', 'rows.intelligence_rubric_score', 'rows.technology_accuracy_rating',
+                'rows.next_action_rating', 'rows.claim_reviews', 'rows.unsupported_claim_count', 'rows.reviewer_notes', 'rows.reviewed_by',
+                'reviewers.name as reviewer_name', 'rows.reviewed_at',
                 'rows.status as import_status', 'rows.created_at as received_at', 'rows.processed_at',
                 'batches.id as batch_id', 'batches.file_name', 'batches.confirmed_at',
                 'users.name as imported_by', 'cohorts.id as cohort_id', 'cohorts.name as cohort_name',
-            ])->first());
+            ])->first();
+        if ($provenance) {
+            $provenance->claim_reviews = is_array($provenance->claim_reviews)
+                ? $provenance->claim_reviews
+                : (json_decode((string) $provenance->claim_reviews, true) ?: []);
+            $decision = DB::table('pilot_human_decisions as decisions')->leftJoin('users', 'users.id', '=', 'decisions.reviewer_id')
+                ->where('decisions.tenant_id', $tenantId)->where('decisions.prospect_import_row_id', $provenance->import_row_id)
+                ->orderByDesc('decisions.decided_at')->orderByDesc('decisions.id')->first([
+                    'decisions.id', 'decisions.service_decision', 'decisions.selected_service_ids', 'decisions.priority',
+                    'decisions.intelligence_run_id', 'decisions.notes', 'decisions.decided_at', 'users.name as reviewer_name',
+                ]);
+            if ($decision) {
+                $decision->selected_service_ids = is_array($decision->selected_service_ids) ? $decision->selected_service_ids : (json_decode((string) $decision->selected_service_ids, true) ?: []);
+                $decision->services = DB::table('tenant_services')->where('tenant_id', $tenantId)->whereIn('id', $decision->selected_service_ids)
+                    ->get(['id', 'sku', 'name']);
+            }
+            $provenance->human_decision = $decision;
+        }
+        $record->setAttribute('import_provenance', $provenance);
 
         return $record;
     }
@@ -174,6 +197,14 @@ class CompanyController extends Controller
             'technologies' => $scan ? DB::table('website_technologies')->where('tenant_id', $tenantId)->where('website_scan_id', $scan->id)->orderBy('name')->get() : [],
             'screenshots' => $scan ? DB::table('website_screenshots')->where('tenant_id', $tenantId)->where('website_scan_id', $scan->id)->orderByDesc('captured_at')->get(['id', 'viewport', 'captured_at', 'status', 'content_hash']) : [],
             'insights' => DB::table('lead_insights')->where('tenant_id', $tenantId)->where('company_id', $record->id)->latest()->limit(50)->get(),
+            'intelligence_results' => DB::table('website_intelligence_results')->where('tenant_id', $tenantId)->where('company_id', $record->id)
+                ->orderByDesc('created_at')->limit(10)->get(['id', 'website_scan_id', 'agent_run_id', 'prompt_template_id', 'prompt_version',
+                    'schema_version', 'provider', 'model', 'correlation_id', 'confidence', 'structured_output', 'provider_latency_ms', 'execution_duration_ms', 'created_at'])
+                ->map(function (object $result): object {
+                    $result->structured_output = is_array($result->structured_output) ? $result->structured_output
+                        : (json_decode((string) $result->structured_output, true) ?: []);
+                    return $result;
+                }),
             'scores' => DB::table('lead_scores')->where('tenant_id', $tenantId)->where('company_id', $record->id)->latest('scored_at')->limit(10)->get(),
         ]);
     }

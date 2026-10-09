@@ -36,7 +36,7 @@ final class SeedSimulatedPilot extends Command
             $owner = $this->owner($password);
             $owner->tenants()->attach($tenant->id, ['role' => 'owner', 'status' => 'active']);
             $cohortId = (string) Str::uuid();
-            DB::table('pilot_cohorts')->insert(['id' => $cohortId, 'tenant_id' => $tenant->id, 'name' => 'Sprint 7 fictional internal pilot · 25 prospects',
+            DB::table('pilot_cohorts')->insert(['id' => $cohortId, 'tenant_id' => $tenant->id, 'name' => 'Sprint 7 fictional internal pilot · 25 prospects', 'data_classification' => 'simulated',
                 'starts_on' => today(), 'owner_user_id' => $owner->id, 'status' => 'active', 'created_at' => now(), 'updated_at' => now()]);
             $path = tempnam(sys_get_temp_dir(), 'yaandu-s7-');
             if ($path === false) throw new LogicException('Unable to create a temporary local fixture CSV.');

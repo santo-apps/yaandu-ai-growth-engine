@@ -29,9 +29,14 @@ final class LeadScoringAgent implements AgentInterface
         $existing = DB::table('lead_scores')->where('tenant_id', $context->tenantId)->where('agent_run_id', $context->runId)->first(['id', 'created_at']);
         DB::table('lead_scores')->updateOrInsert(['id' => $existing?->id ?? (string) Str::uuid()], [
             'tenant_id' => $context->tenantId, 'company_id' => $company->id, 'score' => $score['score'],
+            'evaluation_status' => $score['evaluation_status'], 'evidence_coverage' => $score['evidence_coverage'],
             'components' => json_encode($score['components']), 'rule_version' => $score['rule_version'],
             'agent_run_id' => $context->runId, 'scored_at' => now(), 'created_at' => $existing?->created_at ?? now(), 'updated_at' => now(),
         ]);
-        return new AgentResult($score, 'Company scored '.$score['score'].' / 100.', $evidence);
+        $summary = $score['score'] === null
+            ? 'Insufficient evidence to assign a lead score.'
+            : 'Company scored '.$score['score'].' / 100.';
+
+        return new AgentResult($score, $summary, $evidence);
     }
 }

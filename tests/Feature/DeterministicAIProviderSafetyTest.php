@@ -83,12 +83,12 @@ final class DeterministicAIProviderSafetyTest extends TestCase
         config(['ai.local_acceptance.enabled' => true]);
         $provider = new DeterministicAIProvider();
         $serviceId = (string) Str::uuid(); $evidenceId = (string) Str::uuid(); $knowledgeId = (string) Str::uuid();
+        $websiteSchema = \App\Agents\WebsiteIntelligenceAgent::modelSchema();
         $website = $provider->generate(new AIRequest('website_reasoning', 'Fixture only.', [[
-            'url' => 'https://northstar-retail.fixture.test', 'text' => 'Retail ecommerce business with an older storefront layout. Mobile navigation is difficult.',
-        ]], ['type' => 'object', 'required' => ['summary','issues','technologies','insights','contacts']]), 'fixture-model');
-        self::assertSame('Local deterministic analysis based only on the supplied fictional page evidence.', $website->data['summary']);
-        self::assertStringContainsString('older storefront layout', $website->data['issues'][0]['evidence']);
-        (new JsonSchemaValidator())->validate($website->data, ['type' => 'object', 'required' => ['summary','issues','technologies','insights','contacts']]);
+            'id' => 'fixture-page-id', 'url' => 'https://northstar-retail.fixture.test', 'title' => 'Northstar', 'text' => 'Retail ecommerce business with an older storefront layout. Mobile navigation is difficult.',
+        ]], $websiteSchema), 'fixture-model');
+        self::assertStringContainsString('older storefront layout', $website->data['technical_findings'][0]['excerpt']);
+        (new JsonSchemaValidator())->validate($website->data, $websiteSchema);
 
         $otherServiceId = (string) Str::uuid();
         $proposal = $provider->generate(new AIRequest('proposal_generation', 'Fixture only.', [

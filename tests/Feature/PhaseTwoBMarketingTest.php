@@ -301,6 +301,9 @@ final class PhaseTwoBMarketingTest extends TestCase
     public function test_coordinator_uses_marketing_application_service_and_replay_is_idempotent():void
     {
         [$tenant,$owner,$company]=$this->workspace('marketing-coordinator');
+        // This test explicitly covers the opt-in experimental route; normal tenants default to human review.
+        config(['sales_intelligence.experimental_autonomous_enabled'=>true]);
+        DB::table('tenants')->where('id',$tenant->id)->update(['settings'=>json_encode(['sales_intelligence_mode'=>'experimental_autonomous'])]);
         $campaign=Campaign::create(['tenant_id'=>$tenant->id,'name'=>'Coordinator campaign','status'=>'draft','objective'=>'Improve enquiries']);
         $workflow=app(WorkflowService::class)->create($tenant->id,['company_id'=>$company->id,'campaign_id'=>$campaign->id]);
         DB::table('lead_scores')->insert(['id'=>(string)Str::uuid(),'tenant_id'=>$tenant->id,'company_id'=>$company->id,'score'=>85,'components'=>'{}',
@@ -317,6 +320,19 @@ final class PhaseTwoBMarketingTest extends TestCase
         $consumer->handle(app(AcquisitionWorkflowCoordinator::class));
         self::assertSame(1,DB::table('marketing_drafts')->where('tenant_id',$tenant->id)->where('company_id',$company->id)->count());
         self::assertSame(1,DB::table('agent_runs')->where('tenant_id',$tenant->id)->where('agent_key','MarketingAgent')->count());
+    }
+
+    public function test_lead_score_alone_cannot_trigger_marketing_draft_in_human_assisted_mode():void
+    {
+        [$tenant,,$company]=$this->workspace('marketing-human-assisted');
+        $workflow=app(WorkflowService::class)->create($tenant->id,['company_id'=>$company->id]);
+        DB::table('lead_scores')->insert(['id'=>(string)Str::uuid(),'tenant_id'=>$tenant->id,'company_id'=>$company->id,'score'=>99,'components'=>'{}',
+            'rule_version'=>1,'scored_at'=>now(),'created_at'=>now(),'updated_at'=>now()]);
+        $resolved=app(AcquisitionWorkflowCoordinator::class)->resolve($tenant->id,$workflow->id,'lead_scored');
+        self::assertNull($resolved['action']);
+        self::assertSame('WAIT',$resolved['decision']);
+        self::assertSame('outreach_ineligible',$resolved['reason']);
+        $this->assertDatabaseCount('marketing_drafts',0);
     }
 
     public function test_followup_uses_application_policy_for_high_risk_reply_and_is_review_only():void
@@ -367,6 +383,25 @@ final class PhaseTwoBMarketingTest extends TestCase
             'agent_key'=>'MarketingAgent','system_instruction'=>'A valid policy.','template'=>'Write a short message.','schema_version'=>'v1',
         ])->assertForbidden();
         $this->withHeaders(['X-Tenant-ID'=>$tenant->id])->getJson('/api/v1/marketing-configuration/knowledge')->assertOk()->assertExactJson([]);
+    }
+
+    public function test_owner_can_edit_only_inactive_tenant_prompt_drafts_without_approving_them():void
+    {
+        [$tenant,$owner]=$this->workspace('prompt-draft-edit');[$other]=$this->workspace('prompt-draft-edit-other');
+        $draftId=(string)Str::uuid();
+        DB::table('prompt_templates')->insert(['id'=>$draftId,'tenant_id'=>$tenant->id,'agent_key'=>'WebsiteIntelligenceAgent','version'=>2,
+            'system_instruction'=>'Original instruction.','template'=>'Original template.','schema_version'=>'website-intelligence-pilot-v2',
+            'active'=>false,'status'=>'draft','created_by'=>$owner->id,'created_at'=>now(),'updated_at'=>now()]);
+        Sanctum::actingAs($owner);
+        $payload=['system_instruction'=>'Evidence only.','template'=>'Return recommendation_strength, exact service_key, evidence IDs, rationale, confidence, missing information, discovery question, and next action.','schema_version'=>'website-intelligence-pilot-v2'];
+        $this->withHeaders(['X-Tenant-ID'=>$tenant->id])->putJson('/api/v1/marketing-configuration/prompts/'.$draftId,$payload)
+            ->assertOk()->assertJsonPath('status','draft')->assertJsonPath('active',0)
+            ->assertJsonPath('template',$payload['template']);
+        $this->assertDatabaseHas('prompt_templates',['id'=>$draftId,'tenant_id'=>$tenant->id,'status'=>'draft','active'=>false,'approved_at'=>null]);
+        $this->assertDatabaseHas('audit_logs',['tenant_id'=>$tenant->id,'subject_id'=>$draftId,'action'=>'prompt_template.draft_updated','actor_user_id'=>$owner->id]);
+        $this->withHeaders(['X-Tenant-ID'=>$other->id])->putJson('/api/v1/marketing-configuration/prompts/'.$draftId,$payload)->assertForbidden();
+        DB::table('prompt_templates')->where('id',$draftId)->update(['status'=>'approved','active'=>true,'approved_at'=>now()]);
+        $this->withHeaders(['X-Tenant-ID'=>$tenant->id])->putJson('/api/v1/marketing-configuration/prompts/'.$draftId,$payload)->assertNotFound();
     }
 
     private function workspace(string $slug):array

@@ -24,6 +24,8 @@ use App\Http\Controllers\Api\V1\SalesController;
 use App\Http\Controllers\Api\V1\LocalAcceptanceController;
 use App\Http\Controllers\Api\V1\WebIndexOperationsController;
 use App\Http\Controllers\Api\V1\PilotController;
+use App\Http\Controllers\Api\V1\WebsiteIntelligenceReadinessController;
+use App\Http\Controllers\Api\V1\IcpConfigurationController;
 use App\Http\Middleware\ResolveTenant;
 use Illuminate\Support\Facades\Route;
 
@@ -39,8 +41,10 @@ Route::prefix('v1')->group(function (): void {
     Route::get('/tenants', [AuthController::class, 'tenants']);
     Route::get('/dashboard/summary', [CompanyController::class, 'dashboard']);
     Route::get('/pilot/dashboard', [PilotController::class, 'dashboard']);
+    Route::get('/pilot/sales-intelligence-mode', [PilotController::class, 'salesIntelligenceMode']);
     Route::get('/pilot/operations', [PilotController::class, 'operations'])->middleware('throttle:60,1');
     Route::get('/pilot/readiness', [PilotController::class, 'readiness'])->middleware('throttle:60,1');
+    Route::get('/pilot/intelligence-readiness', WebsiteIntelligenceReadinessController::class)->middleware('throttle:30,1');
     Route::get('/pilot/cohorts', [PilotController::class, 'cohorts']);
     Route::post('/pilot/cohorts', [PilotController::class, 'createCohort']);
     Route::get('/pilot/import-batches', [PilotController::class, 'batches']);
@@ -48,6 +52,10 @@ Route::prefix('v1')->group(function (): void {
     Route::get('/pilot/import-batches/{batch}', [PilotController::class, 'batch']);
     Route::post('/pilot/import-batches/{batch}/confirm', [PilotController::class, 'confirmImport'])->middleware('throttle:10,1');
     Route::post('/pilot/import-batches/{batch}/retry', [PilotController::class, 'retryImport'])->middleware('throttle:10,1');
+    Route::post('/pilot/import-rows/{row}/review', [PilotController::class, 'saveReview'])->middleware('throttle:30,1');
+    Route::post('/pilot/import-rows/{row}/human-decision', [PilotController::class, 'saveHumanDecision'])->middleware('throttle:30,1');
+    Route::get('/pilot/import-rows/{row}/human-decisions', [PilotController::class, 'humanDecisionHistory']);
+    Route::get('/pilot/import-rows/{row}/reviews', [PilotController::class, 'reviewHistory']);
     Route::get('/pilot/import-batches/{batch}/errors.csv', [PilotController::class, 'errorReport']);
     Route::get('/contacts', [CompanyController::class, 'contacts']);
     Route::get('/lead-scores', [CompanyController::class, 'scores']);
@@ -85,6 +93,7 @@ Route::prefix('v1')->group(function (): void {
     Route::post('/follow-up-recommendations/{id}/takeover', [FollowUpRecommendationController::class, 'takeover']);
     Route::get('/marketing-configuration/prompts', [MarketingConfigurationController::class, 'prompts']);
     Route::post('/marketing-configuration/prompts', [MarketingConfigurationController::class, 'createPrompt']);
+    Route::put('/marketing-configuration/prompts/{id}', [MarketingConfigurationController::class, 'updatePromptDraft']);
     Route::post('/marketing-configuration/prompts/{id}/approve', [MarketingConfigurationController::class, 'approvePrompt']);
     Route::get('/marketing-configuration/knowledge', [MarketingConfigurationController::class, 'knowledge']);
     Route::post('/marketing-configuration/knowledge', [MarketingConfigurationController::class, 'createKnowledge']);
@@ -113,6 +122,11 @@ Route::prefix('v1')->group(function (): void {
     Route::post('/ai-configurations', [AIConfigurationController::class, 'store']);
     Route::put('/ai-configurations/{id}', [AIConfigurationController::class, 'update']);
     Route::get('/scoring-rules', [ScoringRuleController::class, 'show']);
+    Route::get('/icp-configurations', [IcpConfigurationController::class, 'index']);
+    Route::post('/icp-configurations', [IcpConfigurationController::class, 'store']);
+    Route::put('/icp-configurations/{id}', [IcpConfigurationController::class, 'update']);
+    Route::post('/icp-configurations/{id}/activate', [IcpConfigurationController::class, 'activate']);
+    Route::post('/icp-configurations/{id}/deactivate', [IcpConfigurationController::class, 'deactivate']);
     Route::put('/scoring-rules', [ScoringRuleController::class, 'update']);
     Route::get('/campaigns', [CampaignController::class, 'index']);
     Route::post('/campaigns', [CampaignController::class, 'store']);

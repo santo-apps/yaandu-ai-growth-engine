@@ -54,10 +54,13 @@ final class SalesExecutionService
             $qualificationLevels = array_map(fn ($item) => $item['level'], $result['qualification']);
             $score = $this->scorer->score($qualificationLevels, $policy ? (json_decode($policy->weights, true) ?: []) : [], $policy ? (json_decode($policy->thresholds, true) ?: []) : []);
             $qualification = ['dimensions' => $result['qualification'], 'score' => $score, 'updated_at' => now()->toISOString()];
+            $humanAssisted = app(\App\SalesIntelligence\SalesIntelligenceMode::class)->humanAssisted($tenantId);
             DB::table('sales_opportunities')->where('tenant_id', $tenantId)->where('id', $opportunity->id)->update(['qualification' => json_encode($qualification),
-                'qualification_score' => $score['score'], 'qualification_level' => $score['level'], 'qualified_at' => $score['score'] >= 60 ? ($opportunity->qualified_at ?? now()) : $opportunity->qualified_at, 'updated_at' => now()]);
+                'qualification_score' => $score['score'], 'qualification_level' => $score['level'],
+                // Agent qualification remains advisory until a salesperson explicitly marks the opportunity qualified.
+                'qualified_at' => $humanAssisted ? $opportunity->qualified_at : ($score['score'] >= 60 ? ($opportunity->qualified_at ?? now()) : $opportunity->qualified_at), 'updated_at' => now()]);
             $this->activity($tenantId, $opportunity->id, 'qualification_updated', $actorId, $runId, $run->correlation_id, ['score' => $score['score'], 'level' => $score['level']]);
-            if ($score['score'] >= 60) $this->activity($tenantId, $opportunity->id, 'marked_qualified', $actorId, $runId, $run->correlation_id, ['score' => $score['score']]);
+            if (! $humanAssisted && $score['score'] >= 60) $this->activity($tenantId, $opportunity->id, 'marked_qualified', $actorId, $runId, $run->correlation_id, ['score' => $score['score']]);
             $conversation->intent = $result['intent'];
             $conversation->intent_confidence = $result['confidence'];
             $conversation->conversation_stage = $opportunity->stage;

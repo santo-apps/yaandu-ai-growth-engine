@@ -55,6 +55,7 @@ Campaign, conversation, opportunity, and proposal tables are included in the sch
 | `website_issues` | Tenant/scan UUIDs, type/severity, summary, page reference, evidence JSONB, confidence, detector/version. |
 | `lead_scores` | Tenant/company UUIDs, total 0–100, component breakdown JSONB, rule-set version, scored time, agent run UUID. Append score history rather than overwrite. |
 | `lead_insights` | Tenant/company UUIDs, kind, statement, confidence, source run, created time. |
+| `website_intelligence_results` | Immutable normalized Website Intelligence result per tenant/agent run, including validated evidence references and model/prompt provenance; no raw provider payload. |
 | `lead_evidence` | Tenant/insight UUIDs, evidence type, source page/contact/issue reference, excerpt/hash, source URL, observed time, confidence. |
 | `campaigns` | Tenant UUID, creator, name/description/objective, status, target audience, timezone, send windows, per-campaign limits, configuration. |
 | `campaign_audiences` | Tenant/campaign UUID, named structured targeting criteria; one current audience definition per campaign. |
@@ -69,6 +70,7 @@ Campaign, conversation, opportunity, and proposal tables are included in the sch
 | `opportunity_activities` | Tenant/opportunity UUID, actor, activity type, safe details, timestamp. |
 | `proposals` | Tenant/opportunity UUID, lifecycle state/version, title/summary/terms, immutable calculated totals/discount, validity and approval/delivery timestamps. |
 | `tenant_services` | Tenant service catalog with SKU, description, unit price/currency, active state. Proposal prices are copied into item snapshots. |
+| `tenant_icp_configurations` | Tenant-scoped versioned ICP JSON dimensions with draft/active/superseded state, author, activation actor/time, and audit history. Active version is used for configured geography and industry scoring; readiness requires an active compatible version. |
 | `tenant_pricing_policies` | Tenant currency, maximum discount and default validity. Discount requests above policy are rejected server-side. |
 | `proposal_items` | Tenant/proposal/service UUID, service snapshot, quantity, unit price and line total. |
 | `proposal_deliveries` | Tenant/proposal/contact method, provider/idempotency state and encrypted subject/body. |

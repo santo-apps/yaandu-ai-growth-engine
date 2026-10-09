@@ -18,7 +18,7 @@ final class AnthropicProvider extends AbstractJsonProvider
         $body = $this->post(rtrim(config('ai.providers.anthropic.endpoint'), '/').'/messages', [
             'x-api-key' => $key, 'anthropic-version' => '2023-06-01',
         ], ['model' => $model, 'max_tokens' => $request->maxOutputTokens, 'temperature' => $request->temperature,
-            'system' => $request->systemInstruction, 'messages' => [['role' => 'user', 'content' => $this->prompt($request)]]]);
+            'system' => $request->systemInstruction, 'messages' => [['role' => 'user', 'content' => $this->prompt($request)]]], $model);
         return $this->decode($body['content'][0]['text'] ?? '', $model, $body['usage']['input_tokens'] ?? null, $body['usage']['output_tokens'] ?? null);
     }
 }

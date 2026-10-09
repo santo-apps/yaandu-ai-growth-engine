@@ -18,7 +18,7 @@ final class GeminiProvider extends AbstractJsonProvider
         $url = rtrim(config('ai.providers.gemini.endpoint'), '/').'/models/'.rawurlencode($model).':generateContent';
         $body = $this->post($url, ['x-goog-api-key' => $key], ['systemInstruction' => ['parts' => [['text' => $request->systemInstruction]]],
             'contents' => [['role' => 'user', 'parts' => [['text' => $this->prompt($request)]]]],
-            'generationConfig' => ['temperature' => $request->temperature, 'maxOutputTokens' => $request->maxOutputTokens, 'responseMimeType' => 'application/json']]);
+            'generationConfig' => ['temperature' => $request->temperature, 'maxOutputTokens' => $request->maxOutputTokens, 'responseMimeType' => 'application/json']], $model);
         return $this->decode($body['candidates'][0]['content']['parts'][0]['text'] ?? '', $model,
             $body['usageMetadata']['promptTokenCount'] ?? null, $body['usageMetadata']['candidatesTokenCount'] ?? null);
     }

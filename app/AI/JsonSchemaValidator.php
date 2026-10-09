@@ -31,7 +31,7 @@ final class JsonSchemaValidator
             }
             if (($schema['additionalProperties'] ?? true) === false) {
                 $unknown = array_diff(array_keys($value), array_keys($schema['properties'] ?? []));
-                if ($unknown !== []) throw new RuntimeException("Structured output at {$path} contains unknown fields.");
+                if ($unknown !== []) throw new RuntimeException("Structured output at {$path} contains unknown fields [".implode(', ', $unknown)."].");
             }
         }
 

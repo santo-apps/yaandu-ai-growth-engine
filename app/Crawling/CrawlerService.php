@@ -6,6 +6,7 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Str;
 use App\WebsiteIntelligence\PlaywrightScreenshotService;
+use App\WebsiteIntelligence\WebsiteIntelligenceFailureTaxonomy;
 use RuntimeException;
 
 final class CrawlerService
@@ -35,13 +36,15 @@ final class CrawlerService
             $policySnapshot = [...$snapshot, 'user_agent' => 'YaanduGrowthBot', 'respect_robots' => true,
                 'max_fetch_attempts' => $maxAttempts, 'max_links_per_page' => $maxLinks, 'max_duration_seconds' => $maxDuration];
             DB::table('website_scans')->where('tenant_id', $tenantId)->where('id', $scanId)->update([
-                'status' => 'running', 'error_code' => null, 'error_summary' => null, 'finished_at' => null,
+                'status' => 'running', 'error_code' => null, 'error_summary' => null, 'failure_category' => null,
+                'retryable' => 'UNKNOWN', 'safe_error_summary' => null, 'finished_at' => null,
                 'policy_snapshot' => json_encode($policySnapshot), 'started_at' => now(), 'updated_at' => now(),
             ]);
         } else {
             DB::table('website_scans')->insert(['id' => $scanId, 'tenant_id' => $tenantId, 'company_website_id' => $websiteId,
                 'status' => 'running', 'max_depth' => $maxDepth, 'max_pages' => $maxPages, 'crawler_version' => 'http-v1',
-                'policy_snapshot' => json_encode($policySnapshot), 'started_at' => now(), 'created_at' => now(), 'updated_at' => now()]);
+                'policy_snapshot' => json_encode($policySnapshot), 'original_scan_id' => $scanId,
+                'started_at' => now(), 'created_at' => now(), 'updated_at' => now()]);
         }
         if (app()->environment(['local', 'testing']) && config('pilot.allow_simulated_fixtures', false)
             && str_ends_with(strtolower((string) parse_url($website->url, PHP_URL_HOST)), '.fixture.test')) {
@@ -63,8 +66,12 @@ final class CrawlerService
                 if ($targetHost !== $host || ! $this->robots->allows($robotsText, parse_url($normalized, PHP_URL_PATH) ?: '/')) continue;
                 $seen[$normalized] = true;
                 $response = $this->fetchWithRetry($normalized, $budget);
+                if (! $response->successful()) throw new RuntimeException('Website returned HTTP '.$response->status().'.');
                 $contentType = strtolower((string) $response->header('Content-Type'));
-                if (! str_contains($contentType, 'text/html')) continue;
+                if (! str_contains($contentType, 'text/html') && ($contentType !== '' || ! preg_match('/^\s*</', $response->body()))) {
+                    if ($depth === 0) throw new RuntimeException('Website root returned unsupported content type.');
+                    continue;
+                }
                 $html = $response->body(); $finalUrl = $normalized;
                 $canonical = $this->canonical($html, $finalUrl);
                 $text = $this->extractText($html);
@@ -99,7 +106,15 @@ final class CrawlerService
             DB::table('website_scans')->where('id', $scanId)->update(['status' => 'completed', 'finished_at' => now(), 'updated_at' => now()]);
             return $scanId;
         } catch (\Throwable $e) {
-            DB::table('website_scans')->where('tenant_id', $tenantId)->where('id', $scanId)->update(['status' => 'failed', 'error_code' => 'CRAWL_FAILED', 'error_summary' => 'The website scan could not be completed.', 'finished_at' => now(), 'updated_at' => now()]);
+            $taxonomy = app(WebsiteIntelligenceFailureTaxonomy::class);
+            $category = $taxonomy->classify($e);
+            $summary = $taxonomy->safeSummary($category);
+            DB::table('website_scans')->where('tenant_id', $tenantId)->where('id', $scanId)->update([
+                'status' => 'failed', 'error_code' => $category, 'failure_category' => $category,
+                'retryable' => $taxonomy->retryability($category), 'safe_error_summary' => $summary,
+                'error_summary' => $summary, 'original_scan_id' => $scanId,
+                'finished_at' => now(), 'updated_at' => now(),
+            ]);
             throw $e;
         }
     }

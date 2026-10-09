@@ -66,29 +66,43 @@ class ProposalController extends Controller
     {
         $this->authorizeManager($request);
         $data = $request->validate(['sku' => ['required','string','max:80'], 'name' => ['required','string','max:255'], 'description' => ['nullable','string','max:4000'],
-            'unit_price' => ['required','regex:/^\d{1,12}(\.\d{1,2})?$/'], 'currency' => ['required','string','size:3','alpha'], 'active' => ['sometimes','boolean'],
+            'unit_price' => [Rule::requiredIf(($request->input('commercial_model') ?? 'FIXED_PRICE') !== 'custom_quote'),'nullable','regex:/^\d{1,12}(\.\d{1,2})?$/'], 'currency' => ['required','string','size:3','alpha'], 'active' => ['sometimes','boolean'],
             'category' => ['nullable','string','max:100'], 'capabilities' => ['sometimes','array','max:20'], 'capabilities.*' => ['string','max:500'],
             'standard_deliverables' => ['sometimes','array','max:30'], 'standard_deliverables.*' => ['string','max:500'], 'optional_deliverables' => ['sometimes','array','max:30'], 'optional_deliverables.*' => ['string','max:500'],
-            'commercial_model' => ['sometimes',Rule::in(['FIXED_PRICE','TIME_AND_MATERIAL','MONTHLY_RETAINER','MILESTONE_BASED','CUSTOM'])], 'unit' => ['sometimes','string','max:60'],
+            'commercial_model' => ['sometimes',Rule::in(['FIXED_PRICE','TIME_AND_MATERIAL','MONTHLY_RETAINER','MILESTONE_BASED','CUSTOM','custom_quote'])], 'unit' => ['nullable','sometimes','string','max:60'],
             'effective_from' => ['nullable','date'], 'effective_until' => ['nullable','date','after_or_equal:effective_from']]);
         $tenant = app('tenant.id'); $policy = $this->pricingPolicyObject($tenant); abort_unless(strtoupper($data['currency']) === $policy->currency, 422, 'Service currency must match the approved tenant pricing currency.');
-        $service = TenantService::create(['tenant_id' => $tenant, ...$data, 'currency' => strtoupper($data['currency']), 'active' => $data['active'] ?? true, 'approved_by' => $request->user()->id]);
+        if (($data['commercial_model'] ?? 'FIXED_PRICE') === 'custom_quote') { $data['unit_price'] = null; $data['unit'] = null; }
+        $service = DB::transaction(function () use ($tenant, $data, $request): TenantService {
+            $service = TenantService::create(['tenant_id' => $tenant, ...$data, 'currency' => strtoupper($data['currency']), 'active' => $data['active'] ?? true, 'approved_by' => $request->user()->id]);
+            $this->audit('commercial_input_created', $service->id, ['type' => 'service_catalogue', 'sku' => $service->sku], 'tenant_service');
+            return $service;
+        });
         return response()->json($service, 201);
     }
 
     public function updateService(Request $request, string $service)
     {
         $this->authorizeManager($request);
+        $record = TenantService::where('tenant_id', app('tenant.id'))->findOrFail($service);
+        $nextModel = $request->input('commercial_model', $record->commercial_model);
         $data = $request->validate(['sku' => ['sometimes','required','string','max:80'], 'name' => ['sometimes','required','string','max:255'], 'description' => ['sometimes','nullable','string','max:4000'],
-            'unit_price' => ['sometimes','required','regex:/^\d{1,12}(\.\d{1,2})?$/'], 'currency' => ['sometimes','required','string','size:3','alpha'], 'active' => ['sometimes','boolean'],
+            'unit_price' => [Rule::requiredIf(($request->exists('unit_price') && $nextModel !== 'custom_quote') || ($request->exists('commercial_model') && $nextModel !== 'custom_quote' && $record->commercial_model === 'custom_quote')),'nullable','regex:/^\d{1,12}(\.\d{1,2})?$/'], 'currency' => ['sometimes','required','string','size:3','alpha'], 'active' => ['sometimes','boolean'],
             'category' => ['sometimes','nullable','string','max:100'], 'capabilities' => ['sometimes','array','max:20'], 'capabilities.*' => ['string','max:500'],
             'standard_deliverables' => ['sometimes','array','max:30'], 'standard_deliverables.*' => ['string','max:500'], 'optional_deliverables' => ['sometimes','array','max:30'], 'optional_deliverables.*' => ['string','max:500'],
-            'commercial_model' => ['sometimes',Rule::in(['FIXED_PRICE','TIME_AND_MATERIAL','MONTHLY_RETAINER','MILESTONE_BASED','CUSTOM'])], 'unit' => ['sometimes','string','max:60'],
+            'commercial_model' => ['sometimes',Rule::in(['FIXED_PRICE','TIME_AND_MATERIAL','MONTHLY_RETAINER','MILESTONE_BASED','CUSTOM','custom_quote'])],
+            'unit' => [Rule::requiredIf(($request->exists('unit') && $nextModel !== 'custom_quote') || ($request->exists('commercial_model') && $nextModel !== 'custom_quote' && $record->commercial_model === 'custom_quote' && $record->unit === null)), 'nullable','string','max:60'],
             'effective_from' => ['sometimes','nullable','date'], 'effective_until' => ['sometimes','nullable','date','after_or_equal:effective_from']]);
-        $record = TenantService::where('tenant_id', app('tenant.id'))->findOrFail($service);
+        if ($nextModel === 'custom_quote') { $data['unit_price'] = null; $data['unit'] = null; }
+        elseif (array_key_exists('commercial_model', $data) && $nextModel !== 'custom_quote' && ! array_key_exists('unit_price', $data) && $record->unit_price === null) {
+            abort(422, 'A numeric catalog price is required when changing from custom quote to a priced rate model.');
+        }
         if (isset($data['currency'])) { $data['currency'] = strtoupper($data['currency']); abort_unless($data['currency'] === $this->pricingPolicyObject(app('tenant.id'))->currency, 422, 'Currency must match the approved tenant pricing currency.'); }
-        $data['approved_by'] = $request->user()->id; $record->update($data);
-        $this->audit('commercial_input_updated', $record->id, ['type' => 'service_catalogue']);
+        $data['approved_by'] = $request->user()->id;
+        DB::transaction(function () use ($record, $data): void {
+            $record->update($data);
+            $this->audit('commercial_input_updated', $record->id, ['type' => 'service_catalogue'], 'tenant_service');
+        });
         return response()->json($record->fresh());
     }
 
@@ -103,9 +117,11 @@ class ProposalController extends Controller
         abort_if(TenantService::where('tenant_id', $tenant)->where('active', true)->where('currency', '!=', $currency)->exists(), 422, 'Active catalog service currency must be updated first.');
         $current = DB::table('tenant_pricing_policies')->where('tenant_id', $tenant)->first();
         $values = ['currency' => $currency, 'max_discount_percent' => $data['max_discount_percent'], 'default_validity_days' => $data['default_validity_days'], 'updated_at' => now()];
-        if ($current) DB::table('tenant_pricing_policies')->where('tenant_id', $tenant)->update($values);
-        else DB::table('tenant_pricing_policies')->insert(['id' => (string) Str::uuid(), 'tenant_id' => $tenant, ...$values, 'created_at' => now()]);
-        $this->audit('commercial_input_updated', $tenant, ['type' => 'pricing_policy']);
+        DB::transaction(function () use ($current, $tenant, $values): void {
+            if ($current) DB::table('tenant_pricing_policies')->where('tenant_id', $tenant)->update($values);
+            else DB::table('tenant_pricing_policies')->insert(['id' => (string) Str::uuid(), 'tenant_id' => $tenant, ...$values, 'created_at' => now()]);
+            $this->audit('commercial_input_updated', $tenant, ['type' => 'pricing_policy'], 'tenant_pricing_policy');
+        });
         return $this->pricingPolicy();
     }
 
@@ -246,6 +262,12 @@ class ProposalController extends Controller
         foreach ($data['items'] as $line) {
             $service = $this->activeServices($tenant)->findOrFail($line['service_id']);
             abort_unless($service->currency === strtoupper($data['currency']), 422, 'Line item currency does not match proposal currency.');
+            if ($service->commercial_model === 'custom_quote') {
+                abort_unless(isset($line['unit_price']), 422, 'Custom-quote services require an explicitly entered human-approved price before proposal totals can be finalized.');
+                abort_unless(blank($line['price_reason'] ?? null) === false && mb_strlen($line['price_reason']) >= 8, 422, 'A custom-quote price requires an approval reason.');
+                abort_unless(DecimalMoney::cents($line['unit_price']) > 0, 422, 'A custom-quote service requires a positive human-approved price.');
+            }
+            abort_unless($service->unit_price !== null || isset($line['unit_price']), 422, 'A proposal line item requires an explicit price.');
             $price = DecimalMoney::cents($line['unit_price'] ?? (string) $service->unit_price); $quantity = (int) $line['quantity'];
             $lineTotal = $price * $quantity; abort_if($lineTotal > 99_999_999_999_999 || $subtotal > 99_999_999_999_999 - $lineTotal, 422, 'Proposal total exceeds supported precision.'); $subtotal += $lineTotal;
             $rows[] = ['tenant_id' => $tenant, 'service_id' => $service->id, 'service_name' => $service->name, 'description' => $service->description,
@@ -385,10 +407,10 @@ class ProposalController extends Controller
         DB::table('opportunity_activities')->insert(['id' => (string) Str::uuid(), 'tenant_id' => app('tenant.id'), 'sales_opportunity_id' => $opportunity,
             'activity_type' => $type, 'actor_user_id' => $actor, 'agent_run_id' => $run, 'correlation_id' => $correlation, 'details' => json_encode($details), 'occurred_at' => now(), 'created_at' => now(), 'updated_at' => now()]);
     }
-    private function audit(string $action, string $subject, array $metadata): void
+    private function audit(string $action, string $subject, array $metadata, string $subjectType = 'proposal'): void
     {
         DB::table('audit_logs')->insert(['id' => (string) Str::uuid(), 'tenant_id' => app('tenant.id'), 'actor_user_id' => auth()->id(), 'action' => $action,
-            'subject_type' => 'proposal', 'subject_id' => $subject, 'request_id' => request()->header('X-Request-ID'), 'metadata' => json_encode($metadata), 'created_at' => now()]);
+            'subject_type' => $subjectType, 'subject_id' => $subject, 'request_id' => request()->header('X-Request-ID'), 'metadata' => json_encode($metadata), 'created_at' => now()]);
     }
     private function documentMetadata(ProposalVersion $version): array { return ['proposal_version_id' => $version->id, 'version' => $version->version, 'sha256' => $version->document_sha256, 'generated_at' => $version->document_generated_at, 'download_url' => '/api/v1/proposals/'.$version->proposal_id.'/versions/'.$version->id.'/document']; }
 }

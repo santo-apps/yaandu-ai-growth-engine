@@ -6,7 +6,14 @@ use Illuminate\Foundation\Configuration\Middleware;
 
 return Application::configure(basePath: dirname(__DIR__))
     ->withRouting(api: __DIR__.'/../routes/api.php', commands: __DIR__.'/../routes/console.php', health: '/up')
-    ->withMiddleware(function (Middleware $middleware): void { $middleware->statefulApi(); })
+    ->withMiddleware(function (Middleware $middleware): void {
+        $middleware->statefulApi();
+        $middleware->redirectGuestsTo(fn ($request) =>
+            $request->is('api/*') ? null : route('login')
+        );
+    })
     ->withExceptions(function (Exceptions $exceptions): void {
-        // Configure safe API error reporting here; never serialize provider credentials.
+        $exceptions->shouldRenderJsonWhen(fn ($request, $exception): bool =>
+            $request->is('api/*') || $request->expectsJson()
+        );
     })->create();
