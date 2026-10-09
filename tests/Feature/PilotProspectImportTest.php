@@ -10,6 +10,7 @@ use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Http\UploadedFile;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Crypt;
 use Illuminate\Support\Facades\Queue;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Storage;
@@ -27,8 +28,9 @@ final class PilotProspectImportTest extends TestCase
         [$tenant, $user] = $this->tenantAndUser('pilot-import');
         Sanctum::actingAs($user);
         $cohort = $this->withHeader('X-Tenant-ID', $tenant->id)->postJson('/api/v1/pilot/cohorts', ['name' => 'Internal pilot', 'status' => 'active'])->assertCreated()->json();
-        $csv = "business_name,website,country,city,industry,business_email,business_phone,contact_name,source,notes\n".
-            "Northwind Health,https://www.northwind.example/contact,IN,Chennai,Healthcare,hello@northwind.example,+91 98765 43210,Sam Buyer,customer referral,Known-domain test\n".
+        $collectedAt = now()->toIso8601String();
+        $csv = "business_name,website,country,city,industry,business_email,business_phone,contact_name,source,source_url,collected_at,provenance_note,notes\n".
+            "Northwind Health,https://www.northwind.example/contact,IN,Chennai,Healthcare,hello@northwind.example,+91 98765 43210,Sam Buyer,customer referral,https://source.example/list,{$collectedAt},Public business listing; domain independently known,Known-domain test\n".
             "Missing Website,,IN,Chennai,Healthcare,,,,customer referral,Invalid row\n".
             "Duplicate Northwind,https://northwind.example,IN,Chennai,Healthcare,,,,customer referral,Duplicate row\n";
         $preview = $this->withHeader('X-Tenant-ID', $tenant->id)->postJson('/api/v1/pilot/import-batches/preview', [
@@ -64,15 +66,105 @@ final class PilotProspectImportTest extends TestCase
         $companyView = $this->withHeader('X-Tenant-ID', $tenant->id)->getJson('/api/v1/companies/'.$company->id)->assertOk()->json();
         self::assertSame($batchId, $companyView['import_provenance']['batch_id']);
         self::assertSame('customer referral', $companyView['import_provenance']['source']);
+        self::assertSame('https://source.example/list', $companyView['import_provenance']['source_url']);
+        self::assertSame('Public business listing; domain independently known', $companyView['import_provenance']['provenance_note']);
+        self::assertNotEmpty($companyView['import_provenance']['collected_at']);
         self::assertSame('Pilot Owner', $companyView['import_provenance']['imported_by']);
         self::assertSame('completed', $companyView['import_provenance']['import_status']);
+        $this->withHeader('X-Tenant-ID', $tenant->id)->postJson('/api/v1/pilot/import-rows/'.$companyView['import_provenance']['import_row_id'].'/review', [
+            'intelligence_rating' => 'useful', 'lead_score_rating' => 'reasonable', 'recommendation_rating' => 'possibly_relevant',
+            'intelligence_rubric_score' => 14, 'technology_accuracy_rating' => 'unknown', 'next_action_rating' => 'acceptable',
+            'claim_reviews' => [['claim' => 'The business operates in healthcare.', 'status' => 'supported', 'source_url' => 'https://northwind.example/about', 'notes' => 'Matches the supplied business description.']],
+            'unsupported_claim_count' => 0, 'reviewer_notes' => 'Identity and domain reviewed against the named public page.',
+        ])->assertOk()->assertJsonPath('review_status', 'reviewed')->assertJsonPath('unsupported_claim_count', 0);
+        $this->withHeader('X-Tenant-ID', $tenant->id)->postJson('/api/v1/pilot/import-rows/'.$companyView['import_provenance']['import_row_id'].'/review', [
+            'intelligence_rating' => 'useful', 'lead_score_rating' => 'reasonable', 'recommendation_rating' => 'possibly_relevant',
+            'intelligence_rubric_score' => 14, 'technology_accuracy_rating' => 'unknown', 'next_action_rating' => 'acceptable',
+            'claim_reviews' => [['claim' => 'The business operates in healthcare.', 'status' => 'supported', 'source_url' => 'https://northwind.example/about', 'notes' => 'Matches the supplied business description.']],
+            'unsupported_claim_count' => 0, 'reviewer_notes' => 'Second append-only review.',
+        ])->assertOk();
+        $history = $this->withHeader('X-Tenant-ID', $tenant->id)->getJson('/api/v1/pilot/import-rows/'.$companyView['import_provenance']['import_row_id'].'/reviews')->assertOk()->json('reviews');
+        self::assertCount(2, $history);
+        self::assertSame([2, 1], array_column($history, 'review_version'));
+        self::assertSame('Second append-only review.', $history[0]['notes']);
+        self::assertSame('Identity and domain reviewed against the named public page.', $history[1]['notes']);
+        $historyResponse = $this->withHeader('X-Tenant-ID', $tenant->id)->getJson('/api/v1/pilot/import-rows/'.$companyView['import_provenance']['import_row_id'].'/reviews')->assertOk()->json();
+        self::assertSame($history[0]['id'], $historyResponse['latest_review']['id']);
+        self::assertSame([$history[1]['id']], array_column($historyResponse['previous_reviews'], 'id'));
+        $reviewedCompany = $this->withHeader('X-Tenant-ID', $tenant->id)->getJson('/api/v1/companies/'.$company->id)->assertOk()->json();
+        self::assertSame('reasonable', $reviewedCompany['import_provenance']['lead_score_rating']);
+        self::assertSame(14, $reviewedCompany['import_provenance']['intelligence_rubric_score']);
+        self::assertSame('acceptable', $reviewedCompany['import_provenance']['next_action_rating']);
+        self::assertSame('The business operates in healthcare.', $reviewedCompany['import_provenance']['claim_reviews'][0]['claim']);
+        self::assertSame((string) $user->id, (string) $reviewedCompany['import_provenance']['reviewed_by']);
+        [$otherTenant, $otherUser] = $this->tenantAndUser('pilot-review-other');
+        Sanctum::actingAs($otherUser);
+        $this->withHeader('X-Tenant-ID', $otherTenant->id)->postJson('/api/v1/pilot/import-rows/'.$companyView['import_provenance']['import_row_id'].'/review', [
+            'intelligence_rating' => 'poor', 'lead_score_rating' => 'clearly_wrong', 'recommendation_rating' => 'unsupported',
+            'technology_accuracy_rating' => 'incorrect', 'next_action_rating' => 'incorrect', 'unsupported_claim_count' => 1,
+        ])->assertNotFound();
+        $this->withHeader('X-Tenant-ID', $otherTenant->id)->getJson('/api/v1/pilot/import-rows/'.$companyView['import_provenance']['import_row_id'].'/reviews')->assertNotFound();
+        self::assertDatabaseHas('prospect_import_rows', ['tenant_id' => $tenant->id, 'id' => $companyView['import_provenance']['import_row_id'], 'lead_score_rating' => 'reasonable']);
+        Sanctum::actingAs($user);
+        DB::table('lead_scores')->insert(['id' => (string) Str::uuid(), 'tenant_id' => $tenant->id, 'company_id' => $company->id,
+            'score' => 0, 'components' => json_encode([]), 'rule_version' => 1, 'evaluation_status' => 'legacy_unclassified',
+            'scored_at' => now()->subMinute(), 'created_at' => now()->subMinute(), 'updated_at' => now()->subMinute()]);
         $dashboard = $this->withHeader('X-Tenant-ID', $tenant->id)->getJson('/api/v1/pilot/dashboard?cohort_id='.$cohort['id'])->assertOk()->json();
         self::assertSame(1, $dashboard['metrics']['prospects_imported']);
         self::assertSame(1, $dashboard['metrics']['valid_prospects']);
         self::assertSame(1, $dashboard['metrics']['duplicates']);
-        self::assertSame(0, $dashboard['funnel']['analyzed']);
+        self::assertSame(0, $dashboard['funnel']['crawl_completed']);
+        self::assertSame(0, $dashboard['metrics']['intelligence_generated']);
+        self::assertSame(1, $dashboard['metrics']['human_reviewed']);
+        self::assertSame(0, $dashboard['metrics']['leads_scored']);
+        self::assertSame(0, $dashboard['metrics']['insufficient_evidence']);
+        self::assertSame(1, $dashboard['metrics']['score_unclassified']);
         self::assertSame(0, $dashboard['metrics']['sandbox_messages_sent']);
-        self::assertNull($dashboard['rates_percent']['website_analysis_completion_rate']);
+        self::assertNull($dashboard['rates_percent']['crawl_completion_rate']);
+
+        $website = $company->websites()->firstOrFail();
+        $completeScanId = (string) Str::uuid();
+        $partialScanId = (string) Str::uuid();
+        DB::table('website_scans')->insert(['id' => $completeScanId, 'tenant_id' => $tenant->id, 'company_website_id' => $website->id,
+            'status' => 'completed', 'max_depth' => 2, 'max_pages' => 10, 'started_at' => now()->subMinutes(2), 'finished_at' => now()->subMinute(),
+            'created_at' => now()->subMinutes(2), 'updated_at' => now()->subMinute()]);
+        DB::table('website_scans')->insert(['id' => $partialScanId, 'tenant_id' => $tenant->id, 'company_website_id' => $website->id,
+            'status' => 'failed', 'max_depth' => 2, 'max_pages' => 10, 'error_code' => 'CRAWL_FAILED',
+            'error_summary' => 'Safe fixture failure summary.', 'started_at' => now()->subSeconds(40), 'finished_at' => now()->subSeconds(30),
+            'created_at' => now()->subSeconds(40), 'updated_at' => now()->subSeconds(30)]);
+        DB::table('website_pages')->insert(['id' => (string) Str::uuid(), 'tenant_id' => $tenant->id, 'website_scan_id' => $partialScanId,
+            'requested_url' => 'https://northwind.example/', 'final_url' => 'https://northwind.example/', 'http_status' => 200,
+            'title' => 'Northwind', 'content_hash' => hash('sha256', 'partial page'), 'extracted_text' => 'A persisted partial scan page.',
+            'depth' => 0, 'created_at' => now()->subSeconds(35), 'updated_at' => now()->subSeconds(35)]);
+        DB::table('lead_scores')->insert(['id' => (string) Str::uuid(), 'tenant_id' => $tenant->id, 'company_id' => $company->id,
+            'score' => null, 'components' => json_encode([]), 'rule_version' => 1, 'evaluation_status' => 'insufficient_evidence',
+            'evidence_coverage' => 0, 'scored_at' => now(), 'created_at' => now(), 'updated_at' => now()]);
+        $dashboard = $this->withHeader('X-Tenant-ID', $tenant->id)->getJson('/api/v1/pilot/dashboard?cohort_id='.$cohort['id'])->assertOk()->json();
+        self::assertSame(0, $dashboard['metrics']['crawl_completed']);
+        self::assertSame(1, $dashboard['metrics']['crawl_partial'], 'A failed latest crawl with persisted pages is partial crawl evidence.');
+        self::assertSame(0, $dashboard['metrics']['crawl_failed']);
+        self::assertSame(0, $dashboard['metrics']['leads_scored']);
+        self::assertSame(1, $dashboard['metrics']['insufficient_evidence']);
+        self::assertSame(0, $dashboard['metrics']['score_unclassified']);
+        self::assertSame(0, $dashboard['metrics']['intelligence_generated'], 'Saved crawl pages alone are not a generated intelligence report.');
+        self::assertSame(0, $dashboard['metrics']['intelligence_failed']);
+        self::assertSame(1, $dashboard['funnel']['crawl_partial']);
+        self::assertSame(0, $dashboard['rates_percent']['crawl_completion_rate'], 'A prior completed scan does not supersede the latest partial scan.');
+
+        $intelligenceInput = json_encode(['website_scan_id' => $partialScanId], JSON_THROW_ON_ERROR);
+        foreach (['failed', 'succeeded'] as $index => $agentStatus) {
+            DB::table('agent_runs')->insert(['id' => (string) Str::uuid(), 'tenant_id' => $tenant->id,
+                'agent_key' => 'WebsiteIntelligenceAgent', 'status' => $agentStatus,
+                'input_hash' => hash('sha256', $intelligenceInput), 'input_ciphertext' => Crypt::encryptString($intelligenceInput),
+                'created_at' => $index === 0 ? now()->subMinute() : now(), 'updated_at' => now()]);
+        }
+        $dashboard = $this->withHeader('X-Tenant-ID', $tenant->id)->getJson('/api/v1/pilot/dashboard?cohort_id='.$cohort['id'])->assertOk()->json();
+        self::assertSame(1, $dashboard['metrics']['intelligence_generated']);
+        self::assertSame(1, $dashboard['metrics']['intelligence_failed']);
+        self::assertSame(1, $dashboard['metrics']['intelligence_current_success']);
+        self::assertSame(0, $dashboard['metrics']['intelligence_current_failure']);
+        self::assertSame(1, $dashboard['metrics']['intelligence_historical_failure']);
+        self::assertSame(1, $dashboard['metrics']['crawl_partial'], 'Intelligence run results do not alter crawl evidence metrics.');
 
         $opportunityId = (string) Str::uuid();
         DB::table('sales_opportunities')->insert(['id' => $opportunityId, 'tenant_id' => $tenant->id, 'company_id' => $company->id,

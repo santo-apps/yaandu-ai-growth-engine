@@ -7,12 +7,84 @@ use App\Jobs\ProcessProspectImportRowJob;
 use App\Pilot\ProspectCsvImportService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Crypt;
 use Illuminate\Support\Facades\Queue;
 use Illuminate\Support\Str;
 use InvalidArgumentException;
 
 final class PilotController extends Controller
 {
+    public function salesIntelligenceMode()
+    {
+        $mode = app(\App\SalesIntelligence\SalesIntelligenceMode::class)->forTenant((string) app('tenant.id'));
+        return response()->json(['sales_intelligence_mode' => $mode, 'ai_findings_require_human_review' => true,
+            'ai_score_is_advisory' => $mode === 'human_assisted', 'autonomous_recommendation_scoring_accepted' => false]);
+    }
+
+    public function saveHumanDecision(Request $request, string $row)
+    {
+        $tenant = (string) app('tenant.id');
+        $role = DB::table('tenant_user')->where('tenant_id', $tenant)->where('user_id', $request->user()->id)
+            ->where('status', 'active')->value('role');
+        abort_unless(in_array($role, ['owner', 'admin', 'manager', 'salesperson', 'sales_rep', 'member'], true), 403,
+            'An active tenant salesperson or manager role is required.');
+        $record = DB::table('prospect_import_rows')->where('tenant_id', $tenant)->where('id', $row)->whereNotNull('company_id')->first();
+        abort_unless($record, 404);
+        $data = $request->validate([
+            'service_decision' => ['required', 'in:selected,no_service,needs_discovery'],
+            'selected_service_ids' => ['present', 'array', 'max:30'],
+            'selected_service_ids.*' => ['required', 'uuid', 'distinct'],
+            'priority' => ['required', 'in:high,medium,low,not_a_fit,needs_more_evidence'],
+            'intelligence_run_id' => ['nullable', 'uuid'],
+            'notes' => ['nullable', 'string', 'max:4000'],
+        ]);
+        $ids = array_values($data['selected_service_ids']);
+        if ($data['service_decision'] === 'selected') abort_if(count($ids) === 0, 422, 'Select at least one active tenant service.');
+        else abort_if(count($ids) > 0, 422, 'Services may only be selected when the service decision is selected.');
+        if ($ids) {
+            $active = DB::table('tenant_services')->where('tenant_id', $tenant)->where('active', true)->whereIn('id', $ids)->count();
+            abort_unless($active === count($ids), 422, 'Only active services belonging to this tenant may be selected.');
+        }
+        $runId = $data['intelligence_run_id'] ?? DB::table('lead_insights')->where('tenant_id', $tenant)
+            ->where('company_id', $record->company_id)->orderByDesc('created_at')->value('agent_run_id');
+        if ($runId) abort_unless(DB::table('agent_runs')->where('tenant_id', $tenant)->where('id', $runId)
+            ->where('agent_key', 'WebsiteIntelligenceAgent')->whereExists(function ($query) use ($tenant, $record): void {
+                $query->selectRaw('1')->from('lead_insights')->whereColumn('lead_insights.agent_run_id', 'agent_runs.id')
+                    ->where('lead_insights.tenant_id', $tenant)->where('lead_insights.company_id', $record->company_id);
+            })->exists(), 422, 'The intelligence run does not belong to this prospect.');
+
+        $id = (string) Str::uuid();
+        DB::transaction(function () use ($id, $tenant, $row, $runId, $request, $data, $ids): void {
+            DB::table('pilot_human_decisions')->insert([
+                'id' => $id, 'tenant_id' => $tenant, 'prospect_import_row_id' => $row, 'intelligence_run_id' => $runId,
+                'reviewer_id' => $request->user()->id, 'service_decision' => $data['service_decision'],
+                'selected_service_ids' => json_encode($ids, JSON_THROW_ON_ERROR), 'priority' => $data['priority'],
+                'notes' => $data['notes'] ?? null, 'decided_at' => now(), 'created_at' => now(), 'updated_at' => now(),
+            ]);
+            DB::table('audit_logs')->insert(['id' => (string) Str::uuid(), 'tenant_id' => $tenant, 'actor_user_id' => $request->user()->id,
+                'action' => 'pilot_human_decision_saved', 'subject_type' => 'pilot_human_decision', 'subject_id' => $id,
+                'request_id' => $request->header('X-Request-ID'), 'metadata' => json_encode([
+                    'prospect_import_row_id' => $row, 'intelligence_run_id' => $runId,
+                    'service_decision' => $data['service_decision'], 'selected_service_ids' => $ids, 'priority' => $data['priority'],
+                ], JSON_THROW_ON_ERROR), 'created_at' => now()]);
+        });
+        return response()->json(DB::table('pilot_human_decisions')->where('tenant_id', $tenant)->where('id', $id)->first(), 201);
+    }
+
+    public function humanDecisionHistory(string $row)
+    {
+        $tenant = (string) app('tenant.id');
+        abort_unless(DB::table('prospect_import_rows')->where('tenant_id', $tenant)->where('id', $row)->exists(), 404);
+        $decisions = DB::table('pilot_human_decisions as decisions')->leftJoin('users', 'users.id', '=', 'decisions.reviewer_id')
+            ->where('decisions.tenant_id', $tenant)->where('decisions.prospect_import_row_id', $row)
+            ->orderByDesc('decisions.decided_at')->get(['decisions.*', 'users.name as reviewer_name']);
+        $decisions->transform(function ($decision): object {
+            $decision->selected_service_ids = is_array($decision->selected_service_ids) ? $decision->selected_service_ids : (json_decode((string) $decision->selected_service_ids, true) ?: []);
+            return $decision;
+        });
+        return response()->json(['latest_decision' => $decisions->first(), 'decisions' => $decisions]);
+    }
+
     public function cohorts()
     {
         $tenant = app('tenant.id');
@@ -23,10 +95,11 @@ final class PilotController extends Controller
     {
         $role = DB::table('tenant_user')->where('tenant_id', app('tenant.id'))->where('user_id', $request->user()->id)->where('status', 'active')->value('role');
         abort_unless(in_array($role, ['owner', 'admin'], true), 403, 'Only tenant managers can create a pilot cohort.');
-        $data = $request->validate(['name' => ['required', 'string', 'max:160'], 'starts_on' => ['nullable', 'date'], 'owner_user_id' => ['nullable', 'integer', 'exists:users,id'], 'status' => ['sometimes', 'in:planned,active,paused,completed']]);
+        $data = $request->validate(['name' => ['required', 'string', 'max:160'], 'starts_on' => ['nullable', 'date'], 'owner_user_id' => ['nullable', 'integer', 'exists:users,id'], 'status' => ['sometimes', 'in:planned,active,paused,completed'], 'data_classification' => ['sometimes', 'in:real,simulated']]);
         if (! empty($data['owner_user_id'])) abort_unless(DB::table('tenant_user')->where('tenant_id', app('tenant.id'))->where('user_id', $data['owner_user_id'])->where('status', 'active')->exists(), 422, 'The cohort owner must be an active member of this tenant.');
         $id = (string) Str::uuid();
         DB::table('pilot_cohorts')->insert(['id' => $id, 'tenant_id' => app('tenant.id'), 'name' => $data['name'], 'starts_on' => $data['starts_on'] ?? null,
+            'data_classification' => $data['data_classification'] ?? 'real',
             'owner_user_id' => $data['owner_user_id'] ?? $request->user()->id, 'status' => $data['status'] ?? 'planned', 'created_at' => now(), 'updated_at' => now()]);
         return response()->json(DB::table('pilot_cohorts')->where('tenant_id', app('tenant.id'))->where('id', $id)->first(), 201);
     }
@@ -56,6 +129,97 @@ final class PilotController extends Controller
         ]);
         $rows->transform(function ($row): object { $row->errors = is_array($row->errors) ? $row->errors : (json_decode((string) $row->errors, true) ?: []); return $row; });
         return response()->json(['batch' => $record, 'rows' => $rows]);
+    }
+
+    public function saveReview(Request $request, string $row)
+    {
+        $tenant = (string) app('tenant.id');
+        $record = DB::table('prospect_import_rows')->where('tenant_id', $tenant)->where('id', $row)->first();
+        abort_unless($record && $record->company_id, 404);
+        $data = $request->validate([
+            'review_type' => ['sometimes', 'in:full_assessment,website_intelligence,lead_score,recommendation'],
+            'intelligence_run_id' => ['nullable', 'uuid'],
+            'lead_score_id' => ['nullable', 'uuid'],
+            'intelligence_rating' => ['required', 'in:strong,useful,needs_improvement,poor,unable_to_assess'],
+            'intelligence_rubric_score' => ['nullable', 'integer', 'between:0,17'],
+            'lead_score_rating' => ['required', 'in:reasonable,slightly_high,slightly_low,clearly_wrong,insufficient_evidence'],
+            'recommendation_rating' => ['required', 'in:strongly_relevant,possibly_relevant,weak,unsupported,unable_to_assess'],
+            'technology_accuracy_rating' => ['required', 'in:correct,incorrect,unknown,not_detected'],
+            'next_action_rating' => ['required', 'in:useful,acceptable,weak,incorrect,unavailable'],
+            'unsupported_claim_count' => ['required', 'integer', 'min:0', 'max:500'],
+            'reviewer_notes' => ['nullable', 'string', 'max:4000'],
+            'claim_reviews' => ['sometimes', 'array', 'max:100'],
+            'claim_reviews.*.claim' => ['required', 'string', 'max:2000'],
+            'claim_reviews.*.status' => ['required', 'in:supported,partially_supported,unsupported,unable_to_verify'],
+            'claim_reviews.*.source_url' => ['nullable', 'url:http,https', 'max:2048'],
+            'claim_reviews.*.notes' => ['nullable', 'string', 'max:2000'],
+        ]);
+        $claimReviews = $data['claim_reviews'] ?? [];
+        $intelligenceRunId = $data['intelligence_run_id'] ?? DB::table('lead_insights')->where('tenant_id', $tenant)
+            ->where('company_id', $record->company_id)->orderByDesc('created_at')->value('agent_run_id');
+        $leadScoreId = $data['lead_score_id'] ?? DB::table('lead_scores')->where('tenant_id', $tenant)
+            ->where('company_id', $record->company_id)->orderByDesc('scored_at')->value('id');
+        if ($intelligenceRunId !== null) {
+            abort_unless(DB::table('agent_runs')->where('tenant_id', $tenant)->where('id', $intelligenceRunId)
+                ->where('agent_key', 'WebsiteIntelligenceAgent')->whereExists(function ($query) use ($tenant, $record): void {
+                    $query->selectRaw('1')->from('lead_insights')->whereColumn('lead_insights.agent_run_id', 'agent_runs.id')
+                        ->where('lead_insights.tenant_id', $tenant)->where('lead_insights.company_id', $record->company_id);
+                })->exists(), 422, 'The intelligence run does not belong to this prospect.');
+        }
+        if ($leadScoreId !== null) abort_unless(DB::table('lead_scores')->where('tenant_id', $tenant)->where('company_id', $record->company_id)->where('id', $leadScoreId)->exists(), 422, 'The lead score does not belong to this prospect.');
+
+        $claimJson = json_encode($claimReviews, JSON_THROW_ON_ERROR);
+        $reviewedAt = now();
+        DB::transaction(function () use ($tenant, $row, $record, $data, $claimReviews, $claimJson, $intelligenceRunId, $leadScoreId, $reviewedAt, $request): void {
+            // Lock the parent row to serialize appends even when this prospect has no history yet.
+            DB::table('prospect_import_rows')->where('tenant_id', $tenant)->where('id', $row)->lockForUpdate()->first(['id']);
+            $latestVersion = (int) (DB::table('pilot_review_history')->where('tenant_id', $tenant)
+                ->where('prospect_import_row_id', $row)->orderByDesc('review_version')->value('review_version') ?? 0);
+            DB::table('pilot_review_history')->insert([
+                'id' => (string) Str::uuid(), 'tenant_id' => $tenant, 'prospect_import_row_id' => $row,
+                'reviewer_id' => $request->user()->id, 'reviewed_at' => $reviewedAt,
+                'review_type' => $data['review_type'] ?? 'full_assessment',
+                'intelligence_run_id' => $intelligenceRunId, 'lead_score_id' => $leadScoreId,
+                'review_version' => $latestVersion + 1, 'intelligence_rating' => $data['intelligence_rating'],
+                'rubric_score' => $data['intelligence_rubric_score'] ?? null,
+                'lead_score_rating' => $data['lead_score_rating'], 'recommendation_rating' => $data['recommendation_rating'],
+                'technology_accuracy_rating' => $data['technology_accuracy_rating'], 'next_action_rating' => $data['next_action_rating'],
+                'claim_count' => count($claimReviews), 'unsupported_claim_count' => $data['unsupported_claim_count'],
+                'claim_reviews' => $claimJson, 'notes' => $data['reviewer_notes'] ?? null,
+                'created_at' => $reviewedAt, 'updated_at' => $reviewedAt,
+            ]);
+            DB::table('prospect_import_rows')->where('tenant_id', $tenant)->where('id', $row)->update([
+                'intelligence_rating' => $data['intelligence_rating'],
+                'intelligence_rubric_score' => $data['intelligence_rubric_score'] ?? null,
+                'lead_score_rating' => $data['lead_score_rating'], 'recommendation_rating' => $data['recommendation_rating'],
+                'technology_accuracy_rating' => $data['technology_accuracy_rating'], 'next_action_rating' => $data['next_action_rating'],
+                'unsupported_claim_count' => $data['unsupported_claim_count'], 'claim_reviews' => $claimJson,
+                'reviewer_notes' => $data['reviewer_notes'] ?? null, 'review_status' => 'reviewed',
+                'reviewed_by' => $request->user()->id, 'reviewed_at' => $reviewedAt, 'updated_at' => $reviewedAt,
+            ]);
+        });
+        return response()->json(DB::table('prospect_import_rows')->where('tenant_id', $tenant)->where('id', $row)->first());
+    }
+
+    public function reviewHistory(string $row)
+    {
+        $tenant = (string) app('tenant.id');
+        abort_unless(DB::table('prospect_import_rows')->where('tenant_id', $tenant)->where('id', $row)->exists(), 404);
+        $reviews = DB::table('pilot_review_history as reviews')->leftJoin('users', 'users.id', '=', 'reviews.reviewer_id')
+            ->where('reviews.tenant_id', $tenant)->where('reviews.prospect_import_row_id', $row)
+            ->orderByDesc('reviews.review_version')->get([
+                'reviews.id', 'reviews.review_version', 'reviews.review_type', 'reviews.reviewer_id',
+                'users.name as reviewer_name', 'reviews.reviewed_at', 'reviews.intelligence_run_id', 'reviews.lead_score_id',
+                'reviews.intelligence_rating', 'reviews.rubric_score', 'reviews.lead_score_rating',
+                'reviews.recommendation_rating', 'reviews.technology_accuracy_rating', 'reviews.next_action_rating',
+                'reviews.claim_count', 'reviews.unsupported_claim_count', 'reviews.claim_reviews', 'reviews.notes',
+            ]);
+        $reviews->transform(function ($review): object {
+            $review->claim_reviews = is_array($review->claim_reviews) ? $review->claim_reviews : (json_decode((string) $review->claim_reviews, true) ?: []);
+            return $review;
+        });
+        return response()->json(['prospect_import_row_id' => $row, 'latest_review' => $reviews->first(),
+            'previous_reviews' => $reviews->skip(1)->values(), 'reviews' => $reviews]);
     }
 
     public function confirmImport(Request $request, string $batch)
@@ -116,7 +280,23 @@ final class PilotController extends Controller
         $batchIds = DB::table('prospect_import_batches')->where('tenant_id', $tenant)->when($cohortId, fn ($q) => $q->where('pilot_cohort_id', $cohortId))->pluck('id');
         $companyIds = DB::table('prospect_import_rows')->where('tenant_id', $tenant)->whereIn('batch_id', $batchIds)->whereNotNull('company_id')->pluck('company_id');
         $count = fn (string $table) => DB::table($table)->where('tenant_id', $tenant);
-        $scans = $count('website_scans')->whereIn('company_website_id', DB::table('company_websites')->where('tenant_id', $tenant)->whereIn('company_id', $companyIds)->select('id'));
+        $scans = DB::table('website_scans as scan')->join('company_websites as website', function ($join): void {
+            $join->on('website.id', '=', 'scan.company_website_id')->on('website.tenant_id', '=', 'scan.tenant_id');
+        })->where('scan.tenant_id', $tenant)->where('website.tenant_id', $tenant)->whereIn('website.company_id', $companyIds)
+            ->whereNotExists(function ($query): void {
+                $query->selectRaw('1')->from('website_scans as newer')->join('company_websites as newer_website', function ($join): void {
+                    $join->on('newer_website.id', '=', 'newer.company_website_id')->on('newer_website.tenant_id', '=', 'newer.tenant_id');
+                })
+                    ->whereColumn('newer.tenant_id', 'scan.tenant_id')
+                    ->whereColumn('newer_website.company_id', 'website.company_id')
+                    ->where(function ($query): void {
+                        $query->whereColumn('newer.created_at', '>', 'scan.created_at')
+                            ->orWhere(function ($query): void {
+                                $query->whereColumn('newer.created_at', '=', 'scan.created_at')
+                                    ->whereColumn('newer.id', '>', 'scan.id');
+                            });
+                    });
+            });
         $drafts = $count('marketing_drafts')->whereIn('company_id', $companyIds);
         $opportunities = $count('sales_opportunities')->whereIn('company_id', $companyIds);
         $meetings = $count('meeting_bookings')->whereIn('sales_opportunity_id', (clone $opportunities)->select('id'));
@@ -133,12 +313,90 @@ final class PilotController extends Controller
         $processingDurations = DB::table('prospect_import_rows')->where('tenant_id', $tenant)->whereIn('batch_id', $batchIds)
             ->whereIn('status', ['completed', 'failed'])->get(['created_at', 'updated_at', 'processed_at'])
             ->map(fn ($row) => max(0, \Illuminate\Support\Carbon::parse($row->created_at)->diffInSeconds(\Illuminate\Support\Carbon::parse($row->processed_at ?: $row->updated_at), false)));
-        $scored = $count('lead_scores')->whereIn('company_id', $companyIds)->distinct('company_id')->count('company_id');
+        $latestScans = (clone $scans)->get(['scan.id', 'scan.status', 'website.company_id']);
+        $crawlCounts = ['crawl_completed' => 0, 'crawl_partial' => 0, 'crawl_failed' => 0];
+        foreach ($latestScans as $scan) {
+            $hasPages = DB::table('website_pages')->where('tenant_id', $tenant)->where('website_scan_id', $scan->id)->exists();
+            if ($scan->status === 'completed') $crawlCounts['crawl_completed']++;
+            elseif ($scan->status === 'partial' || ($scan->status === 'failed' && $hasPages)) $crawlCounts['crawl_partial']++;
+            elseif ($scan->status === 'failed') $crawlCounts['crawl_failed']++;
+        }
+
+        $scanCompany = DB::table('website_scans as all_scans')->join('company_websites as all_websites', function ($join): void {
+            $join->on('all_websites.id', '=', 'all_scans.company_website_id')->on('all_websites.tenant_id', '=', 'all_scans.tenant_id');
+        })->where('all_scans.tenant_id', $tenant)->where('all_websites.tenant_id', $tenant)->whereIn('all_websites.company_id', $companyIds)
+            ->pluck('all_websites.company_id', 'all_scans.id');
+        $intelligenceCompanies = ['succeeded' => [], 'failed' => []];
+        $intelligenceLatestStatus = [];
+        $scanHashes = [];
+        foreach ($scanCompany as $scanId => $companyId) {
+            $scanHashes[hash('sha256', (string) $scanId)] = $companyId;
+            $scanHashes[hash('sha256', json_encode(['website_scan_id' => (string) $scanId], JSON_THROW_ON_ERROR))] = $companyId;
+        }
+        $agentRuns = DB::table('agent_runs')->where('tenant_id', $tenant)->where('agent_key', 'WebsiteIntelligenceAgent')
+            ->whereIn('status', ['succeeded', 'failed'])->orderByDesc('created_at')->get(['id', 'status', 'input_hash', 'input_ciphertext', 'created_at']);
+        foreach ($agentRuns as $agentRun) {
+            $companyId = null;
+            if ($agentRun->input_ciphertext) {
+                try {
+                    $payload = json_decode(Crypt::decryptString($agentRun->input_ciphertext), true, 16, JSON_THROW_ON_ERROR);
+                    $companyId = isset($payload['website_scan_id']) ? ($scanCompany[$payload['website_scan_id']] ?? null) : null;
+                } catch (\Throwable) {
+                    // An unavailable encrypted snapshot cannot be safely associated with a cohort prospect.
+                }
+            }
+            $companyId ??= $scanHashes[$agentRun->input_hash ?? ''] ?? null;
+            if ($companyId) {
+                $intelligenceCompanies[$agentRun->status][$companyId] = true;
+                $intelligenceLatestStatus[$companyId] ??= $agentRun->status;
+            }
+        }
+        $latestScores = [];
+        foreach ($count('lead_scores')->whereIn('company_id', $companyIds)->orderByDesc('scored_at')->orderByDesc('id')->get(['company_id', 'score', 'evaluation_status']) as $score) {
+            $latestScores[$score->company_id] ??= $score;
+        }
+        $scored = count(array_filter($latestScores, fn ($score): bool => $score->score !== null && $score->evaluation_status === 'scored'));
+        $insufficientEvidence = count(array_filter($latestScores, fn ($score): bool => $score->evaluation_status === 'insufficient_evidence'));
+        $scoreUnclassified = count(array_filter($latestScores, fn ($score): bool => ! in_array($score->evaluation_status, ['scored', 'insufficient_evidence'], true)));
+        $intelligenceCurrentSuccess = count(array_filter($intelligenceLatestStatus, fn (string $status): bool => $status === 'succeeded'));
+        $intelligenceCurrentFailure = count(array_filter($intelligenceLatestStatus, fn (string $status): bool => $status === 'failed'));
+        $reviewed = DB::table('pilot_review_history')->where('tenant_id', $tenant)->whereIn('prospect_import_row_id',
+            DB::table('prospect_import_rows')->where('tenant_id', $tenant)->whereIn('batch_id', $batchIds)->select('id'))
+            ->distinct('prospect_import_row_id')->count('prospect_import_row_id');
+        $rowIds = DB::table('prospect_import_rows')->where('tenant_id', $tenant)->whereIn('batch_id', $batchIds)->whereNotNull('company_id')->select('id');
+        $latestHumanDecisions = DB::table('pilot_human_decisions as decisions')->where('decisions.tenant_id', $tenant)
+            ->whereIn('decisions.prospect_import_row_id', $rowIds)->whereNotExists(function ($query): void {
+                $query->selectRaw('1')->from('pilot_human_decisions as newer')->whereColumn('newer.tenant_id', 'decisions.tenant_id')
+                    ->whereColumn('newer.prospect_import_row_id', 'decisions.prospect_import_row_id')
+                    ->where(function ($order): void { $order->whereColumn('newer.decided_at', '>', 'decisions.decided_at')
+                        ->orWhere(function ($tie): void { $tie->whereColumn('newer.decided_at', '=', 'decisions.decided_at')->whereColumn('newer.id', '>', 'decisions.id'); }); });
+            });
+        $humanDecisions = (clone $latestHumanDecisions)->get(['service_decision', 'priority']);
+        $humanMetrics = [
+            'awaiting_human_review' => max(0, count($intelligenceCompanies['succeeded']) - $reviewed),
+            'human_priority_high' => $humanDecisions->where('priority', 'high')->count(),
+            'human_priority_medium' => $humanDecisions->where('priority', 'medium')->count(),
+            'human_priority_low' => $humanDecisions->where('priority', 'low')->count(),
+            'human_priority_needs_more_evidence' => $humanDecisions->where('priority', 'needs_more_evidence')->count(),
+            'human_priority_not_a_fit' => $humanDecisions->where('priority', 'not_a_fit')->count(),
+            'human_service_selected' => $humanDecisions->where('service_decision', 'selected')->count(),
+            'human_no_service_selected' => $humanDecisions->where('service_decision', 'no_service')->count(),
+            'human_needs_discovery' => $humanDecisions->where('service_decision', 'needs_discovery')->count(),
+        ];
         $approvedDrafts = (clone $drafts)->where('status', 'approved')->count();
         $metrics = [
             'prospects_imported' => $imported, 'valid_prospects' => $valid, 'duplicates' => DB::table('prospect_import_rows')->where('tenant_id', $tenant)->whereIn('batch_id', $batchIds)->where('status', 'duplicate')->count(),
-            'websites_analyzed' => (clone $scans)->whereIn('status', ['completed', 'partial'])->count(), 'analysis_failures' => (clone $scans)->where('status', 'failed')->count(),
-            'leads_scored' => $scored, 'high_priority' => $count('lead_scores')->whereIn('company_id', $companyIds)->where('score', '>=', 70)->distinct('company_id')->count('company_id'),
+            ...$crawlCounts,
+            'intelligence_generated' => count($intelligenceCompanies['succeeded']),
+            'intelligence_failed' => count($intelligenceCompanies['failed']),
+            'intelligence_current_success' => $intelligenceCurrentSuccess,
+            'intelligence_current_failure' => $intelligenceCurrentFailure,
+            'intelligence_historical_failure' => count($intelligenceCompanies['failed']),
+            'leads_scored' => $scored, 'insufficient_evidence' => $insufficientEvidence, 'score_unclassified' => $scoreUnclassified,
+            'score_current' => $scored, 'score_insufficient_evidence' => $insufficientEvidence, 'score_legacy_unclassified' => $scoreUnclassified,
+            'human_reviewed' => $reviewed,
+            ...$humanMetrics,
+            'high_priority' => count(array_filter($latestScores, fn ($score): bool => $score->score !== null && $score->evaluation_status === 'scored' && $score->score >= 70)),
             'marketing_drafts' => (clone $drafts)->count(), 'drafts_awaiting_approval' => (clone $drafts)->where('status', 'pending_review')->count(),
             'approved_marketing_drafts' => $approvedDrafts, 'sandbox_messages_sent' => (clone $messages)->where('messages.status', 'sent')->where('messages.provider', 'fake')->count(), 'replies' => (clone $replies)->count(),
             'qualified_leads' => (clone $opportunities)->whereNotNull('qualified_at')->distinct('company_id')->count('company_id'), 'opportunities' => (clone $opportunities)->count(),
@@ -151,24 +409,45 @@ final class PilotController extends Controller
         $opportunityCompanies = (clone $opportunities)->distinct('company_id')->count('company_id');
         $meetingOpportunities = (clone $meetings)->distinct('sales_opportunity_id')->count('sales_opportunity_id');
         $proposalOpportunities = (clone $proposals)->distinct('sales_opportunity_id')->count('sales_opportunity_id');
-        $funnel = ['imported' => $imported, 'analyzed' => (clone $scans)->whereIn('status', ['completed', 'partial'])->distinct('company_website_id')->count('company_website_id'),
-            'scored' => $scored, 'drafted' => (clone $drafts)->distinct('company_id')->count('company_id'), 'approved' => (clone $drafts)->where('status', 'approved')->distinct('company_id')->count('company_id'),
+        $funnel = ['imported' => $imported, ...$crawlCounts,
+            'intelligence_generated' => $metrics['intelligence_generated'], 'intelligence_failed' => $metrics['intelligence_failed'],
+            'scored' => $scored, 'insufficient_evidence' => $insufficientEvidence, 'score_unclassified' => $scoreUnclassified, 'human_reviewed' => $reviewed,
+            'drafted' => (clone $drafts)->distinct('company_id')->count('company_id'), 'approved' => (clone $drafts)->where('status', 'approved')->distinct('company_id')->count('company_id'),
             'sent' => $sentCompanies, 'replied' => $repliedCompanies,
             'qualified' => $qualifiedCompanies, 'opportunity' => $opportunityCompanies, 'meeting' => $meetingOpportunities, 'proposal' => $proposalOpportunities];
         $rates = ['import_success_rate' => $this->rate($imported, $valid),
             'duplicate_rate' => $this->rate($metrics['duplicates'], DB::table('prospect_import_rows')->where('tenant_id', $tenant)->whereIn('batch_id', $batchIds)->count()),
-            'website_analysis_completion_rate' => $this->rate($metrics['websites_analyzed'], (clone $scans)->count()), 'lead_scoring_coverage' => $this->rate($scored, $imported),
+            'crawl_completion_rate' => $this->rate($crawlCounts['crawl_completed'], count($latestScans)), 'lead_scoring_coverage' => $this->rate($scored, $imported),
             'draft_approval_rate' => $this->rate($approvedDrafts, (clone $drafts)->count()), 'sandbox_delivery_acceptance_rate' => $this->rate($metrics['sandbox_messages_sent'], (clone $messages)->count()),
             'reply_rate' => $this->rate($funnel['replied'], $sentCompanies), 'qualification_rate' => $this->rate($qualifiedCompanies, $repliedCompanies),
             'opportunity_conversion' => $this->rate($opportunityCompanies, $repliedCompanies), 'meeting_booking_rate' => $this->rate($meetingOpportunities, $opportunityCompanies),
             'proposal_generation_rate' => $this->rate($proposalOpportunities, $opportunityCompanies), 'failed_job_rate' => $this->rate($failedRows, $attemptedRows)];
         $nonFakeOutbound = (clone $messages)->where('messages.provider', '!=', 'fake')->count();
-        return response()->json(['cohort_id' => $cohortId, 'metrics' => $metrics, 'funnel' => $funnel, 'rates_percent' => $rates, 'simulated' => $nonFakeOutbound === 0,
+        $cohort = $cohortId ? DB::table('pilot_cohorts')->where('tenant_id', $tenant)->where('id', $cohortId)->first(['name', 'data_classification']) : null;
+        $reviewCounts = DB::table('prospect_import_rows')->where('tenant_id', $tenant)->whereIn('batch_id', $batchIds)->where('status', 'completed')
+            ->selectRaw('coalesce(sum(case when review_status = ? then 1 else 0 end), 0) as reviewed, coalesce(sum(case when review_status != ? then 1 else 0 end), 0) as pending_review', ['reviewed', 'reviewed'])->first();
+        return response()->json(['cohort_id' => $cohortId, 'cohort' => $cohort,
+            'sales_intelligence_mode' => app(\App\SalesIntelligence\SalesIntelligenceMode::class)->forTenant($tenant),
+            'ai_score_metrics_are_advisory' => true, 'review' => $reviewCounts,
+            'unauthorized_outbound_messages' => $nonFakeOutbound,
+            'metrics' => $metrics, 'funnel' => $funnel, 'rates_percent' => $rates, 'simulated' => $nonFakeOutbound === 0,
             'outbound_provider_counts' => (clone $messages)->select('messages.provider', DB::raw('count(*) as count'))->groupBy('messages.provider')->pluck('count', 'messages.provider'),
             'definitions' => ['rate' => 'Numerator divided by the explicitly named denominator, rounded to one decimal; zero denominator returns null.',
                 'import_success_rate' => 'Imported prospect rows divided by validated, non-duplicate new rows; invalid and duplicate rows are reported separately.',
                 'failed_job_rate' => 'Failed valid, new import rows divided by valid, new rows that reached a completed or failed terminal state.',
                 'average_processing_time_seconds' => 'Mean created-to-terminal timestamp interval across completed or failed import rows; it is a local pilot measurement, not a production SLA.',
+                'crawl_completed' => 'Distinct cohort prospects whose latest website crawl completed.',
+                'crawl_partial' => 'Distinct cohort prospects whose latest crawl is partial or failed after saving page evidence.',
+                'crawl_failed' => 'Distinct cohort prospects whose latest crawl failed without saving any page evidence.',
+            'intelligence_generated' => 'Distinct cohort prospects associated with a succeeded WebsiteIntelligenceAgent run.',
+            'intelligence_failed' => 'Distinct cohort prospects associated with a failed WebsiteIntelligenceAgent run.',
+            'intelligence_current_success' => 'Distinct prospects whose latest WebsiteIntelligenceAgent run succeeded.',
+            'intelligence_current_failure' => 'Distinct prospects whose latest WebsiteIntelligenceAgent run failed.',
+            'intelligence_historical_failure' => 'Distinct prospects with any failed WebsiteIntelligenceAgent run; may overlap current successes.',
+                'leads_scored' => 'Distinct cohort prospects whose latest score is evaluable.',
+                'insufficient_evidence' => 'Distinct cohort prospects whose latest score has insufficient evidence.',
+                'score_unclassified' => 'Distinct cohort prospects with a latest legacy or otherwise unclassified score; not counted as scored or insufficient evidence.',
+                'human_reviewed' => 'Distinct cohort import rows with at least one persisted review-history record.',
                 'sandbox_delivery_acceptance_rate' => 'Fake sandbox messages marked sent / all outbound message records for cohort prospects.',
                 'reply_rate' => 'Distinct cohort prospects with an inbound message / distinct cohort prospects with a sent outbound message.',
                 'qualification_rate' => 'Distinct qualified opportunity companies / distinct replied companies.',
@@ -240,7 +519,7 @@ final class PilotController extends Controller
             ->where('status', 'active')->value('role');
         abort_unless(in_array($role, ['owner', 'admin'], true), 403, 'Workspace readiness requires an active tenant manager.');
 
-        $requiredPrompts = ['MarketingAgent', 'FollowUpAgent', 'SalesAgent', 'ProposalAgent'];
+        $requiredPrompts = ['WebsiteIntelligenceAgent', 'MarketingAgent', 'FollowUpAgent', 'SalesAgent', 'ProposalAgent'];
         $prompts = DB::table('prompt_templates')->where('tenant_id', $tenant)->whereIn('agent_key', $requiredPrompts)
             ->where('status', 'approved')->where('active', true)->pluck('agent_key')->all();
         $missing = [];

@@ -3,6 +3,7 @@ import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { csrfToken, salesRequest } from '../salesApi'
 
 const props = defineProps<{ tenantId: string; manager: boolean }>()
+const emit = defineEmits<{ importCompleted: [importedCount: number] }>()
 const cohorts = ref<any[]>([])
 const cohortId = ref('')
 const file = ref<File | null>(null)
@@ -12,7 +13,7 @@ const busy = ref(false)
 const error = ref('')
 const notice = ref('')
 const creatingCohort = ref(false)
-const cohortName = ref('Sprint 7 internal simulated pilot')
+const cohortName = ref('Sprint 7B — Controlled Real Prospect Pilot')
 let pollTimer: ReturnType<typeof setInterval> | undefined
 const rows = computed(() => preview.value?.rows ?? batch.value?.rows ?? [])
 
@@ -44,7 +45,15 @@ async function confirmImport() {
 async function loadBatch(id: string) { batch.value = await salesRequest(`/pilot/import-batches/${encodeURIComponent(id)}`, props.tenantId) }
 function poll() {
   if (pollTimer) clearInterval(pollTimer)
-  pollTimer = setInterval(async () => { if (!batch.value?.batch?.id) return; await loadBatch(batch.value.batch.id); if (!['importing', 'validating'].includes(batch.value.batch.status)) { clearInterval(pollTimer); pollTimer = undefined } }, 1800)
+  pollTimer = setInterval(async () => {
+    if (!batch.value?.batch?.id) return
+    await loadBatch(batch.value.batch.id)
+    if (!['importing', 'validating'].includes(batch.value.batch.status)) {
+      clearInterval(pollTimer); pollTimer = undefined
+      const importedCount = Number(batch.value.batch.counts?.imported ?? 0)
+      if (importedCount > 0) emit('importCompleted', importedCount)
+    }
+  }, 1800)
 }
 async function retryFailed() {
   if (!batch.value?.batch?.id) return
@@ -59,7 +68,7 @@ async function downloadErrors() {
 }
 async function createCohort() {
   creatingCohort.value = true; error.value = ''
-  try { const cohort = await salesRequest('/pilot/cohorts', props.tenantId, 'POST', { name: cohortName.value, starts_on: new Date().toISOString().slice(0, 10), status: 'active' }); await loadCohorts(); cohortId.value = cohort.id; notice.value = 'Pilot cohort created.' }
+  try { const cohort = await salesRequest('/pilot/cohorts', props.tenantId, 'POST', { name: cohortName.value, starts_on: new Date().toISOString().slice(0, 10), status: 'active', data_classification: 'real' }); await loadCohorts(); cohortId.value = cohort.id; notice.value = 'REAL prospect pilot cohort created.' }
   catch (e) { error.value = e instanceof Error ? e.message : 'Unable to create cohort.' }
   finally { creatingCohort.value = false }
 }
@@ -70,8 +79,8 @@ onBeforeUnmount(() => { if (pollTimer) clearInterval(pollTimer) })
 <template>
   <section class="import-panel">
     <div class="import-head"><div><span class="eyebrow">KNOWN-DOMAIN INTAKE</span><h2>Import a prospect list</h2><p>Business name, website, country code and source are required. Website identity stays unverified until independently checked.</p></div><span class="safe-label">No outreach on import</span></div>
-    <div class="import-controls"><label class="file-field">CSV file<input type="file" accept=".csv,text/csv" @change="chooseFile" /></label><label>Pilot cohort<select v-model="cohortId"><option value="">No cohort</option><option v-for="cohort in cohorts" :key="cohort.id" :value="cohort.id">{{ cohort.name }}</option></select></label><button v-if="manager" class="quiet" :disabled="creatingCohort" @click="createCohort">{{ creatingCohort ? 'Creating…' : '＋ New cohort' }}</button><button class="primary" :disabled="busy || !file" @click="previewFile">{{ busy ? 'Checking…' : 'Preview CSV' }}</button></div>
-    <details class="csv-help"><summary>CSV format and privacy</summary><p>Required columns: <code>business_name, website, country, source</code>. Optional: <code>city, industry, business_email, business_phone, contact_name, notes</code>. Country uses ISO two-letter codes. Maximum 100 data rows and 2 MB. Contact values are encrypted while staged and on the contact record. The source is recorded as user-supplied and is not independent proof.</p></details>
+    <div class="import-controls"><label class="file-field">CSV file<input type="file" accept=".csv,text/csv" @change="chooseFile" /></label><label>Pilot cohort<select v-model="cohortId"><option value="">No cohort</option><option v-for="cohort in cohorts" :key="cohort.id" :value="cohort.id">{{ cohort.name }} · {{ (cohort.data_classification || 'real').toUpperCase() }}</option></select></label><button v-if="manager" class="quiet" :disabled="creatingCohort" @click="createCohort">{{ creatingCohort ? 'Creating…' : '＋ New cohort' }}</button><button class="primary" :disabled="busy || !file" @click="previewFile">{{ busy ? 'Checking…' : 'Preview CSV' }}</button></div>
+    <details class="csv-help"><summary>CSV format and privacy</summary><p>Required columns: <code>business_name, website, country, source</code>. Optional: <code>city, industry, source_url, collected_at, provenance_note, business_email, business_phone, contact_name, notes</code>. Country uses ISO two-letter codes. Maximum 100 data rows and 2 MB. Contact values are encrypted while staged and on the contact record. Imported domains remain unverified; they are known URLs, not proof of ownership.</p></details>
     <p v-if="error" class="import-error" role="alert">{{ error }}</p><p v-if="notice" class="import-notice" role="status">{{ notice }}</p>
     <div v-if="preview" class="import-state"><div class="import-summary"><b>{{ preview.counts.valid }} ready</b><b>{{ preview.counts.invalid }} invalid or duplicate</b><span>Batch {{ preview.id }}</span></div><div class="import-table-wrap"><table><thead><tr><th>Row</th><th>Business</th><th>Website</th><th>Result</th><th>Row notes</th></tr></thead><tbody><tr v-for="row in rows" :key="row.row_number"><td>{{ row.row_number }}</td><td>{{ row.business_name || '—' }}</td><td>{{ row.normalized_domain || row.website || '—' }}</td><td>{{ row.validation_status }} · {{ row.deduplication_status }}</td><td>{{ row.errors?.join(' ') || 'Ready to import' }}</td></tr></tbody></table></div><button class="primary" :disabled="busy || preview.counts.valid === 0" @click="confirmImport">Confirm import of {{ preview.counts.valid }} rows</button></div>
     <div v-if="batch" class="import-state"><div class="import-summary"><b>{{ batch.batch.status.replaceAll('_', ' ') }}</b><span>{{ batch.batch.counts.imported || 0 }} imported</span><span>{{ batch.batch.counts.pending || 0 }} pending</span><span>{{ batch.batch.counts.failed || 0 }} failed</span></div><div class="import-table-wrap"><table><thead><tr><th>Row</th><th>Business</th><th>Domain</th><th>Validation</th><th>Import status</th></tr></thead><tbody><tr v-for="row in rows" :key="row.id"><td>{{ row.row_number }}</td><td>{{ row.original_name }}</td><td>{{ row.normalized_domain || row.original_website }}</td><td>{{ row.validation_status }} · {{ row.deduplication_status }}</td><td>{{ row.status }}<small v-if="row.errors?.length">{{ row.errors.join(' ') }}</small></td></tr></tbody></table></div><div class="import-footer"><button class="quiet" @click="downloadErrors">Download row issues</button><button v-if="batch.batch.counts?.failed" class="quiet" @click="retryFailed">Retry failed rows</button><span>Imported domains remain unverified. No message was sent.</span></div></div>

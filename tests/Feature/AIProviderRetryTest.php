@@ -4,6 +4,7 @@ namespace Tests\Feature;
 
 use App\AI\AIRequest;
 use App\AI\Providers\OpenAIProvider;
+use App\AI\Providers\AIProviderException;
 use Illuminate\Support\Facades\Http;
 use RuntimeException;
 use Tests\TestCase;
@@ -34,8 +35,10 @@ class AIProviderRetryTest extends TestCase
         try {
             (new OpenAIProvider)->generate(new AIRequest('task', 'Return data.', [], ['type' => 'object']), 'test-model');
             self::fail('Expected permanent provider errors to be surfaced.');
-        } catch (RuntimeException $exception) {
-            self::assertSame('AI provider request failed with HTTP 400', $exception->getMessage());
+        } catch (AIProviderException $exception) {
+            self::assertSame(400, $exception->httpStatus);
+            self::assertSame('OPENAI_RESPONSE_RECEIVED', $exception->requestOutcome);
+            self::assertSame('Provider rejected the request (HTTP 400).', $exception->getMessage());
         }
 
         Http::assertSentCount(1);

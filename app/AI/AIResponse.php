@@ -11,5 +11,7 @@ final readonly class AIResponse
         public ?int $inputTokens = null,
         public ?int $outputTokens = null,
         public ?int $latencyMs = null,
+        public ?int $httpStatus = null,
+        public ?string $endpoint = null,
     ) {}
 }

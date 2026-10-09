@@ -132,6 +132,13 @@ final class AcquisitionWorkflowCoordinator
 
     private function outreachEligible(string $tenantId, object $workflow): bool
     {
+        if (app(\App\SalesIntelligence\SalesIntelligenceMode::class)->humanAssisted($tenantId)) {
+            // A score is advisory. Only an explicit human priority and service decision may open draft planning.
+            $row = DB::table('prospect_import_rows')->where('tenant_id', $tenantId)->where('company_id', $workflow->company_id)->orderByDesc('processed_at')->value('id');
+            if (! $row) return false;
+            $decision = DB::table('pilot_human_decisions')->where('tenant_id', $tenantId)->where('prospect_import_row_id', $row)->orderByDesc('decided_at')->orderByDesc('id')->first();
+            if (! $decision || ! in_array($decision->priority, ['high', 'medium'], true) || $decision->service_decision !== 'selected') return false;
+        }
         $score = DB::table('lead_scores')->where('tenant_id', $tenantId)->where('company_id', $workflow->company_id)->orderByDesc('scored_at')->value('score');
         return $score !== null && (int) $score >= (int) config('orchestration.outreach_score_threshold', 70);
     }

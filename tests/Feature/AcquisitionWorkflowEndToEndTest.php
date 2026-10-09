@@ -181,6 +181,8 @@ final class AcquisitionWorkflowEndToEndTest extends TestCase
     private function startOutreach(string $slug): array
     {
         $tenant=Tenant::create(['id'=>(string)Str::uuid(),'name'=>$slug,'slug'=>$slug]);
+        config(['sales_intelligence.experimental_autonomous_enabled'=>true]);
+        $tenant->update(['settings'=>['sales_intelligence_mode'=>'experimental_autonomous']]);
         $owner=User::create(['name'=>'Journey Owner','email'=>$slug.'@example.test','password'=>'hashed-test-password']);
         $owner->tenants()->attach($tenant->id,['role'=>'owner','status'=>'active']); Sanctum::actingAs($owner);
         $campaign=Campaign::create(['tenant_id'=>$tenant->id,'name'=>'Journey Campaign','objective'=>'Improve ecommerce conversion','status'=>'active']);
@@ -195,7 +197,7 @@ final class AcquisitionWorkflowEndToEndTest extends TestCase
         foreach(['website_reasoning','content_generation','sales_reasoning','proposal_generation'] as $task)
             DB::table('ai_model_configurations')->insert(['id'=>(string)Str::uuid(),'tenant_id'=>$tenant->id,'task_key'=>$task,'provider'=>'conversation-test','model'=>'journey-fake',
                 'enabled'=>true,'parameters'=>'{}','version'=>1,'created_at'=>now(),'updated_at'=>now()]);
-        DB::table('tenants')->where('id',$tenant->id)->update(['settings'=>json_encode(['scoring'=>['icp'=>['industries'=>['Retail'],'keywords'=>['ecommerce']]]])]);
+        DB::table('tenants')->where('id',$tenant->id)->update(['settings'=>json_encode(['sales_intelligence_mode'=>'experimental_autonomous','scoring'=>['icp'=>['industries'=>['Retail'],'keywords'=>['ecommerce']]]])]);
         DB::table('tenant_automation_settings')->insert(['tenant_id'=>$tenant->id,'autonomy_mode'=>'ASSISTED','created_at'=>now(),'updated_at'=>now()]);
         DB::table('tenant_scheduling_configurations')->insert(['id'=>(string)Str::uuid(),'tenant_id'=>$tenant->id,'provider'=>'fake','enabled'=>true,
             'default_timezone'=>'Asia/Kolkata','autonomous_booking_enabled'=>false,'created_at'=>now(),'updated_at'=>now()]);
@@ -285,17 +287,15 @@ final class JourneyAIProvider implements AIProviderInterface
     }
     private function website(AIRequest $request):array
     {
-        $page=$request->evidence[0]; $url=$page['url'];
-        preg_match('/Contact us at [^ ]+/', $page['text'], $contactQuote);
-        preg_match('/buyer@[a-z0-9.-]+/', $page['text'], $email);
-        $contactExcerpt='Alex Buyer Director, '.($contactQuote[0]??'');
-        return ['summary'=>'Public ecommerce company with an outdated desktop site.','issues'=>[
-            ['type'=>'outdated_website','summary'=>'The website uses a legacy platform.','source_url'=>$url,'evidence'=>'Legacy desktop ecommerce site','severity'=>'high','confidence'=>.95],
-            ['type'=>'poor_mobile_ux','summary'=>'Mobile navigation appears limited.','source_url'=>$url,'evidence'=>'Legacy desktop ecommerce site','severity'=>'medium','confidence'=>.9],
-            ['type'=>'poor_lead_capture','summary'=>'The page has no clear enquiry path.','source_url'=>$url,'evidence'=>'No WhatsApp link','severity'=>'medium','confidence'=>.9],
-        ],'technologies'=>[['name'=>'Legacy CMS','category'=>'platform','source_url'=>$url,'evidence'=>'Legacy desktop ecommerce site','confidence'=>.9]],
-            'insights'=>[['statement'=>'Retail ecommerce business seeking online growth.','kind'=>'business_fit','source_url'=>$url,'evidence'=>'Legacy desktop ecommerce site','confidence'=>.95]],
-            'contacts'=>[['name'=>'Alex Buyer','title'=>'Director','source_url'=>$url,'evidence'=>$contactExcerpt,'confidence'=>.9]]];
+        $page=$request->evidence[0]; $id=$page['id']; $excerpt='Legacy desktop ecommerce site';
+        return ['business_identity'=>['name'=>(string)($page['title']??''),'description'=>'Public ecommerce company.','evidence_id'=>$id,'excerpt'=>mb_substr($page['text'],0,120)],
+            'observations'=>[['statement'=>'Retail ecommerce business seeking online growth.','kind'=>'fact','evidence_id'=>$id,'excerpt'=>$excerpt,'confidence'=>.95]],
+            'technical_findings'=>[
+                ['type'=>'outdated_website','summary'=>'The website uses a legacy platform.','severity'=>'high','evidence_id'=>$id,'excerpt'=>$excerpt,'confidence'=>.95],
+                ['type'=>'poor_mobile_ux','summary'=>'Mobile navigation appears limited.','severity'=>'medium','evidence_id'=>$id,'excerpt'=>$excerpt,'confidence'=>.9],
+                ['type'=>'technology','summary'=>'Legacy CMS','severity'=>'low','evidence_id'=>$id,'excerpt'=>$excerpt,'confidence'=>.9]],
+            'opportunities'=>[], 'service_recommendations'=>[], 'unknowns'=>['Revenue and traffic are unknown.'],
+            'evidence'=>[['evidence_id'=>$id,'source_url'=>$page['url'],'excerpt'=>$excerpt]], 'confidence'=>.9];
     }
     private function marketing(AIRequest $request):array
     {

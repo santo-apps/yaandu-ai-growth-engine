@@ -20,7 +20,7 @@ final class OpenAIProvider extends AbstractJsonProvider
                 'model' => $model, 'temperature' => $request->temperature, 'max_tokens' => $request->maxOutputTokens,
                 'response_format' => ['type' => 'json_object'],
                 'messages' => [['role' => 'system', 'content' => $request->systemInstruction], ['role' => 'user', 'content' => $this->prompt($request)]],
-            ]);
+            ], $model);
         return $this->decode($body['choices'][0]['message']['content'] ?? '', $model, $body['usage']['prompt_tokens'] ?? null, $body['usage']['completion_tokens'] ?? null);
     }
 }

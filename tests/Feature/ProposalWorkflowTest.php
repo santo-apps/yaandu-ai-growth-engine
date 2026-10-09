@@ -179,10 +179,62 @@ class ProposalWorkflowTest extends TestCase
     {
         [$tenant, $owner, , $opportunity, $service] = $this->fixture('proposal-manual-commercial'); Sanctum::actingAs($owner);
         $this->withHeader('X-Tenant-ID', $tenant->id)->putJson('/api/v1/pricing-policy', ['currency' => 'INR', 'max_discount_percent' => 10, 'default_validity_days' => 30])->assertOk();
+        $this->assertDatabaseHas('audit_logs', ['tenant_id' => $tenant->id, 'subject_type' => 'tenant_pricing_policy', 'subject_id' => $tenant->id,
+            'action' => 'commercial_input_updated', 'actor_user_id' => $owner->id]);
         $proposal = $this->withHeader('X-Tenant-ID', $tenant->id)->postJson('/api/v1/opportunities/'.$opportunity->id.'/proposals', ['requirements' => ['requested_services' => ['Website'], 'business_requirements' => ['Improve enquiries']]])->json();
         $this->withHeader('X-Tenant-ID', $tenant->id)->putJson('/api/v1/proposals/'.$proposal['id'].'/commercials', ['currency' => 'INR', 'discount_percent' => '5.00', 'discount_reason' => 'Approved by owner', 'items' => [['service_id' => $service->id, 'quantity' => 1, 'unit_price' => '12000.01', 'price_reason' => 'Approved custom project rate']]])
             ->assertOk()->assertJsonPath('total', '11400.01');
         $this->assertDatabaseHas('proposal_items', ['tenant_id' => $tenant->id, 'proposal_id' => $proposal['id'], 'unit_price' => '12000.01', 'price_approved_by' => $owner->id, 'discount_approved_by' => $owner->id, 'discount_reason' => 'Approved by owner']);
+    }
+
+    public function test_custom_quote_service_has_no_catalog_price_and_requires_explicit_human_price_before_financial_approval(): void
+    {
+        [$tenant, $owner, , $opportunity] = $this->fixture('proposal-custom-quote');
+        Sanctum::actingAs($owner);
+        $headers = ['X-Tenant-ID' => $tenant->id, 'Idempotency-Key' => 'custom-quote-generate'];
+
+        $this->withHeaders($headers)->postJson('/api/v1/tenant-services', [
+            'sku' => 'custom_software', 'name' => 'Custom Software Development', 'description' => 'Software scoped after discovery.',
+            'commercial_model' => 'custom_quote', 'currency' => 'INR', 'active' => true, 'standard_deliverables' => ['Reviewed enquiry flow'],
+        ])->assertCreated()->assertJsonPath('unit_price', null)->assertJsonPath('unit', null);
+        $service = TenantService::where('tenant_id', $tenant->id)->where('sku', 'custom_software')->firstOrFail();
+        $this->assertNotNull($service->approved_by);
+        $this->assertDatabaseHas('audit_logs', ['tenant_id' => $tenant->id, 'subject_type' => 'tenant_service', 'subject_id' => $service->id,
+            'action' => 'commercial_input_created', 'actor_user_id' => $owner->id]);
+        $this->withHeaders($headers)->patchJson('/api/v1/tenant-services/'.$service->id, ['commercial_model' => 'FIXED_PRICE'])
+            ->assertUnprocessable()->assertJsonValidationErrors(['unit_price', 'unit']);
+        self::assertSame('custom_quote', $service->fresh()->commercial_model);
+
+        $this->withHeaders($headers)->postJson('/api/v1/tenant-services', [
+            'sku' => 'fixed_service', 'name' => 'Fixed service', 'commercial_model' => 'FIXED_PRICE', 'currency' => 'INR',
+        ])->assertUnprocessable()->assertJsonValidationErrors('unit_price');
+        $pricedService = TenantService::where('tenant_id', $tenant->id)->where('sku', 'WEB-001')->firstOrFail();
+        $this->withHeaders($headers)->patchJson('/api/v1/tenant-services/'.$pricedService->id, ['unit_price' => null])
+            ->assertUnprocessable()->assertJsonValidationErrors('unit_price');
+
+        $this->configureAgent($tenant->id, $service->id);
+        $proposal = $this->withHeaders($headers)->postJson('/api/v1/opportunities/'.$opportunity->id.'/proposals', ['requirements' => [
+            'requested_services' => ['Custom Software Development'], 'business_requirements' => ['Scope a software solution after discovery.'],
+        ]])->assertCreated()->json();
+        $this->withHeaders($headers)->postJson('/api/v1/proposals/'.$proposal['id'].'/generate')->assertOk()
+            ->assertJsonPath('status', ProposalStatus::CommercialInputRequired->value);
+        $this->assertDatabaseCount('proposal_items', 0);
+
+        $this->withHeaders($headers)->putJson('/api/v1/proposals/'.$proposal['id'].'/commercials', [
+            'currency' => 'INR', 'items' => [['service_id' => $service->id, 'quantity' => 1]],
+        ])->assertUnprocessable();
+        $this->withHeaders($headers)->putJson('/api/v1/proposals/'.$proposal['id'].'/commercials', [
+            'currency' => 'INR', 'items' => [['service_id' => $service->id, 'quantity' => 1, 'unit_price' => '0.00', 'price_reason' => 'Owner quote amount entered.']],
+        ])->assertUnprocessable();
+        $this->withHeaders($headers)->postJson('/api/v1/proposals/'.$proposal['id'].'/approve')->assertStatus(409);
+        $this->withHeaders($headers)->postJson('/api/v1/proposals/'.$proposal['id'].'/ready-to-send')->assertStatus(409);
+        $this->assertDatabaseCount('proposal_items', 0);
+
+        $this->withHeaders($headers)->putJson('/api/v1/proposals/'.$proposal['id'].'/commercials', [
+            'currency' => 'INR', 'items' => [['service_id' => $service->id, 'quantity' => 1, 'unit_price' => '275000.00', 'price_reason' => 'Owner approved after discovery.']],
+        ])->assertOk()->assertJsonPath('total', '275000.00');
+        $this->assertDatabaseHas('proposal_items', ['tenant_id' => $tenant->id, 'proposal_id' => $proposal['id'], 'service_id' => $service->id,
+            'unit_price' => '275000.00', 'price_approved_by' => $owner->id, 'price_override_reason' => 'Owner approved after discovery.']);
     }
 
     public function test_pdf_renderer_escapes_pdf_delimiters_and_strips_markup(): void

@@ -51,10 +51,8 @@ onMounted(refresh)
 </script>
 
 <template>
-  <aside v-if="state || error" class="local-acceptance" aria-label="Local acceptance controls">
+  <aside v-if="state" class="local-acceptance" aria-label="Local acceptance controls">
     <div class="acceptance-head"><strong>LOCAL ACCEPTANCE · TEST MODE</strong><span>AI, outbound email, and calendar are deterministic fakes. No external messages or meetings.</span></div>
-    <small v-if="!state" class="acceptance-error">{{ error }}</small>
-    <template v-else>
     <div class="acceptance-state"><span>{{ state.providers.ai }}</span><span>{{ state.providers.outbound }}</span><span>{{ state.providers.scheduling }}</span><span>Queue: {{ state.queue }}</span></div>
     <div class="acceptance-actions">
       <button v-if="state.message?.status === 'accepted' && state.message.provider === 'fake'" class="quiet" :disabled="busy" @click="post(`outbound/${state.message.id}/sent`)">Confirm fake delivery</button>
@@ -66,7 +64,6 @@ onMounted(refresh)
     <small v-else-if="state.conversation_id">Outbound conversation thread created. No inbound reply has been simulated yet.</small>
     <small v-if="state.proposal_delivery_count > 0" class="acceptance-error">Unexpected proposal delivery count: {{ state.proposal_delivery_count }}</small>
     <small v-if="error" class="acceptance-error">{{ error }}</small>
-    </template>
   </aside>
 </template>
 

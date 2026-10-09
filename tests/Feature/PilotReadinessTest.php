@@ -13,6 +13,14 @@ final class PilotReadinessTest extends TestCase
 {
     use RefreshDatabase;
 
+    public function test_unauthenticated_api_browser_request_returns_json_401_instead_of_web_redirect(): void
+    {
+        $this->get('/api/v1/me')
+            ->assertUnauthorized()
+            ->assertHeader('content-type', 'application/json')
+            ->assertJsonPath('message', 'Unauthenticated.');
+    }
+
     public function test_readiness_is_tenant_scoped_and_never_returns_secret_material(): void
     {
         [$tenant, $owner] = $this->workspace('readiness-owner', 'owner');
@@ -36,6 +44,20 @@ final class PilotReadinessTest extends TestCase
         [$tenant, $member] = $this->workspace('readiness-member', 'member');
         Sanctum::actingAs($member);
         $this->withHeader('X-Tenant-ID', $tenant->id)->getJson('/api/v1/pilot/readiness')->assertForbidden();
+    }
+
+    public function test_website_intelligence_readiness_is_dedicated_tenant_scoped_and_explicitly_lists_gates(): void
+    {
+        [$tenant, $owner] = $this->workspace('intelligence-readiness', 'owner');
+        Sanctum::actingAs($owner);
+        $response = $this->withHeader('X-Tenant-ID', $tenant->id)->getJson('/api/v1/pilot/intelligence-readiness')->assertOk();
+        $response->assertJsonPath('ready', false)->assertJsonPath('credential_loaded', false)
+            ->assertJsonPath('prompt.approved_active', false)->assertJsonPath('smoke_test.passed_recently', false)
+            ->assertJsonPath('secrets_exposed', false);
+        self::assertNotEmpty($response->json('reasons'));
+        self::assertArrayNotHasKey('api_key', $response->json());
+        [$otherTenant] = $this->workspace('intelligence-readiness-other', 'owner');
+        $this->withHeader('X-Tenant-ID', $otherTenant->id)->getJson('/api/v1/pilot/intelligence-readiness')->assertForbidden();
     }
 
     /** @return array{Tenant, User} */

@@ -50,6 +50,22 @@ final class SalesAgentWorkflowTest extends TestCase
         $this->assertDatabaseHas('opportunity_activities',['tenant_id'=>$tenant->id,'activity_type'=>'sales_draft_generated']);
     }
 
+    public function test_high_ai_qualification_score_stays_advisory_in_human_assisted_mode(): void
+    {
+        [$tenant, $owner, , $conversation, $message] = $this->workspace('sales-advisory-qualification');
+        $this->prompt($tenant->id);
+        $this->router(new SalesFakeProvider($message->id, 'INTERESTED', true));
+        Sanctum::actingAs($owner);
+        $result = $this->withHeaders(['X-Tenant-ID' => $tenant->id, 'Idempotency-Key' => 'sales-high-advisory'])
+            ->postJson('/api/v1/conversations/'.$conversation->id.'/sales-analysis', [])->assertOk()->json();
+        self::assertSame(100, $result['qualification']['score']['score']);
+        self::assertSame('NEW', $result['opportunity']['stage']);
+        self::assertNull($result['opportunity']['qualified_at']);
+        $this->assertDatabaseCount('meeting_bookings', 0);
+        $this->assertDatabaseCount('proposals', 0);
+        $this->assertDatabaseCount('outbound_messages', 0);
+    }
+
     public function test_pricing_request_never_persists_model_generated_price_and_cross_tenant_access_is_hidden(): void
     {
         [$tenant,$owner,$company,$conversation,$message]=$this->workspace('sales-pricing');$other=$this->workspace('sales-other');
@@ -111,14 +127,16 @@ final class SalesAgentWorkflowTest extends TestCase
 final class SalesFakeProvider implements AIProviderInterface
 {
     public array $requests=[];
-    public function __construct(private readonly string $messageId,private readonly string $intent='INTERESTED'){}
+    public function __construct(private readonly string $messageId,private readonly string $intent='INTERESTED',private readonly bool $highQualification=false){}
     public function providerKey():string{return 'sales-test';}
     public function capabilities():array{return ['structured_json'];}
     public function generate(AIRequest $request,string $model):AIResponse
     {
         $this->requests[]=$request;
-        return new AIResponse(['intent'=>$this->intent,'confidence'=>0.94,'qualification'=>['NEED'=>'STRONG','FIT'=>'STRONG','AUTHORITY'=>'UNKNOWN','TIMELINE'=>'STRONG','BUDGET'=>'UNKNOWN'],
-            'qualification_evidence'=>['NEED'=>[$this->messageId],'FIT'=>[],'AUTHORITY'=>[],'TIMELINE'=>[$this->messageId],'BUDGET'=>[]],
+        $qualification=$this->highQualification?array_fill_keys(\App\Sales\QualificationScorer::DIMENSIONS,'STRONG'):['NEED'=>'STRONG','FIT'=>'STRONG','AUTHORITY'=>'UNKNOWN','TIMELINE'=>'STRONG','BUDGET'=>'UNKNOWN'];
+        $qualificationEvidence=$this->highQualification?array_fill_keys(\App\Sales\QualificationScorer::DIMENSIONS,[$this->messageId]):['NEED'=>[$this->messageId],'FIT'=>[],'AUTHORITY'=>[],'TIMELINE'=>[$this->messageId],'BUDGET'=>[]];
+        return new AIResponse(['intent'=>$this->intent,'confidence'=>0.94,'qualification'=>$qualification,
+            'qualification_evidence'=>$qualificationEvidence,
             'missing_information'=>['Who is involved in the decision?','Is budget approved?'],'recommended_action'=>'DRAFT_RESPONSE','requires_human_review'=>false,
             'draft_response'=>'We can explore your ecommerce goals and launch timeline.','evidence_references'=>[$this->messageId],'knowledge_references'=>[],
             'reasoning_summary'=>'Prospect stated a need and deadline.'],$this->providerKey(),$model);

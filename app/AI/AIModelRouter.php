@@ -59,8 +59,26 @@ final class AIModelRouter
         $usageId = $this->reserveUsage($effectiveRequest, $configuration['provider'], $configuration['model']);
         try {
             $response = $provider->generate($effectiveRequest, $configuration['model']);
-            $this->schemaValidator->validate($response->data, $request->outputSchema);
-            $this->completeUsage($usageId, $request, $response);
+            try {
+                $this->schemaValidator->validate($response->data, $request->outputSchema);
+            } catch (\Throwable $error) {
+                $outcome = $response->provider === 'openai' ? 'OPENAI_RESPONSE_RECEIVED' : 'PROVIDER_RESPONSE_RECEIVED';
+                $safeMessage = 'AI provider response did not satisfy the required output schema.';
+                if (preg_match('/missing required field \[([a-zA-Z0-9_.-]{1,80})\]/', $error->getMessage(), $missingField)) {
+                    $safeMessage = 'AI provider response is missing required field ['.$missingField[1].'].';
+                }
+                throw new Providers\AIProviderException($safeMessage, 'response_schema', $outcome,
+                    httpStatus: $response->httpStatus, endpoint: $response->endpoint, model: $response->model,
+                    elapsedMs: $response->latencyMs, previous: $error);
+            }
+            try {
+                $this->completeUsage($usageId, $request, $response);
+            } catch (\Throwable $error) {
+                $outcome = $response->provider === 'openai' ? 'OPENAI_RESPONSE_RECEIVED' : 'PROVIDER_RESPONSE_RECEIVED';
+                throw new Providers\AIProviderException('AI usage metadata could not be persisted after the provider response.', 'usage_persistence', $outcome,
+                    httpStatus: $response->httpStatus, endpoint: $response->endpoint, model: $response->model,
+                    elapsedMs: $response->latencyMs, previous: $error);
+            }
             return $response;
         } catch (\Throwable $error) {
             if ($usageId) DB::table('ai_usage_records')->where('id', $usageId)->update(['status' => 'FAILED']);
@@ -111,7 +129,7 @@ final class AIModelRouter
         $cost = is_array($pricing) && isset($pricing['input'], $pricing['output']) && $response->inputTokens !== null && $response->outputTokens !== null
             ? (($response->inputTokens * (float) $pricing['input']) + ($response->outputTokens * (float) $pricing['output'])) / 1000 : null;
         DB::table('ai_usage_records')->where('id', $usageId)->where('tenant_id', $request->tenantId)->update([
-            'input_tokens' => $response->inputTokens, 'output_tokens' => $response->outputTokens,
+            'input_tokens' => $response->inputTokens, 'output_tokens' => $response->outputTokens, 'provider_latency_ms' => $response->latencyMs,
             'reserved_tokens' => 0, 'estimated_cost' => $cost, 'provider' => $response->provider, 'model' => $response->model, 'status' => 'COMPLETED']);
         $usage = DB::table('ai_usage_records')->where('id', $usageId)->where('tenant_id', $request->tenantId)->first();
         if (! $usage?->workflow_id) return;

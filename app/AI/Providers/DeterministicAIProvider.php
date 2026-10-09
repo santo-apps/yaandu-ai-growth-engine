@@ -38,20 +38,22 @@ final class DeterministicAIProvider implements AIProviderInterface
     private function website(AIRequest $request): array
     {
         $page = $request->evidence[0] ?? [];
-        $url = (string) ($page['url'] ?? 'https://northstar-retail.fixture.test');
+        $pageId = (string) ($page['id'] ?? '');
         $text = (string) ($page['text'] ?? '');
-        $issues = [];
+        $excerpt = mb_substr(trim($text), 0, min(120, mb_strlen($text)));
+        $findings = [];
         if (stripos($text, 'older storefront layout') !== false) {
-            $issues[] = ['type' => 'outdated_website', 'summary' => 'The site describes an older storefront layout.', 'source_url' => $url, 'evidence' => 'older storefront layout', 'severity' => 'high', 'confidence' => 0.94];
+            $findings[] = ['type' => 'outdated_website', 'summary' => 'The site describes an older storefront layout.', 'severity' => 'high', 'evidence_id' => $pageId, 'excerpt' => 'older storefront layout', 'confidence' => 0.94];
         }
         if (stripos($text, 'mobile navigation is difficult') !== false) {
-            $issues[] = ['type' => 'poor_mobile_ux', 'summary' => 'The page describes difficult mobile navigation.', 'source_url' => $url, 'evidence' => 'Mobile navigation is difficult', 'severity' => 'medium', 'confidence' => 0.92];
+            $findings[] = ['type' => 'poor_mobile_ux', 'summary' => 'The page describes difficult mobile navigation.', 'severity' => 'medium', 'evidence_id' => $pageId, 'excerpt' => 'Mobile navigation is difficult', 'confidence' => 0.92];
         }
-        $insights = stripos($text, 'retail ecommerce business') !== false
-            ? [['statement' => 'The page identifies a retail ecommerce business.', 'kind' => 'business_fit', 'source_url' => $url, 'evidence' => 'Fictional retail ecommerce business', 'confidence' => 0.93]] : [];
-
-        return ['summary' => 'Local deterministic analysis based only on the supplied fictional page evidence.',
-            'issues' => $issues, 'technologies' => [], 'insights' => $insights, 'contacts' => []];
+        $observations = stripos($text, 'retail ecommerce business') !== false
+            ? [['statement' => 'The page identifies a retail ecommerce business.', 'kind' => 'fact', 'evidence_id' => $pageId, 'excerpt' => 'fictional retail ecommerce business', 'confidence' => 0.93]] : [];
+        return ['business_identity' => ['name' => (string) ($page['title'] ?? ''), 'description' => '', 'evidence_id' => $pageId, 'excerpt' => $excerpt],
+            'observations' => $observations, 'technical_findings' => $findings, 'opportunities' => [], 'service_recommendations' => [],
+            'unknowns' => ['Revenue, traffic, employee count, customer count, conversion, spend, profitability, internal systems, and unobserved technology are unknown.'],
+            'evidence' => $pageId !== '' ? [['evidence_id' => $pageId, 'source_url' => $page['url'] ?? '', 'excerpt' => $excerpt]] : [], 'confidence' => 0.9];
     }
 
     private function marketing(AIRequest $request): array

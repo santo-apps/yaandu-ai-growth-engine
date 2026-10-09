@@ -333,7 +333,7 @@ final class WorkflowService
         else return;
         $workflow = $query->orderByDesc('updated_at')->first();
         if (! $workflow) return;
-        $retryableFailure = in_array($failureCode, ['AI_PROVIDER_UNAVAILABLE', 'AGENT_TIMEOUT'], true);
+        $retryableFailure = in_array($failureCode, ['AI_PROVIDER_UNAVAILABLE', 'AGENT_TIMEOUT', 'PROVIDER_TIMEOUT', 'PROVIDER_RATE_LIMIT'], true);
         $event = $phase === 'started' ? 'agent_run_started' : ($phase === 'failed' ? ($retryableFailure ? 'agent_run_retryable_failure' : 'agent_run_nonretryable_failure') : match ($agentKey) {
             'WebsiteIntelligenceAgent' => 'website_analysis_completed', 'LeadScoringAgent' => 'lead_scored', 'MarketingAgent' => 'marketing_draft_created',
             'FollowUpAgent' => 'reply_analyzed', 'SalesAgent' => 'sales_analysis_completed', 'ProposalAgent' => 'proposal_generated', default => 'agent_run_completed',
