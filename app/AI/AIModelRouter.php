@@ -11,10 +11,12 @@ final class AIModelRouter
     /** @var array<string, AIProviderInterface> */
     private array $providers = [];
     private readonly JsonSchemaValidator $schemaValidator;
+    private readonly ModelPricing $modelPricing;
 
     public function __construct(iterable $providers, private readonly array $taskConfigurations)
     {
         $this->schemaValidator = new JsonSchemaValidator();
+        $this->modelPricing = new ModelPricing();
         foreach ($providers as $provider) {
             $this->providers[$provider->providerKey()] = $provider;
         }
@@ -97,10 +99,12 @@ final class AIModelRouter
             $today = DB::table('ai_usage_records')->where('tenant_id', $request->tenantId)->whereDate('created_at', today());
             $calls = (clone $today)->count();
             $tokens = (int) (clone $today)->sum(DB::raw('COALESCE(input_tokens,0) + COALESCE(output_tokens,0) + COALESCE(reserved_tokens,0)'));
-            if ($settings?->daily_ai_call_limit && $calls >= $settings->daily_ai_call_limit) throw new RuntimeException('Tenant daily AI call budget reached.');
+            $callLimit = $this->effectiveLimit($settings?->daily_ai_call_limit, config('ai.daily_call_limit', 0));
+            if ($callLimit > 0 && $calls >= $callLimit) throw new RuntimeException('Tenant daily AI call budget reached.');
             $reserve = max(1, $request->maxOutputTokens);
-            if ($settings?->daily_token_limit && $tokens + $reserve > $settings->daily_token_limit) throw new RuntimeException('Tenant daily AI token budget would be exceeded.');
-            $pricing = config('ai.model_pricing_per_1k', [])[$provider][$model] ?? null;
+            $tokenLimit = $this->effectiveLimit($settings?->daily_token_limit, config('ai.daily_token_limit', 0));
+            if ($tokenLimit > 0 && $tokens + $reserve > $tokenLimit) throw new RuntimeException('Tenant daily AI token budget would be exceeded.');
+            $pricing = $this->modelPricing->resolve($provider, $model);
             if ($settings?->monthly_estimated_spend_limit !== null) {
                 if (! is_array($pricing) || ! isset($pricing['input'], $pricing['output'])) throw new RuntimeException('Monthly spend limit is configured but verified model pricing is unavailable; AI execution is paused.');
                 $month = DB::table('ai_usage_records')->where('tenant_id', $request->tenantId)->where('created_at', '>=', now()->startOfMonth());
@@ -125,25 +129,36 @@ final class AIModelRouter
     private function completeUsage(?string $usageId, AIRequest $request, AIResponse $response): void
     {
         if (! $usageId) return;
-        $pricing = config('ai.model_pricing_per_1k', [])[$response->provider][$response->model] ?? null;
-        $cost = is_array($pricing) && isset($pricing['input'], $pricing['output']) && $response->inputTokens !== null && $response->outputTokens !== null
-            ? (($response->inputTokens * (float) $pricing['input']) + ($response->outputTokens * (float) $pricing['output'])) / 1000 : null;
+        $pricing = $this->modelPricing->resolve($response->provider, $response->model);
+        $cost = $pricing ? $this->modelPricing->estimate($pricing, $response->inputTokens, $response->outputTokens) : null;
         DB::table('ai_usage_records')->where('id', $usageId)->where('tenant_id', $request->tenantId)->update([
             'input_tokens' => $response->inputTokens, 'output_tokens' => $response->outputTokens, 'provider_latency_ms' => $response->latencyMs,
-            'reserved_tokens' => 0, 'estimated_cost' => $cost, 'provider' => $response->provider, 'model' => $response->model, 'status' => 'COMPLETED']);
+            'reserved_tokens' => 0, 'estimated_cost' => $cost, 'estimated_cost_currency' => $cost === null ? null : $pricing['currency'],
+            'pricing_effective_date' => $cost === null ? null : $pricing['effective_from'], 'pricing_version' => $cost === null ? null : $pricing['version'],
+            'provider' => $response->provider, 'model' => $response->model, 'status' => 'COMPLETED']);
         $usage = DB::table('ai_usage_records')->where('id', $usageId)->where('tenant_id', $request->tenantId)->first();
         if (! $usage?->workflow_id) return;
         $settings = DB::table('tenant_automation_settings')->where('tenant_id', $request->tenantId)->first();
         $daily = DB::table('ai_usage_records')->where('tenant_id', $request->tenantId)->whereDate('created_at', today());
-        $callsExceeded = $settings?->daily_ai_call_limit && (clone $daily)->count() > $settings->daily_ai_call_limit;
+        $callLimit = $this->effectiveLimit($settings?->daily_ai_call_limit, config('ai.daily_call_limit', 0));
+        $callsExceeded = $callLimit > 0 && (clone $daily)->count() > $callLimit;
         $tokenTotal = (int) (clone $daily)->sum(DB::raw('COALESCE(input_tokens,0) + COALESCE(output_tokens,0) + COALESCE(reserved_tokens,0)'));
-        $tokensExceeded = $settings?->daily_token_limit && $tokenTotal > $settings->daily_token_limit;
+        $tokenLimit = $this->effectiveLimit($settings?->daily_token_limit, config('ai.daily_token_limit', 0));
+        $tokensExceeded = $tokenLimit > 0 && $tokenTotal > $tokenLimit;
         $month = DB::table('ai_usage_records')->where('tenant_id', $request->tenantId)->where('created_at', '>=', now()->startOfMonth());
         $spendExceeded = $settings?->monthly_estimated_spend_limit !== null && $cost !== null && (float) (clone $month)->sum('estimated_cost') > (float) $settings->monthly_estimated_spend_limit;
         if ($callsExceeded || $tokensExceeded || $spendExceeded) {
             try { app(\App\Orchestration\WorkflowService::class)->append($request->tenantId, $usage->workflow_id, 'ai_budget_exceeded', 'policy', ['reason_code' => 'tenant_ai_budget'], 'ai-budget:'.$usageId); }
             catch (\Throwable) {}
         }
+    }
+
+    private function effectiveLimit(mixed $tenantLimit, mixed $applicationLimit): int
+    {
+        $tenant = max(0, (int) $tenantLimit);
+        $application = max(0, (int) $applicationLimit);
+        if ($tenant > 0 && $application > 0) return min($tenant, $application);
+        return max($tenant, $application);
     }
 
 }

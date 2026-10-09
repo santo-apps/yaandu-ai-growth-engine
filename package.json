@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "vue-tsc -b && vite build",
-    "typecheck": "vue-tsc -b"
+    "typecheck": "vue-tsc -b",
+    "test:ui": "node tests/Playwright/sprint-8-ui-acceptance.mjs"
   },
   "dependencies": {
     "@vitejs/plugin-vue": "^5.2.1",

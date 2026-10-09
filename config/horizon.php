@@ -15,7 +15,7 @@ return [
             'supervisor-intelligence' => ['connection' => 'redis', 'queue' => ['intelligence'], 'balance' => 'auto', 'minProcesses' => 1, 'maxProcesses' => 4, 'tries' => 3, 'timeout' => 240],
             'supervisor-scoring' => ['connection' => 'redis', 'queue' => ['scoring'], 'balance' => 'auto', 'minProcesses' => 1, 'maxProcesses' => 4, 'tries' => 3, 'timeout' => 240],
             'supervisor-campaigns' => ['connection' => 'redis', 'queue' => ['campaigns'], 'balance' => 'auto', 'minProcesses' => 1, 'maxProcesses' => 3, 'tries' => 3, 'timeout' => 120],
-            'supervisor-outbound' => ['connection' => 'redis', 'queue' => ['outbound'], 'balance' => 'auto', 'minProcesses' => 1, 'maxProcesses' => 4, 'tries' => 1000, 'timeout' => 90],
+            'supervisor-outbound' => ['connection' => 'redis', 'queue' => ['outbound'], 'balance' => 'auto', 'minProcesses' => 1, 'maxProcesses' => 4, 'tries' => 5, 'timeout' => 90],
             'supervisor-conversations' => ['connection' => 'redis', 'queue' => ['conversations'], 'balance' => 'auto', 'minProcesses' => 1, 'maxProcesses' => 3, 'tries' => 3, 'timeout' => 120],
             'supervisor-workflow' => ['connection' => 'redis', 'queue' => ['workflow'], 'balance' => 'auto', 'minProcesses' => 1, 'maxProcesses' => 3, 'tries' => 3, 'timeout' => 120],
         ],

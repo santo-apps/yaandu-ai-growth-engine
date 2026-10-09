@@ -32,6 +32,7 @@ final class PostgresRedisDiscoveryVerificationTest extends TestCase
         self::assertSame('pgsql', DB::connection()->getDriverName(), 'This suite must execute against PostgreSQL.');
         self::assertSame('redis', config('queue.default'), 'This suite must enqueue through Redis.');
         $this->isolateRedisQueue();
+        config(['candidate_discovery.max_sources_per_business' => 5]);
 
         $tenant = Tenant::create(['id' => (string) Str::uuid(), 'name' => 'PostgreSQL Candidate Discovery Integration',
             'slug' => 'pg-candidate-'.Str::lower(Str::random(12)), 'status' => 'active']);
@@ -97,6 +98,11 @@ final class PostgresRedisDiscoveryVerificationTest extends TestCase
             'pilot.allow_simulated_fixtures' => true,
             'ai.tasks.website_reasoning.provider' => 'deterministic', 'ai.tasks.website_reasoning.model' => 'local-acceptance-v1',
             'ai.tasks.lead_classification.provider' => 'deterministic', 'ai.tasks.lead_classification.model' => 'local-acceptance-v1']);
+        // This test may run with a local .env that disables deterministic providers at bootstrap.
+        // Register the fake explicitly after switching this test to its isolated fixture profile.
+        $this->app->tag([\App\AI\Providers\DeterministicAIProvider::class], 'ai.providers');
+        $this->app->forgetInstance(\App\AI\AIModelRouter::class);
+        $this->app->forgetInstance(\App\Agents\AgentOrchestrator::class);
 
         $tenant = Tenant::create(['id' => (string) Str::uuid(), 'name' => 'PostgreSQL Discovery Integration',
             'slug' => 'pg-discovery-'.Str::lower(Str::random(12)), 'status' => 'active']);

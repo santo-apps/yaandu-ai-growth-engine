@@ -20,6 +20,8 @@ return [
     ],
     'timeouts' => ['connect' => 5, 'request' => 45],
     'retries' => ['attempts' => 2],
+    'daily_call_limit' => (int) env('AI_DAILY_CALL_LIMIT', 50),
+    'daily_token_limit' => (int) env('AI_DAILY_TOKEN_LIMIT', 50000),
     // Optional provider/model-specific rates per 1,000 tokens. Keep empty until verified rates are configured.
     'model_pricing_per_1k' => [],
 ];

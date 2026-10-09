@@ -70,6 +70,7 @@ class AppServiceProvider extends ServiceProvider
     public function boot(): void
     {
         RateLimiter::for('login', fn ($request) => Limit::perMinute(5)->by(Str::lower((string) $request->input('email')).'|'.$request->ip()));
+        RateLimiter::for('api', fn ($request) => Limit::perMinute(120)->by(($request->user()?->getAuthIdentifier() ?? 'guest').'|'.$request->ip()));
         Gate::define('viewHorizon', fn ($user) => $user->tenants()->wherePivot('status', 'active')
             ->wherePivotIn('role', ['owner', 'admin'])->where('tenants.status', 'active')->exists());
     }

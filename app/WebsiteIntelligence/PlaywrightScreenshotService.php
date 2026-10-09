@@ -17,6 +17,10 @@ final class PlaywrightScreenshotService
     /** Capture the first-party page using a single validated, pinned public address. */
     public function capture(string $tenantId, string $scanId, string $pageId, string $url, ?int $timeoutSeconds = null): ?string
     {
+        // This implementation launches Chromium as a subprocess from the current
+        // Laravel worker. Production capture stays fail-closed until a separate
+        // isolated browser-worker adapter is deployed.
+        if (app()->environment('production')) return null;
         if (! config('crawling.playwright.enabled') || ! config('crawling.screenshots.enabled')) return null;
 
         [$host, $addresses] = $this->policy->validatePublicHttpUrl($url);
