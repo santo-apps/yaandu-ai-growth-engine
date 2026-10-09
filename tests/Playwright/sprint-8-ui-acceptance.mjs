@@ -51,7 +51,12 @@ try {
     else if (path === `/companies/${companyId}`) body = fixtureCompany
     else if (path === `/companies/${companyId}/intelligence`) body = {
       latest_scan: { status: 'completed', created_at: '2026-01-01T00:00:00Z' },
-      issues: [], pages: [], scores: [], intelligence_results: [], screenshots: [],
+      issues: [{ id: 'issue-1', type: 'mobile_ux', severity: 'medium', summary: 'Navigation may be difficult on small screens.', confidence: 0.8, evidence: JSON.stringify({ source_url: 'https://synthetic-pilot.example.test', excerpt: 'Synthetic fixture evidence excerpt.' }) }],
+      technologies: [{ id: 'tech-1', name: 'Synthetic CMS' }],
+      pages: [{ id: 'page-1', final_url: 'https://synthetic-pilot.example.test', requested_url: 'https://synthetic-pilot.example.test', title: 'Synthetic Pilot', http_status: 200, extracted_text: 'Synthetic page evidence.' }],
+      scores: [{ id: 'score-1', score: null, evidence_coverage: 50, rule_version: 1, components: { industry_fit: { points: 5, evidence: 'Synthetic business profile' } } }],
+      intelligence_results: [{ structured_output: { business_identity: { description: 'Synthetic company summary.' }, observations: [{ statement: 'The site lists a contact page.', evidence_id: 'page-1', confidence: 0.9 }], opportunities: [], technical_findings: [], unknowns: ['CRM use is unknown.'], evidence: [{ evidence_id: 'page-1', source_url: 'https://synthetic-pilot.example.test', excerpt: 'Synthetic page evidence.' }] } }],
+      screenshots: [],
     }
     else if (path === '/pilot/cohorts') body = { data: [] }
     else if (path.startsWith('/pilot/dashboard')) body = { cohort: null, simulated: true, sales_intelligence_mode: 'human_assisted', metrics: {}, funnel: {}, rates_percent: {} }
@@ -81,6 +86,9 @@ try {
       results.push(await inspect(page, 'Prospect 360', outputDirectory))
       await page.getByRole('button', { name: 'Website', exact: true }).click()
       await page.getByText('Latest scan').waitFor()
+      await page.getByText('Executive summary', { exact: true }).waitFor()
+      assert.equal(await page.locator('.intelligence-workspace pre').count(), 0, 'Website Intelligence must not render raw JSON')
+      assert.ok(!(await page.locator('.intelligence-workspace').innerText()).includes('{\"'), 'Website Intelligence content is human-readable')
       results.push(await inspect(page, 'Website Intelligence', outputDirectory))
     }
     results.push(await inspect(page, label, outputDirectory))
