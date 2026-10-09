@@ -49,4 +49,17 @@ final class ProductionReadinessCommandTest extends TestCase
 
         self::assertNull($result);
     }
+
+    public function test_readiness_fails_when_debug_environment_flag_is_enabled_even_if_runtime_is_forced_safe(): void
+    {
+        config(['app.env' => 'production', 'app.debug' => false, 'production_readiness.debug_enabled' => true,
+            'app.key' => 'base64:local-test-key', 'queue.default' => 'redis']);
+        Redis::shouldReceive('connection')->andReturnSelf();
+        Redis::shouldReceive('ping')->andReturn('PONG');
+        $this->app->instance(MasterSupervisorRepository::class, Mockery::mock(MasterSupervisorRepository::class, function ($mock): void {
+            $mock->shouldReceive('all')->andReturn([]);
+        }));
+
+        $this->artisan('production:readiness')->expectsOutputToContain('Debug must be disabled')->assertExitCode(1);
+    }
 }

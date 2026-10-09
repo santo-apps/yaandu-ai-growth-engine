@@ -1,6 +1,7 @@
 <?php
 
 return [
+    'debug_enabled' => (bool) env('APP_DEBUG', false),
     'tenant_id' => env('PRODUCTION_READINESS_TENANT_ID'),
     'backup_verified' => (bool) env('PRODUCTION_BACKUP_VERIFIED', false),
     'monitoring_configured' => (bool) env('PRODUCTION_MONITORING_CONFIGURED', false),

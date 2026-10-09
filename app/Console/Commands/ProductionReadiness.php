@@ -21,7 +21,8 @@ final class ProductionReadiness extends Command
     public function handle(): int
     {
         $this->check('APP_ENV', app()->environment('production'), 'Production environment required.');
-        $this->check('APP_DEBUG', config('app.debug') === false, 'Debug must be disabled.');
+        $debugDisabled = config('app.debug') === false && ! config('production_readiness.debug_enabled', false);
+        $this->check('APP_DEBUG', $debugDisabled, 'Debug must be disabled in the runtime and environment.');
         $this->check('APP_KEY', filled(config('app.key')), 'Application encryption key '.(filled(config('app.key')) ? 'present.' : 'missing.'));
 
         try {
