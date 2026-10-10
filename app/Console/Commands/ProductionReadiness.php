@@ -6,6 +6,7 @@ use App\SalesIntelligence\SalesIntelligenceMode;
 use Illuminate\Console\Command;
 use Illuminate\Console\Scheduling\Schedule;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Mail;
 use Illuminate\Support\Facades\Redis;
 use Illuminate\Support\Facades\Storage;
 use Laravel\Horizon\Contracts\MasterSupervisorRepository;
@@ -87,8 +88,7 @@ final class ProductionReadiness extends Command
         $this->check('Secure session cookie', (bool) config('session.secure'), 'Secure session cookie must be enabled behind HTTPS.');
         if (config('production_readiness.trusted_edge_verified')) $this->pass('Trusted hosts / proxies', 'Deployment owner attests HTTPS edge, host allow-list and trusted proxy configuration.');
         else $this->recordWarning('Trusted hosts / proxies', 'Deployment proxy and host allow-list must be verified at the edge.');
-        $mail = (string) config('mail.default');
-        $this->check('Mail', $mail !== 'log' && $mail !== 'array', 'Mail transport: '.$mail.'. Confirm provider delivery before enabling notifications.');
+        $this->checkMail();
         $this->check('Backups', (bool) config('production_readiness.backup_verified'), 'Backup schedule and isolated restore evidence are deployment-owned.');
         $this->check('Monitoring', (bool) config('production_readiness.monitoring_configured'), 'HTTP, DB, Redis, Horizon, queue and provider alerts are deployment-owned.');
 
@@ -184,5 +184,47 @@ final class ProductionReadiness extends Command
         }
 
         $this->pass('Production storage', 'Private local storage path, permissions and runtime write/read/delete probe verified.');
+    }
+
+    private function checkMail(): void
+    {
+        if (! config('production_readiness.mail_enabled', false)) {
+            $this->pass('Mail', 'Outbound mail is intentionally disabled for the controlled pilot.');
+
+            return;
+        }
+
+        $mailer = strtolower(trim((string) config('mail.default', '')));
+        $mailerConfig = config('mail.mailers.'.$mailer);
+        $transport = is_array($mailerConfig) ? strtolower(trim((string) ($mailerConfig['transport'] ?? ''))) : '';
+        $configured = $mailer !== '' && ! in_array($mailer, ['log', 'array'], true)
+            && $transport !== '' && ! in_array($transport, ['log', 'array'], true);
+
+        if ($configured && $transport === 'smtp') {
+            $host = (string) ($mailerConfig['host'] ?? '');
+            $port = filter_var($mailerConfig['port'] ?? null, FILTER_VALIDATE_INT);
+            $configured = filled($host) && $port !== false && $port >= 1 && $port <= 65535;
+        } elseif ($configured) {
+            $mailerOptions = array_filter($mailerConfig, static fn (mixed $value, string|int $key): bool => $key !== 'transport' && filled($value), ARRAY_FILTER_USE_BOTH);
+            $serviceOptions = config('services.'.$mailer, []);
+            $configured = $mailerOptions !== [] || (is_array($serviceOptions) && $serviceOptions !== []);
+        }
+
+        if (! $configured) {
+            $this->recordFailure('Mail', 'Outbound mail is enabled but no usable non-log/non-array transport configuration is present.');
+
+            return;
+        }
+
+        try {
+            // Resolve the configured driver without sending a message or opening a provider connection.
+            Mail::mailer($mailer)->getSymfonyTransport();
+        } catch (Throwable) {
+            $this->recordFailure('Mail', 'Outbound mail is enabled but Laravel cannot resolve the configured transport.');
+
+            return;
+        }
+
+        $this->pass('Mail', 'Mail transport is configured. Confirm provider delivery before enabling notifications; no delivery is assumed.');
     }
 }

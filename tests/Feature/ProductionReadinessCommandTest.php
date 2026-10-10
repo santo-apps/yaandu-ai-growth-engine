@@ -14,7 +14,7 @@ use Tests\TestCase;
 
 final class ProductionReadinessCommandTest extends TestCase
 {
-    public function test_readiness_is_read_only_and_never_prints_provider_credentials(): void
+    public function test_readiness_reports_gates_and_never_prints_provider_credentials(): void
     {
         config(['app.env' => 'testing', 'app.debug' => true, 'app.key' => 'base64:local-test-key', 'queue.default' => 'sync',
             'filesystems.default' => 'local', 'app.url' => 'http://localhost', 'mail.default' => 'log',
@@ -163,6 +163,57 @@ final class ProductionReadinessCommandTest extends TestCase
         }
     }
 
+    public function test_disabled_mail_passes_for_controlled_pilot_without_assuming_delivery(): void
+    {
+        $this->prepareStorageReadiness(true, true);
+        config(['production_readiness.mail_enabled' => false, 'mail.default' => 'log']);
+
+        $output = $this->runReadiness();
+
+        $this->assertMailStatus($output, 'PASS');
+        self::assertStringContainsString('Outbound mail is intentionally disabled for the controlled pilot.', $output);
+        self::assertStringNotContainsString('provider delivery confirmed', $output);
+    }
+
+    public function test_enabled_log_mailer_fails_readiness(): void
+    {
+        $this->prepareStorageReadiness(true, true);
+        config(['production_readiness.mail_enabled' => true, 'mail.default' => 'log',
+            'mail.mailers.log' => ['transport' => 'log', 'channel' => null]]);
+
+        $this->assertMailStatus($this->runReadiness(), 'FAIL');
+    }
+
+    public function test_enabled_array_mailer_fails_readiness(): void
+    {
+        $this->prepareStorageReadiness(true, true);
+        config(['production_readiness.mail_enabled' => true, 'mail.default' => 'array',
+            'mail.mailers.array' => ['transport' => 'array']]);
+
+        $this->assertMailStatus($this->runReadiness(), 'FAIL');
+    }
+
+    public function test_enabled_real_configured_smtp_transport_passes_without_sending_mail(): void
+    {
+        $this->prepareStorageReadiness(true, true);
+        config(['production_readiness.mail_enabled' => true, 'mail.default' => 'smtp',
+            'mail.mailers.smtp' => ['transport' => 'smtp', 'host' => 'smtp.example.test', 'port' => 587]]);
+
+        $output = $this->runReadiness();
+
+        $this->assertMailStatus($output, 'PASS');
+        self::assertStringContainsString('Confirm provider delivery before enabling notifications; no delivery is assumed.', $output);
+    }
+
+    public function test_enabled_smtp_transport_without_host_or_valid_port_fails_readiness(): void
+    {
+        $this->prepareStorageReadiness(true, true);
+        config(['production_readiness.mail_enabled' => true, 'mail.default' => 'smtp',
+            'mail.mailers.smtp' => ['transport' => 'smtp', 'host' => '', 'port' => 0]]);
+
+        $this->assertMailStatus($this->runReadiness(), 'FAIL');
+    }
+
     private function useTemporaryPrivateStorage(): string
     {
         $storageRoot = sys_get_temp_dir().'/yaandu-storage-readiness-'.Str::uuid().'/storage';
@@ -200,5 +251,10 @@ final class ProductionReadinessCommandTest extends TestCase
     private function assertStorageStatus(string $output, string $status): void
     {
         self::assertMatchesRegularExpression('/\|\s*Production storage\s*\|\s*'.preg_quote($status, '/').'\s*\|/', $output, $output);
+    }
+
+    private function assertMailStatus(string $output, string $status): void
+    {
+        self::assertMatchesRegularExpression('/\|\s*Mail\s*\|\s*'.preg_quote($status, '/').'\s*\|/', $output, $output);
     }
 }
