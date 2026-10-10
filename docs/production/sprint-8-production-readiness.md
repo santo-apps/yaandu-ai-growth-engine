@@ -1,0 +1,68 @@
+# Sprint 8 Production Readiness
+
+**Status: NOT READY for a controlled production pilot.** This repository can verify local application behavior; it does not contain evidence of a deployed production stack. The read-only `php artisan production:readiness` command distinguishes runtime evidence from operator/deployment assertions and must be run against the production release environment after configuration is loaded.
+
+## Discovered architecture
+
+| Concern | Repository evidence | Production status |
+|---|---|---|
+| Application | Laravel 12, PHP constraint `^8.3`; local operator reported PHP 8.5.11 | Production PHP patch level and web server are unverified |
+| Frontend | Vue 3, TypeScript, Vite; `npm run build` produces static assets | Build is reproducible locally; CDN/web-server deployment is not verified |
+| Database | PostgreSQL connection and tenant-aware migrations | Local PostgreSQL has been exercised previously; production HA, TLS, backups and restore evidence are absent |
+| Queues | Redis queue connection, Horizon; separate default, discovery, candidate-discovery, intake, crawl, intelligence, scoring, campaigns, outbound, conversations and workflow queues | Production supervisors are bounded; host/process management remains deployment-owned |
+| Browser work | HTTP-first crawler; Playwright flag defaults off; a Cilium policy template exists | Template is not deployed isolation evidence. Keep Playwright disabled until a separate isolated worker is deployed and verified |
+| Artifacts | Private local disk and S3-compatible disk support; local disk is the default | S3 credentials/configuration or runtime object verification are not assumed |
+| Scheduling | Laravel schedule includes daily proposal expiry | Cron/`schedule:run` heartbeat is not verified |
+| Edge/TLS | `APP_URL`, CORS and Sanctum settings are configurable | TLS termination, trusted proxy/host restrictions and cookie domain are deployment-owned |
+| Logging/secrets | Laravel logging, `.env` local config, provider request redaction paths | Secret manager, log sink, access controls and retention are unverified |
+| Monitoring | `/up` framework health endpoint; Horizon status/readiness checks | No deployed alert receiver or monitor is evidenced |
+
+## Environment safety and readiness command
+
+`php artisan production:readiness` is read-only: it performs a database `SELECT 1`, Redis ping, and status/configuration inspection. It never prints credential values or writes a temporary S3 object. `FAIL` returns a nonzero exit code; `WARN` means runtime proof or deployment evidence is still needed. The command checks production environment/debug/key, PostgreSQL, Redis, Redis/Horizon queue configuration and running Horizon, an explicit tenant `website_reasoning` OpenAI route and credential presence, Human-Assisted mode, Playwright isolation assertion, object storage configuration, schedule, HTTPS URL, mail, backup and monitoring assertions. Set `PRODUCTION_READINESS_TENANT_ID` to inspect the pilot tenant. `PRODUCTION_BACKUP_VERIFIED`, `PRODUCTION_MONITORING_CONFIGURED`, and `SCHEDULE_HEARTBEAT_CONFIGURED` are operator assertions, not discovered facts.
+
+Production must use `APP_ENV=production`, `APP_DEBUG=false`, a unique generated `APP_KEY`, PostgreSQL, Redis, HTTPS, secure cookies, and secrets delivered by the deployment secret manager. Never copy local `.env` values into a release. Keep fake outbound, inbound and scheduling providers, deterministic AI, and fixture crawling disabled outside local/testing. The app's JSON exception handling does not guarantee edge/server sanitization: validate a production-like request with debug off before release.
+
+## Queues and Horizon
+
+Production Horizon config has explicit bounded supervisors for the important queues. HTTP/discovery, crawl, intelligence and scoring work cannot consume the outbound/conversation queues. Supervisor timeouts are below Redis `retry_after=420` for the reviewed production settings. Outbound retries are capped at five (previously 1,000). All queue failures must be inspected in Horizon and `failed_jobs`; do not silently retry auth/configuration failures indefinitely. Deployment should run Horizon under a process manager (systemd, Supervisor, or an orchestrator), use `php artisan horizon:terminate` during rollout, wait for process replacement, and verify `php artisan horizon:status`.
+
+Playwright remains disabled by default, and its current production service now refuses to launch Chromium at all: it would otherwise start a subprocess from the normal Laravel crawl worker. A dedicated `browser` queue, worker adapter/process/container, and network isolation have not been implemented or deployed. Do not treat a queue name, environment flag, or the provided Cilium YAML template as isolation evidence. Production browser capture remains blocked until that separate runtime is delivered and verified.
+
+## URL and crawl safety review
+
+The implementation uses an HTTP-first crawler and has existing URL policy, public-address DNS resolution, robots parsing, host throttling, crawl budgets, redirect resolution and website-resolution regressions. Redirect targets are re-resolved/revalidated before use, and only HTTP(S) URLs are accepted. Existing tests cover private/loopback and redirect cases. DNS rebinding cannot be ruled out by a repository audit alone: production must retain connection-time destination controls at the network boundary. Never crawl credentials, private networks, metadata addresses, or access-controlled sites. Do not bypass CAPTCHAs, rate limits, or robots restrictions. No new unsafe crawler mode is enabled in this sprint.
+
+## Storage and database
+
+S3 configuration in Laravel does not prove object read/write/delete or bucket policy. Keep pilot artifacts on the configured private disk only when its access controls and backups are verified; otherwise treat production artifact storage as blocked. When an S3 probe is separately authorized, use a unique temporary key, verify private access, read it, delete it, and verify deletion. Require private bucket defaults, no public ACLs, short-lived signed URLs, tenant-prefixed object keys, and lifecycle expiration aligned to retention.
+
+Migrations use PostgreSQL UUIDs, tenant-scoped foreign keys/indexes for critical scan and intelligence relations, and tenant-local uniqueness where required. No speculative index or migration is added here. Before release, inspect `EXPLAIN (ANALYZE, BUFFERS)` on production-shaped data for prospect lists, activity history and dashboards; use statement/lock timeouts and avoid holding transactions open across provider/network calls.
+
+## Backups and retention
+
+Until the database owner sets a stricter policy, the pilot baseline should be: encrypted nightly PostgreSQL base backup plus continuous/WAL recovery where supported; retain daily backups 35 days and monthly snapshots 12 months; encrypt in transit and at rest; store backups in a separate account/region with access logging. Back up object artifacts and the small set of critical tenant configuration/prompt/ICP/audit data consistently. Before inviting pilot users, restore the latest backup into an isolated environment, apply the matching release, verify row counts/tenant boundaries and sample artifact checksums, and record the restore time. Never restore over production as a test.
+
+Suggested initial retention (subject to contractual/privacy review): raw crawl HTML/text 90 days; screenshots 30 days; AI structured results and evidence references 12 months; AI usage metadata 24 months; human reviews and tenant decisions 24 months; audit logs 24 months or longer where legal requirements demand; failed-job payloads 14 days; application logs 30 days. Do not delete or mutate existing Sprint 7 evidence during this sprint. Implement deletion as a reviewed scheduled policy with legal hold and tenant scope, not ad hoc SQL.
+
+## Logging, provider safeguards, and cost
+
+Provider HTTP exceptions are classified and sanitized; request headers and raw credentials must never be logged. Keep logs on allow-listed fields (tenant-scoped opaque identifiers, correlation ID, provider/model, status category, latency and token counts). Do not log full public-site payloads by default. Restrict logs, redact authorization/session/cookie fields, and test with canary secret strings. OpenAI route selection is explicit per tenant for the Website Intelligence task; provider timeouts, bounded retries, schema validation and token accounting are already implemented. Do not retry permanent 4xx authentication/configuration errors. Pricing is optional and `config/ai.php` intentionally has no rates; show **cost unavailable** unless a model rate, currency and effective date have been owner-verified. Never infer historical cost.
+
+## Tenant and authorization gate
+
+Tenant isolation is a P0 gate. Keep `ResolveTenant` plus active-membership checks, tenant predicates, composite tenant foreign keys and cross-tenant tests. Before release, verify every export, signed artifact URL, intelligence/evidence/review/decision, service selection, opportunity/proposal, campaign and dashboard query against two real test tenants. Role matrix: sales roles may read assigned tenant prospects, review evidence, select active tenant services, set human priority and record next action; only owner/admin roles manage prompts, models, ICP, service catalog and commercial policy. Proposal/outbound approvals remain separate, audited human actions. Do not rely on UI visibility as authorization.
+
+## Pilot boundaries
+
+Human-Assisted Intelligence remains the only pilot mode: AI findings and scores are advisory; a person chooses service/no service/needs discovery, assigns priority and decides next action. No AI-only qualification, service assignment, campaign activation, or outbound sending. Review existing human decision history rather than adding a second feedback store. Initial intake is manually reviewed and limited to 10–25 legitimate public businesses per batch; lower `PILOT_MAX_IMPORT_ROWS` to 25 for the pilot deployment. Set conservative crawl/AI budgets, one crawl worker, and tenant daily AI call/token limits. A manager must explicitly authorize any AI transfer of public crawl content; private/internal material is out of scope.
+
+## Deployment, rollback, smoke, and monitoring
+
+Follow [the controlled pilot runbook](controlled-pilot-runbook.md). A release is blocked until it has a known immutable artifact, a verified database backup/restore, reviewed reversible migrations, and rollback owner. Migrations with irreversible data changes must be treated as expand/contract and have a forward-fix plan; do not assume `migrate:rollback` restores deleted/rewritten data. Keep previous app assets and release directory for rollback. On deploy: enter maintenance only if required by migration, install locked Composer deps, build frontend, run reviewed migrations, clear/rebuild config/route/view caches, gracefully terminate Horizon, wait for workers, verify health and run synthetic-only smoke checks. Roll back code/assets if login, tenant boundary, read paths, or queues fail; if schema has advanced, use a compatible forward fix or restore only after an incident decision.
+
+Alert after 2 consecutive failed 1-minute probes for app/DB/Redis/Horizon; page on failed-job rate above 5% over 15 minutes or oldest critical queue job above 5 minutes; warn on noncritical backlog above 100 for 10 minutes; stop provider execution after 3 authentication failures in 10 minutes or 3 quota/rate-limit failures in 5 minutes; alert on any repeated storage write/read failure. Track crawl failures by bounded failure category and alert at >30% over 30 minutes only when at least 10 jobs were attempted. Send alerts to a protected on-call channel and include correlation IDs, never payloads/secrets.
+
+## Readiness acceptance
+
+This repository has not been deployed to production. Production APP_DEBUG=false, PostgreSQL/Redis/Horizon runtime in the production release, storage object access, restore, monitoring, TLS/proxy policy, user onboarding, and isolated browser-worker deployment require environment evidence. The readiness command must pass every required check and no unresolved P0/P1 security issue may remain before pilot authorization. A local PASS does not establish production readiness.

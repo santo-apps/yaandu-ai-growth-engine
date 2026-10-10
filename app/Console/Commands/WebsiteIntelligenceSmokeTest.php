@@ -45,6 +45,8 @@ final class WebsiteIntelligenceSmokeTest extends Command
                 ['synthetic_test' => 'No real company or website data.'], $schema, maxOutputTokens: 64, temperature: 0,
                 correlationId: $correlationId, tenantId: $tenant));
             $passed = ($response->data['result'] ?? null) === 'ok';
+            $pricing = app(\App\AI\ModelPricing::class)->resolve($provider, $model);
+            $estimatedCost = $pricing ? app(\App\AI\ModelPricing::class)->estimate($pricing, $response->inputTokens, $response->outputTokens) : null;
             $record = ['status' => $passed ? 'passed' : 'failed', 'provider' => $response->provider, 'model' => $response->model,
                 'completed_at' => now()->toIso8601String(), 'duration_ms' => (int) ((microtime(true) - $started) * 1000),
                 'input_tokens_available' => $response->inputTokens !== null, 'output_tokens_available' => $response->outputTokens !== null,
@@ -54,7 +56,10 @@ final class WebsiteIntelligenceSmokeTest extends Command
                 'correlation_id' => $correlationId, 'stage' => 'response_parsed', 'request_outcome' => $this->responseOutcome($provider),
                 'http_status' => $response->httpStatus, 'endpoint' => $response->endpoint ?? $this->endpoint($provider, $model),
                 'request_shape' => $requestShape,
-                'estimated_cost' => $this->estimatedCost($provider, $model, $response->inputTokens, $response->outputTokens)];
+                'estimated_cost' => $estimatedCost, 'estimated_cost_currency' => $estimatedCost === null ? null : $pricing['currency'],
+                'pricing_effective_date' => $estimatedCost === null ? null : $pricing['effective_from'],
+                'pricing_version' => $estimatedCost === null ? null : $pricing['version'],
+                'cost_status' => $estimatedCost === null ? 'unavailable' : 'estimated'];
         } catch (Throwable $error) {
             $record = ['status' => 'failed', 'provider' => $provider, 'model' => $model, 'completed_at' => now()->toIso8601String(),
                 'duration_ms' => (int) ((microtime(true) - $started) * 1000), 'input_tokens_available' => false, 'output_tokens_available' => false,
@@ -102,10 +107,4 @@ final class WebsiteIntelligenceSmokeTest extends Command
         return $provider === 'openai' ? 'OPENAI_RESPONSE_RECEIVED' : 'PROVIDER_RESPONSE_RECEIVED';
     }
 
-    private function estimatedCost(string $provider, string $model, ?int $inputTokens, ?int $outputTokens): ?float
-    {
-        $pricing = config('ai.model_pricing_per_1k', [])[$provider][$model] ?? null;
-        if (! is_array($pricing) || ! isset($pricing['input'], $pricing['output']) || $inputTokens === null || $outputTokens === null) return null;
-        return (($inputTokens * (float) $pricing['input']) + ($outputTokens * (float) $pricing['output'])) / 1000;
-    }
 }

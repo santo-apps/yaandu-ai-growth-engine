@@ -35,7 +35,7 @@ Route::prefix('v1')->group(function (): void {
     Route::post('/webhooks/outbound/{provider}', OutboundWebhookController::class)->middleware('throttle:60,1');
     Route::post('/webhooks/inbound/{provider}', InboundWebhookController::class)->middleware('throttle:60,1');
     Route::post('/login', [AuthController::class, 'login'])->middleware('throttle:login');
-    Route::middleware(['auth:sanctum', ResolveTenant::class])->group(function (): void {
+    Route::middleware(['auth:sanctum', ResolveTenant::class, 'throttle:api'])->group(function (): void {
     Route::post('/logout', [AuthController::class, 'logout']);
     Route::get('/me', fn () => request()->user());
     Route::get('/tenants', [AuthController::class, 'tenants']);
