@@ -221,6 +221,79 @@ class ProductizedCorpusIngestionTest extends TestCase
         self::assertSame(3, DB::table('web_index_document_sources')->count());
     }
 
+    public function test_osm_robots_transport_failure_is_classified_and_source_continues_to_next_document(): void
+    {
+        config(['discovery.osm_min_delay_ms' => 0, 'website_resolution.max_identity_pages_per_domain' => 0]);
+        $this->app->instance(PublicAddressResolverInterface::class, new class implements PublicAddressResolverInterface {
+            public function resolve(string $host): array { return ['93.184.216.34']; }
+        });
+        Http::preventStrayRequests();
+        Http::fake(function ($request) {
+            $url = $request->url();
+            if ($url === 'https://overpass-api.de/api/interpreter') return Http::response(['elements' => [
+                ['type' => 'node', 'id' => 201, 'lat' => 25, 'lon' => 55, 'tags' => ['name' => 'Robots Failure Shop', 'shop' => 'furniture', 'website' => 'https://robots-failure.test/']],
+                ['type' => 'node', 'id' => 202, 'lat' => 25, 'lon' => 55, 'tags' => ['name' => 'Available Shop', 'shop' => 'furniture', 'website' => 'https://available-shop.test/']],
+            ]]);
+            RateLimiter::clear('crawl-host:'.hash('sha256', (string) parse_url($url, PHP_URL_HOST)));
+            if ($url === 'https://robots-failure.test/robots.txt') {
+                throw new \Illuminate\Http\Client\ConnectionException('synthetic connection failure');
+            }
+            if (str_ends_with($url, '/robots.txt')) return Http::response('', 404);
+            return Http::response('<title>Available Shop</title><p>Furniture shop serving Dubai, UAE.</p>', 200, ['Content-Type' => 'text/html']);
+        });
+
+        $result = app(LocalWebIndexIngestionService::class)->ingest(app(OpenStreetMapWebsiteIndexIngestionSource::class), 2, [
+            'location' => 'Dubai', 'country' => 'UAE', 'categories' => ['retail'], 'max_source_records' => 2,
+            'max_fetches' => 4, 'max_runtime_seconds' => 60,
+        ]);
+
+        self::assertSame(1, $result['inserted']);
+        self::assertSame(1, $result['processed']);
+        self::assertSame(1, $result['source_metrics']['robots_transport_failures']);
+        self::assertSame(1, $result['source_metrics']['indexed_pages']);
+        self::assertSame(1, DB::table('web_index_documents')->where('normalized_domain', 'available-shop.test')->count());
+        self::assertSame(0, DB::table('web_index_documents')->where('normalized_domain', 'robots-failure.test')->count());
+        self::assertSame(0, DB::table('campaign_recipients')->count());
+        self::assertSame(0, DB::table('outbound_messages')->count());
+        self::assertSame(0, DB::table('workflow_approvals')->where('action', 'SEND_OUTREACH')->count());
+    }
+
+    public function test_every_osm_record_failure_classification_has_an_initialized_counter(): void
+    {
+        $source = app(OpenStreetMapWebsiteIndexIngestionSource::class);
+        $classify = new \ReflectionMethod($source, 'recordFailure');
+        $cases = [
+            'DIRECTORY_EVIDENCE' => 'directory_or_social_skipped',
+            'ROBOTS_DENIED' => 'robots_denied',
+            'ROBOTS_UNAVAILABLE' => 'robots_unavailable',
+            'ROBOTS_DNS_FAILURE' => 'robots_dns_failures',
+            'ROBOTS_TIMEOUT' => 'robots_timeouts',
+            'ROBOTS_UNSAFE_REDIRECT' => 'robots_redirect_rejections',
+            'ROBOTS_TRANSPORT_FAILURE' => 'robots_transport_failures',
+            'URL_NORMALIZATION_REJECTED' => 'url_normalization_rejections',
+            'UNSAFE_URL' => 'ssrf_policy_rejections',
+            'NON_HTML' => 'candidate_non_html',
+            'OVERSIZED' => 'candidate_oversize',
+            'PARSE_FAILURE' => 'parse_failures',
+            'DNS_FAILURE' => 'candidate_dns_failures',
+            'TIMEOUT' => 'candidate_timeouts',
+            'UNSAFE_REDIRECT' => 'candidate_redirect_rejections',
+            'HTTP_FAILURE' => 'candidate_http_failures',
+            'OTHER_TRANSPORT_FAILURE' => 'candidate_transport_failures',
+        ];
+
+        foreach ($cases as $message => $counter) {
+            try {
+                $classify->invoke($source, new \RuntimeException($message));
+            } catch (\Throwable $error) {
+                self::fail("Classification {$message} threw ".get_class($error).': '.$error->getMessage());
+            }
+        }
+
+        $metrics = $source->metrics();
+        foreach (array_values($cases) as $counter) self::assertSame(1, $metrics[$counter], "Expected {$counter} to be initialized and incremented.");
+    }
+
     public function test_source_failures_leave_run_partially_completed_for_operator_review(): void
     {
         $result = app(LocalWebIndexIngestionService::class)->ingest($this->source([], 'flaky_fixture', ['source_failures' => 2]), 5);

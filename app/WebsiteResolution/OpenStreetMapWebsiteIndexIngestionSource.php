@@ -18,6 +18,7 @@ final class OpenStreetMapWebsiteIndexIngestionSource implements WebIndexIngestio
         'parsed_pages' => 0, 'business_identity_extracted' => 0, 'candidate_new_domains' => 0, 'existing_corpus_duplicates' => 0,
         'indexed_pages' => 0, 'duplicate_osm_refs' => 0, 'directory_or_social_skipped' => 0,
         'dns_resolution_failures' => 0, 'ssrf_policy_rejections' => 0, 'robots_denied' => 0, 'robots_unavailable' => 0,
+        'robots_dns_failures' => 0, 'robots_timeouts' => 0, 'robots_redirect_rejections' => 0, 'robots_transport_failures' => 0,
         'candidate_dns_failures' => 0, 'candidate_timeouts' => 0, 'candidate_redirect_rejections' => 0,
         'candidate_transport_failures' => 0, 'candidate_http_failures' => 0, 'candidate_non_html' => 0,
         'candidate_oversize' => 0, 'parse_failures' => 0, 'time_budget_exhausted' => 0, 'fetch_budget_exhausted' => 0];
