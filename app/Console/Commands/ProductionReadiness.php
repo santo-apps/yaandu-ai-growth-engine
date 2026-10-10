@@ -7,13 +7,15 @@ use Illuminate\Console\Command;
 use Illuminate\Console\Scheduling\Schedule;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Redis;
+use Illuminate\Support\Facades\Storage;
 use Laravel\Horizon\Contracts\MasterSupervisorRepository;
+use Illuminate\Support\Str;
 use Throwable;
 
 final class ProductionReadiness extends Command
 {
     protected $signature = 'production:readiness';
-    protected $description = 'Report production readiness without exposing secrets or changing state';
+    protected $description = 'Report production readiness without exposing secrets; verifies local storage with a temporary probe';
 
     /** @var array<string, array{status:string, detail:string}> */
     private array $checks = [];
@@ -75,13 +77,7 @@ final class ProductionReadiness extends Command
         $this->check('Pilot processing limits', $importLimit >= 10 && $importLimit <= 25 && $aiCallLimit > 0 && $aiTokenLimit > 0,
             'Require 10–25 rows per batch and positive daily AI call/token caps.');
 
-        $disk = (string) config('filesystems.default');
-        if ($disk !== 's3') $this->recordFailure('Object storage', 'Default disk is '.$disk.'; S3-compatible storage is required for production artifacts.');
-        elseif (filled(config('filesystems.disks.s3.bucket')) && filled(config('filesystems.disks.s3.key')) && filled(config('filesystems.disks.s3.secret'))) {
-            if (config('production_readiness.storage_runtime_verified')) $this->pass('Object storage', 'S3 is configured and deployment owner attests read/write/delete and private bucket verification.');
-            else $this->recordWarning('Object storage', 'S3 configuration detected; runtime read/write/delete has not been verified.');
-        }
-        else $this->recordFailure('Object storage', 'S3 is selected but required configuration is missing.');
+        $this->checkProductionStorage();
 
         $scheduled = count(app(Schedule::class)->events()) > 0;
         $this->check('Scheduler', $scheduled, $scheduled ? 'Application schedule contains events; host heartbeat still requires deployment verification.' : 'No scheduled tasks are registered.');
@@ -108,4 +104,85 @@ final class ProductionReadiness extends Command
     private function pass(string $name, string $detail): void { $this->checks[$name] = ['status' => 'PASS', 'detail' => $detail]; }
     private function recordFailure(string $name, string $detail): void { $this->checks[$name] = ['status' => 'FAIL', 'detail' => $detail]; }
     private function recordWarning(string $name, string $detail): void { $this->checks[$name] = ['status' => 'WARN', 'detail' => $detail]; }
+
+    private function checkProductionStorage(): void
+    {
+        $disk = (string) config('filesystems.default');
+
+        if ($disk === 's3') {
+            $configured = filled(config('filesystems.disks.s3.bucket'))
+                && filled(config('filesystems.disks.s3.key'))
+                && filled(config('filesystems.disks.s3.secret'));
+            if (! $configured) {
+                $this->recordFailure('Production storage', 'S3 is selected but required configuration is missing.');
+            } elseif (config('production_readiness.storage_runtime_verified')) {
+                $this->pass('Production storage', 'S3 is configured and deployment owner attests read/write/delete and private bucket verification.');
+            } else {
+                $this->recordWarning('Production storage', 'S3 configuration detected; runtime read/write/delete has not been verified.');
+            }
+
+            return;
+        }
+
+        if ($disk !== 'local') {
+            $this->recordFailure('Production storage', 'Unsupported default storage disk: '.$disk.'. Select verified private local storage or S3.');
+
+            return;
+        }
+
+        $privatePath = storage_path('app/private');
+        $privateRealPath = realpath($privatePath);
+        $publicRealPath = realpath(public_path());
+        $diskRealPath = realpath((string) config('filesystems.disks.local.root', ''));
+
+        if (! is_dir($privatePath) || $privateRealPath === false) {
+            $this->recordFailure('Production storage', 'Required private storage directory storage/app/private does not exist.');
+
+            return;
+        }
+
+        if ($publicRealPath === false || $privateRealPath === $publicRealPath
+            || str_starts_with($privateRealPath, rtrim($publicRealPath, DIRECTORY_SEPARATOR).DIRECTORY_SEPARATOR)) {
+            $this->recordFailure('Production storage', 'Private storage resolves inside the public web root.');
+
+            return;
+        }
+
+        if ($diskRealPath === false || $diskRealPath !== $privateRealPath) {
+            $this->recordFailure('Production storage', 'The local disk root must resolve to storage/app/private.');
+
+            return;
+        }
+
+        if (! is_writable($privateRealPath)) {
+            $this->recordFailure('Production storage', 'Private storage directory is not writable by the application.');
+
+            return;
+        }
+
+        $filesystem = Storage::disk('local');
+        $probePath = '.production-storage-probe-'.Str::uuid().'.tmp';
+        $probeContent = Str::random(48);
+        try {
+            if (! $filesystem->put($probePath, $probeContent)
+                || $filesystem->get($probePath) !== $probeContent
+                || ! $filesystem->delete($probePath)
+                || $filesystem->exists($probePath)) {
+                throw new \RuntimeException('Storage probe operation failed.');
+            }
+        } catch (Throwable) {
+            try { $filesystem->delete($probePath); } catch (Throwable) { /* Best-effort cleanup of a random probe file. */ }
+            $this->recordFailure('Production storage', 'Private storage write/read/delete probe failed.');
+
+            return;
+        }
+
+        if (! config('production_readiness.storage_runtime_verified')) {
+            $this->recordFailure('Production storage', 'Local storage probe passed, but PRODUCTION_STORAGE_RUNTIME_VERIFIED is not enabled.');
+
+            return;
+        }
+
+        $this->pass('Production storage', 'Private local storage path, permissions and runtime write/read/delete probe verified.');
+    }
 }
