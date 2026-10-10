@@ -57,11 +57,14 @@ final class WebsiteIntelligenceAgent implements AgentInterface
         $schema = $prompt->version >= 2 ? self::modelSchemaV2($approvedServices->keys()->all()) : self::modelSchema();
         $systemInstruction = $prompt->systemInstruction;
         if ($prompt->version >= 2) {
-            $offerings = $approvedServices->map(fn (object $service): array => [
-                'service_key' => $service->sku,
+            $offerings = $approvedServices->flatMap(fn ($services, string $serviceKey) => $services->map(fn (object $service): array => [
+                'service_key' => $serviceKey,
+                'canonical_service_key' => $serviceKey,
+                'tenant_service_id' => $service->id,
+                'sku' => $service->sku,
                 'name' => $service->name,
                 'description' => mb_substr((string) ($service->description ?? ''), 0, 500),
-            ])->values()->all();
+            ]))->values()->all();
             $systemInstruction .= "\n\nTenant-approved active service offerings (the only offerings that may be recommended; map every recommendation to an exact service_key; if empty, return no service recommendations):\n".json_encode($offerings, JSON_THROW_ON_ERROR);
         }
         $response = $this->router->generate(
@@ -139,8 +142,8 @@ final class WebsiteIntelligenceAgent implements AgentInterface
             // a tenant service recommendation. V2 is constrained to the current catalog.
             if ($prompt->version < 2) continue;
             $serviceKey = (string) ($recommendation['service_key'] ?? '');
-            $catalogService = $approvedServices->get($serviceKey);
-            if (! $catalogService) continue;
+            $catalogServices = $approvedServices->get($serviceKey);
+            if (! $catalogServices || $catalogServices->isEmpty()) continue;
             $evidenceIds = array_values(array_intersect($recommendation['evidence_ids'] ?? [], array_keys($validatedEvidence)));
             $linkedOpportunityEvidence = array_values(array_intersect($evidenceIds, $opportunityEvidenceIds));
             $linkedNextActionEvidence = [];
@@ -152,13 +155,20 @@ final class WebsiteIntelligenceAgent implements AgentInterface
             $hasRequiredText = collect($requiredText)->every(fn (string $field): bool => filled($recommendation[$field] ?? null));
             $confidence = $recommendation['confidence'] ?? null;
             if (($recommendation['speculative'] ?? true) !== false || $evidenceIds === [] || $linkedOpportunityEvidence === [] || $linkedNextActionEvidence === [] || ! $hasRequiredText
-                || ! is_numeric($confidence) || $confidence < 0 || $confidence > 1 || ! $catalogService->id) continue;
-            $recommendations[] = [...$recommendation, 'service_key' => $serviceKey, 'service_name' => $catalogService->name,
-                'tenant_service_id' => $catalogService->id, 'evidence_ids' => $evidenceIds];
+                || ! is_numeric($confidence) || $confidence < 0 || $confidence > 1) continue;
+            $matchingServices = $catalogServices->map(fn (object $service): array => [
+                'id' => $service->id, 'sku' => $service->sku, 'name' => $service->name,
+            ])->values()->all();
+            $recommendations[] = [...$recommendation, 'service_key' => $serviceKey,
+                'service_names' => array_values(array_unique(array_column($matchingServices, 'name'))),
+                'tenant_services' => $matchingServices,
+                // Keep the legacy singular field only when it is unambiguous.
+                ...(count($matchingServices) === 1 ? ['service_name' => $matchingServices[0]['name'], 'tenant_service_id' => $matchingServices[0]['id']] : []),
+                'evidence_ids' => $evidenceIds];
             foreach ($evidenceIds as $evidenceId) {
                 $citation = $validatedEvidence[$evidenceId] ?? null;
                 if (! $citation) continue;
-                $insights[] = ['statement' => mb_substr(trim($catalogService->name.': '.($recommendation['rationale'] ?? $recommendation['recommendation'] ?? '')), 0, 2000),
+                $insights[] = ['statement' => mb_substr(trim(implode(' / ', array_column($matchingServices, 'name')).': '.($recommendation['rationale'] ?? $recommendation['recommendation'] ?? '')), 0, 2000),
                     'kind' => 'service_recommendation', 'confidence' => $recommendation['confidence'] ?? 0.5,
                     'source_url' => $citation['source_url'], 'evidence' => $citation['excerpt']];
             }

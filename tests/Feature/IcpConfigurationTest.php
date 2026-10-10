@@ -60,13 +60,26 @@ final class IcpConfigurationTest extends TestCase
     public function test_owner_can_activate_a_valid_version_and_activation_is_audited(): void
     {
         [$tenant, $owner] = $this->workspace('icp-config-valid', 'owner');
-        DB::table('tenant_services')->insert(['id' => (string) Str::uuid(), 'tenant_id' => $tenant->id, 'sku' => 'website_modernization',
+        DB::table('tenant_services')->insert(['id' => (string) Str::uuid(), 'tenant_id' => $tenant->id, 'sku' => 'YND-WEB-PERF',
+            'canonical_service_key' => 'website_modernization',
             'name' => 'Website modernization', 'description' => 'Configured test service', 'unit_price' => '100.00', 'currency' => 'INR',
             'active' => true, 'commercial_model' => 'FIXED_PRICE', 'unit' => 'project', 'approved_by' => $owner->id,
             'created_at' => now(), 'updated_at' => now()]);
+        DB::table('tenant_services')->insert([
+            ['id' => (string) Str::uuid(), 'tenant_id' => $tenant->id, 'sku' => 'unmapped-taxonomy-sku', 'canonical_service_key' => null,
+                'name' => 'Unmapped', 'unit_price' => '100.00', 'currency' => 'INR', 'active' => true, 'approved_by' => $owner->id, 'created_at' => now(), 'updated_at' => now()],
+            ['id' => (string) Str::uuid(), 'tenant_id' => $tenant->id, 'sku' => 'inactive-ai', 'canonical_service_key' => 'ai_agents',
+                'name' => 'Inactive AI', 'unit_price' => '100.00', 'currency' => 'INR', 'active' => false, 'approved_by' => $owner->id, 'created_at' => now(), 'updated_at' => now()],
+            ['id' => (string) Str::uuid(), 'tenant_id' => $tenant->id, 'sku' => 'unapproved-seo', 'canonical_service_key' => 'seo',
+                'name' => 'Unapproved SEO', 'unit_price' => '100.00', 'currency' => 'INR', 'active' => true, 'approved_by' => null, 'created_at' => now(), 'updated_at' => now()],
+        ]);
         Sanctum::actingAs($owner);
         $configuration = $this->configuration();
         $configuration['service_fit']['service_keys'] = ['website_modernization'];
+        $this->withHeader('X-Tenant-ID', $tenant->id)->getJson('/api/v1/icp-configurations')->assertOk()
+            ->assertJsonPath('available_service_keys.0', 'website_modernization')
+            ->assertJsonPath('available_service_capabilities.0.key', 'website_modernization')
+            ->assertJsonPath('available_service_capabilities.0.label', 'Website modernization');
         $draft = $this->withHeader('X-Tenant-ID', $tenant->id)->postJson('/api/v1/icp-configurations', $configuration)->assertCreated()->json();
         $active = $this->withHeader('X-Tenant-ID', $tenant->id)->postJson('/api/v1/icp-configurations/'.$draft['id'].'/activate')->assertOk()
             ->assertJsonPath('status', 'active')->assertJsonPath('activated_by', $owner->id)->json();

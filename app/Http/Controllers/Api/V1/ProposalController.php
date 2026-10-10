@@ -12,6 +12,7 @@ use App\Proposals\GenerateProposalCommand;
 use App\Proposals\ProposalGenerationService;
 use App\Proposals\ProposalDocumentRendererInterface;
 use App\Proposals\ProposalStatus;
+use App\WebsiteIntelligence\YaanduServiceTaxonomy;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Crypt;
@@ -62,10 +63,17 @@ class ProposalController extends Controller
     }
     public function services() { return $this->activeServices(app('tenant.id'))->orderBy('name')->get(); }
 
+    public function serviceCapabilities(Request $request)
+    {
+        $this->authorizeManager($request);
+        return response()->json(YaanduServiceTaxonomy::SERVICES);
+    }
+
     public function storeService(Request $request)
     {
         $this->authorizeManager($request);
         $data = $request->validate(['sku' => ['required','string','max:80'], 'name' => ['required','string','max:255'], 'description' => ['nullable','string','max:4000'],
+            'canonical_service_key' => ['sometimes','nullable',Rule::in(YaanduServiceTaxonomy::keys())],
             'unit_price' => [Rule::requiredIf(($request->input('commercial_model') ?? 'FIXED_PRICE') !== 'custom_quote'),'nullable','regex:/^\d{1,12}(\.\d{1,2})?$/'], 'currency' => ['required','string','size:3','alpha'], 'active' => ['sometimes','boolean'],
             'category' => ['nullable','string','max:100'], 'capabilities' => ['sometimes','array','max:20'], 'capabilities.*' => ['string','max:500'],
             'standard_deliverables' => ['sometimes','array','max:30'], 'standard_deliverables.*' => ['string','max:500'], 'optional_deliverables' => ['sometimes','array','max:30'], 'optional_deliverables.*' => ['string','max:500'],
@@ -87,6 +95,7 @@ class ProposalController extends Controller
         $record = TenantService::where('tenant_id', app('tenant.id'))->findOrFail($service);
         $nextModel = $request->input('commercial_model', $record->commercial_model);
         $data = $request->validate(['sku' => ['sometimes','required','string','max:80'], 'name' => ['sometimes','required','string','max:255'], 'description' => ['sometimes','nullable','string','max:4000'],
+            'canonical_service_key' => ['sometimes','nullable',Rule::in(YaanduServiceTaxonomy::keys())],
             'unit_price' => [Rule::requiredIf(($request->exists('unit_price') && $nextModel !== 'custom_quote') || ($request->exists('commercial_model') && $nextModel !== 'custom_quote' && $record->commercial_model === 'custom_quote')),'nullable','regex:/^\d{1,12}(\.\d{1,2})?$/'], 'currency' => ['sometimes','required','string','size:3','alpha'], 'active' => ['sometimes','boolean'],
             'category' => ['sometimes','nullable','string','max:100'], 'capabilities' => ['sometimes','array','max:20'], 'capabilities.*' => ['string','max:500'],
             'standard_deliverables' => ['sometimes','array','max:30'], 'standard_deliverables.*' => ['string','max:500'], 'optional_deliverables' => ['sometimes','array','max:30'], 'optional_deliverables.*' => ['string','max:500'],
