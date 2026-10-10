@@ -6,14 +6,17 @@ use App\SalesIntelligence\SalesIntelligenceMode;
 use Illuminate\Console\Command;
 use Illuminate\Console\Scheduling\Schedule;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Mail;
 use Illuminate\Support\Facades\Redis;
+use Illuminate\Support\Facades\Storage;
 use Laravel\Horizon\Contracts\MasterSupervisorRepository;
+use Illuminate\Support\Str;
 use Throwable;
 
 final class ProductionReadiness extends Command
 {
     protected $signature = 'production:readiness';
-    protected $description = 'Report production readiness without exposing secrets or changing state';
+    protected $description = 'Report production readiness without exposing secrets; verifies local storage with a temporary probe';
 
     /** @var array<string, array{status:string, detail:string}> */
     private array $checks = [];
@@ -75,13 +78,7 @@ final class ProductionReadiness extends Command
         $this->check('Pilot processing limits', $importLimit >= 10 && $importLimit <= 25 && $aiCallLimit > 0 && $aiTokenLimit > 0,
             'Require 10–25 rows per batch and positive daily AI call/token caps.');
 
-        $disk = (string) config('filesystems.default');
-        if ($disk !== 's3') $this->recordFailure('Object storage', 'Default disk is '.$disk.'; S3-compatible storage is required for production artifacts.');
-        elseif (filled(config('filesystems.disks.s3.bucket')) && filled(config('filesystems.disks.s3.key')) && filled(config('filesystems.disks.s3.secret'))) {
-            if (config('production_readiness.storage_runtime_verified')) $this->pass('Object storage', 'S3 is configured and deployment owner attests read/write/delete and private bucket verification.');
-            else $this->recordWarning('Object storage', 'S3 configuration detected; runtime read/write/delete has not been verified.');
-        }
-        else $this->recordFailure('Object storage', 'S3 is selected but required configuration is missing.');
+        $this->checkProductionStorage();
 
         $scheduled = count(app(Schedule::class)->events()) > 0;
         $this->check('Scheduler', $scheduled, $scheduled ? 'Application schedule contains events; host heartbeat still requires deployment verification.' : 'No scheduled tasks are registered.');
@@ -91,8 +88,7 @@ final class ProductionReadiness extends Command
         $this->check('Secure session cookie', (bool) config('session.secure'), 'Secure session cookie must be enabled behind HTTPS.');
         if (config('production_readiness.trusted_edge_verified')) $this->pass('Trusted hosts / proxies', 'Deployment owner attests HTTPS edge, host allow-list and trusted proxy configuration.');
         else $this->recordWarning('Trusted hosts / proxies', 'Deployment proxy and host allow-list must be verified at the edge.');
-        $mail = (string) config('mail.default');
-        $this->check('Mail', $mail !== 'log' && $mail !== 'array', 'Mail transport: '.$mail.'. Confirm provider delivery before enabling notifications.');
+        $this->checkMail();
         $this->check('Backups', (bool) config('production_readiness.backup_verified'), 'Backup schedule and isolated restore evidence are deployment-owned.');
         $this->check('Monitoring', (bool) config('production_readiness.monitoring_configured'), 'HTTP, DB, Redis, Horizon, queue and provider alerts are deployment-owned.');
 
@@ -108,4 +104,127 @@ final class ProductionReadiness extends Command
     private function pass(string $name, string $detail): void { $this->checks[$name] = ['status' => 'PASS', 'detail' => $detail]; }
     private function recordFailure(string $name, string $detail): void { $this->checks[$name] = ['status' => 'FAIL', 'detail' => $detail]; }
     private function recordWarning(string $name, string $detail): void { $this->checks[$name] = ['status' => 'WARN', 'detail' => $detail]; }
+
+    private function checkProductionStorage(): void
+    {
+        $disk = (string) config('filesystems.default');
+
+        if ($disk === 's3') {
+            $configured = filled(config('filesystems.disks.s3.bucket'))
+                && filled(config('filesystems.disks.s3.key'))
+                && filled(config('filesystems.disks.s3.secret'));
+            if (! $configured) {
+                $this->recordFailure('Production storage', 'S3 is selected but required configuration is missing.');
+            } elseif (config('production_readiness.storage_runtime_verified')) {
+                $this->pass('Production storage', 'S3 is configured and deployment owner attests read/write/delete and private bucket verification.');
+            } else {
+                $this->recordWarning('Production storage', 'S3 configuration detected; runtime read/write/delete has not been verified.');
+            }
+
+            return;
+        }
+
+        if ($disk !== 'local') {
+            $this->recordFailure('Production storage', 'Unsupported default storage disk: '.$disk.'. Select verified private local storage or S3.');
+
+            return;
+        }
+
+        $privatePath = storage_path('app/private');
+        $privateRealPath = realpath($privatePath);
+        $publicRealPath = realpath(public_path());
+        $diskRealPath = realpath((string) config('filesystems.disks.local.root', ''));
+
+        if (! is_dir($privatePath) || $privateRealPath === false) {
+            $this->recordFailure('Production storage', 'Required private storage directory storage/app/private does not exist.');
+
+            return;
+        }
+
+        if ($publicRealPath === false || $privateRealPath === $publicRealPath
+            || str_starts_with($privateRealPath, rtrim($publicRealPath, DIRECTORY_SEPARATOR).DIRECTORY_SEPARATOR)) {
+            $this->recordFailure('Production storage', 'Private storage resolves inside the public web root.');
+
+            return;
+        }
+
+        if ($diskRealPath === false || $diskRealPath !== $privateRealPath) {
+            $this->recordFailure('Production storage', 'The local disk root must resolve to storage/app/private.');
+
+            return;
+        }
+
+        if (! is_writable($privateRealPath)) {
+            $this->recordFailure('Production storage', 'Private storage directory is not writable by the application.');
+
+            return;
+        }
+
+        $filesystem = Storage::disk('local');
+        $probePath = '.production-storage-probe-'.Str::uuid().'.tmp';
+        $probeContent = Str::random(48);
+        try {
+            if (! $filesystem->put($probePath, $probeContent)
+                || $filesystem->get($probePath) !== $probeContent
+                || ! $filesystem->delete($probePath)
+                || $filesystem->exists($probePath)) {
+                throw new \RuntimeException('Storage probe operation failed.');
+            }
+        } catch (Throwable) {
+            try { $filesystem->delete($probePath); } catch (Throwable) { /* Best-effort cleanup of a random probe file. */ }
+            $this->recordFailure('Production storage', 'Private storage write/read/delete probe failed.');
+
+            return;
+        }
+
+        if (! config('production_readiness.storage_runtime_verified')) {
+            $this->recordFailure('Production storage', 'Local storage probe passed, but PRODUCTION_STORAGE_RUNTIME_VERIFIED is not enabled.');
+
+            return;
+        }
+
+        $this->pass('Production storage', 'Private local storage path, permissions and runtime write/read/delete probe verified.');
+    }
+
+    private function checkMail(): void
+    {
+        if (! config('production_readiness.mail_enabled', false)) {
+            $this->pass('Mail', 'Outbound mail is intentionally disabled for the controlled pilot.');
+
+            return;
+        }
+
+        $mailer = strtolower(trim((string) config('mail.default', '')));
+        $mailerConfig = config('mail.mailers.'.$mailer);
+        $transport = is_array($mailerConfig) ? strtolower(trim((string) ($mailerConfig['transport'] ?? ''))) : '';
+        $configured = $mailer !== '' && ! in_array($mailer, ['log', 'array'], true)
+            && $transport !== '' && ! in_array($transport, ['log', 'array'], true);
+
+        if ($configured && $transport === 'smtp') {
+            $host = (string) ($mailerConfig['host'] ?? '');
+            $port = filter_var($mailerConfig['port'] ?? null, FILTER_VALIDATE_INT);
+            $configured = filled($host) && $port !== false && $port >= 1 && $port <= 65535;
+        } elseif ($configured) {
+            $mailerOptions = array_filter($mailerConfig, static fn (mixed $value, string|int $key): bool => $key !== 'transport' && filled($value), ARRAY_FILTER_USE_BOTH);
+            $serviceOptions = config('services.'.$mailer, []);
+            $configured = $mailerOptions !== [] || (is_array($serviceOptions) && $serviceOptions !== []);
+        }
+
+        if (! $configured) {
+            $this->recordFailure('Mail', 'Outbound mail is enabled but no usable non-log/non-array transport configuration is present.');
+
+            return;
+        }
+
+        try {
+            // Resolve the configured driver without sending a message or opening a provider connection.
+            Mail::mailer($mailer)->getSymfonyTransport();
+        } catch (Throwable) {
+            $this->recordFailure('Mail', 'Outbound mail is enabled but Laravel cannot resolve the configured transport.');
+
+            return;
+        }
+
+        $this->pass('Mail', 'Mail transport is configured. Confirm provider delivery before enabling notifications; no delivery is assumed.');
+    }
 }
