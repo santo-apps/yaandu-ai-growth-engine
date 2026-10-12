@@ -131,7 +131,7 @@ class PhaseOneRemediationTest extends TestCase
         $url = 'https://evidence.test/about';
         $excerpt = 'We build industrial pumps for factories. Powered by WordPress. Avery Stone is Chief Executive Officer.';
         $key = "tenants/{$tenant->id}/crawls/{$scanId}/page.html";
-        Storage::disk('local')->put($key, '<p>'.$excerpt.'</p><a href="mailto:hello@evidence.test">Contact</a>');
+        Storage::disk('local')->put($key, '<html><head><meta name="generator" content="WordPress"></head><body><p>'.$excerpt.'</p><a href="mailto:hello@evidence.test">Contact</a></body></html>');
         DB::table('website_pages')->insert(['id' => $pageId, 'tenant_id' => $tenant->id, 'website_scan_id' => $scanId,
             'requested_url' => $url, 'final_url' => $url, 'title' => 'About us', 'http_status' => 200, 'object_key' => $key,
             'extracted_text' => $excerpt, 'depth' => 1, 'created_at' => now(), 'updated_at' => now()]);
@@ -144,10 +144,11 @@ class PhaseOneRemediationTest extends TestCase
             'opportunities' => [], 'service_recommendations' => [], 'unknowns' => [],
             'evidence' => [['evidence_id' => $pageId, 'source_url' => $url, 'excerpt' => 'Powered by WordPress.']], 'confidence' => 0.9];
         $provider = new class($responseData) implements AIProviderInterface {
+            public ?AIRequest $lastRequest = null;
             public function __construct(private array $data) {}
             public function providerKey(): string { return 'anthropic'; }
             public function capabilities(): array { return ['structured_json']; }
-            public function generate(AIRequest $request, string $model): AIResponse { return new AIResponse($this->data, 'anthropic', $model); }
+            public function generate(AIRequest $request, string $model): AIResponse { $this->lastRequest = $request; return new AIResponse($this->data, 'anthropic', $model); }
         };
         $router = new AIModelRouter([$provider], config('ai.tasks'));
         DB::table('prompt_templates')->insert(['id' => (string) Str::uuid(), 'tenant_id' => $tenant->id, 'agent_key' => 'WebsiteIntelligenceAgent', 'version' => 1,
@@ -162,8 +163,8 @@ class PhaseOneRemediationTest extends TestCase
 
         self::assertSame('succeeded', DB::table('agent_runs')->where('id', $runId)->value('status'));
         self::assertSame(2, DB::table('agent_events')->where('tenant_id', $tenant->id)->where('agent_run_id', $runId)->count());
-        self::assertSame(1, DB::table('website_issues')->where('tenant_id', $tenant->id)->where('website_scan_id', $scanId)->count());
-        self::assertSame(1, DB::table('website_technologies')->where('tenant_id', $tenant->id)->where('website_scan_id', $scanId)->count());
+        self::assertSame(1, DB::table('website_issues')->where('tenant_id', $tenant->id)->where('website_scan_id', $scanId)->where('detector_version', 'ai-v1')->count());
+        self::assertSame(1, DB::table('website_technologies')->where('tenant_id', $tenant->id)->where('website_scan_id', $scanId)->where('detection_method', 'ai_inference')->count());
         self::assertSame(1, DB::table('lead_insights')->where('tenant_id', $tenant->id)->where('agent_run_id', $runId)->count());
         self::assertSame(1, DB::table('lead_evidence')->where('tenant_id', $tenant->id)->count());
         $structuredResult = DB::table('website_intelligence_results')->where('tenant_id', $tenant->id)->where('agent_run_id', $runId)->first();
@@ -173,6 +174,8 @@ class PhaseOneRemediationTest extends TestCase
         self::assertSame('anthropic', $structuredResult->provider);
         self::assertSame('test-model', $structuredResult->model);
         self::assertSame(1, $structuredResult->prompt_version);
+        self::assertSame('WordPress', collect($provider->lastRequest?->evidence[0]['deterministic_observations'] ?? [])->firstWhere('name', 'WordPress')['name'] ?? null,
+            'The Website Intelligence request receives the persisted deterministic technical evidence.');
         self::assertSame($runId, $structuredResult->agent_run_id);
         self::assertGreaterThanOrEqual(0, (int) $structuredResult->execution_duration_ms);
         self::assertLessThan(30_000, (int) $structuredResult->execution_duration_ms, 'Execution duration must use elapsed runtime, not a timezone-shifted database timestamp.');
@@ -182,13 +185,13 @@ class PhaseOneRemediationTest extends TestCase
         self::assertSame($url, json_decode(DB::table('website_issues')->where('tenant_id', $tenant->id)->value('evidence'), true)['source_url']);
         self::assertSame(0, DB::table('lead_insights')->where('tenant_id', $otherTenant->id)->count());
         self::assertSame(1, count($result->data['issues']));
-        self::assertSame($runId, DB::table('website_issues')->where('tenant_id', $tenant->id)->where('website_scan_id', $scanId)->value('agent_run_id'));
+        self::assertSame($runId, DB::table('website_issues')->where('tenant_id', $tenant->id)->where('website_scan_id', $scanId)->where('detector_version', 'ai-v1')->value('agent_run_id'));
 
         $secondRunId = (string) Str::uuid();
         DB::table('agent_runs')->insert(['id' => $secondRunId, 'tenant_id' => $tenant->id, 'agent_key' => $agent->name(), 'status' => 'running', 'created_at' => now(), 'updated_at' => now()]);
         (new AgentOrchestrator([$agent]))->run($agent->name(), $tenant->id, ['website_scan_id' => $scanId], existingRunId: $secondRunId);
-        self::assertSame(2, DB::table('website_issues')->where('tenant_id', $tenant->id)->where('website_scan_id', $scanId)->count());
-        self::assertSame(2, DB::table('website_technologies')->where('tenant_id', $tenant->id)->where('website_scan_id', $scanId)->count());
+        self::assertSame(2, DB::table('website_issues')->where('tenant_id', $tenant->id)->where('website_scan_id', $scanId)->where('detector_version', 'ai-v1')->count());
+        self::assertSame(2, DB::table('website_technologies')->where('tenant_id', $tenant->id)->where('website_scan_id', $scanId)->where('detection_method', 'ai_inference')->count());
         self::assertSame(2, DB::table('website_intelligence_results')->where('tenant_id', $tenant->id)->where('company_id', $company->id)->count());
         self::assertSame($runId, DB::table('website_intelligence_results')->where('tenant_id', $tenant->id)->where('agent_run_id', $runId)->value('agent_run_id'));
         $owner = User::create(['name' => 'Intelligence owner', 'email' => 'intelligence-owner@example.test', 'password' => 'password']);

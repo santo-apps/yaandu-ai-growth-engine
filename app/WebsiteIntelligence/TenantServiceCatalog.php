@@ -8,12 +8,12 @@ use Illuminate\Support\Facades\DB;
 /** The only source of sellable services for Website Intelligence recommendations. */
 final class TenantServiceCatalog
 {
-    /** @return Collection<string, object> keyed by the canonical service key */
+    /** @return Collection<string, Collection<int, object>> keyed by canonical capability, retaining every mapped commercial service */
     public function recommendationServices(string $tenantId): Collection
     {
         return $this->activeApprovedServices($tenantId)
-            ->filter(fn (object $service): bool => in_array((string) $service->sku, YaanduServiceTaxonomy::keys(), true))
-            ->keyBy('sku');
+            ->filter(fn (object $service): bool => in_array((string) $service->canonical_service_key, YaanduServiceTaxonomy::keys(), true))
+            ->groupBy('canonical_service_key');
     }
 
     /** @return Collection<int, object> */
@@ -26,6 +26,6 @@ final class TenantServiceCatalog
             ->where(fn ($query) => $query->whereNull('effective_from')->orWhere('effective_from', '<=', now()))
             ->where(fn ($query) => $query->whereNull('effective_until')->orWhere('effective_until', '>=', now()))
             ->orderBy('sku')
-            ->get(['id', 'sku', 'name', 'description']);
+            ->get(['id', 'sku', 'canonical_service_key', 'name', 'description']);
     }
 }

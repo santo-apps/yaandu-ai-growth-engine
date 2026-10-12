@@ -46,8 +46,14 @@ final class LeadEvidenceBuilder
         $issuesQuery = $scan ? DB::table('website_issues')->where('tenant_id', $tenantId)->where('website_scan_id', $scan->id) : null;
         $technologyQuery = $scan ? DB::table('website_technologies')->where('tenant_id', $tenantId)->where('website_scan_id', $scan->id) : null;
         if ($latestIntelligence) {
-            $issuesQuery?->where('agent_run_id', $latestIntelligence->agent_run_id);
-            $technologyQuery?->where('agent_run_id', $latestIntelligence->agent_run_id);
+            // Deterministic crawl evidence is scan-scoped, not owned by an AI run.
+            // Keep it visible alongside findings from the latest intelligence run.
+            $issuesQuery?->where(fn ($query) => $query
+                ->where(fn ($deterministic) => $deterministic->whereNull('agent_run_id')->where('detector_version', 'deterministic-v1'))
+                ->orWhere('agent_run_id', $latestIntelligence->agent_run_id));
+            $technologyQuery?->where(fn ($query) => $query
+                ->where(fn ($deterministic) => $deterministic->whereNull('agent_run_id')->where('detection_method', 'deterministic-v1'))
+                ->orWhere('agent_run_id', $latestIntelligence->agent_run_id));
         }
         $issues = $issuesQuery?->get() ?? collect();
         $technologies = $technologyQuery?->get() ?? collect();
@@ -70,7 +76,15 @@ final class LeadEvidenceBuilder
         };
         $outdated = $issue(['outdated', 'legacy', 'obsolete', 'deprecated', 'unmaintained', 'end of life']);
         $mobile = $issue(['mobile', 'responsive', 'viewport', 'touch target']);
-        $leadCapture = $issue(['lead capture', 'contact form', 'conversion', 'call to action', 'contact method']);
+        $observedLeadCaptureMechanism = $issues->firstWhere('type', 'lead_capture_mechanism_present');
+        $leadCapture = $issues->first(function (object $item): bool {
+            if ($item->type === 'lead_capture_mechanism_present') return false;
+            $text = $this->normalize($item->type.' '.$item->summary);
+            foreach (['lead capture', 'contact form', 'conversion', 'call to action', 'contact method'] as $pattern) {
+                if (str_contains($text, $pattern)) return true;
+            }
+            return false;
+        });
 
         $pageHas = function (string $needle) use ($pages): bool {
             foreach ($pages as $page) {
@@ -94,14 +108,27 @@ final class LeadEvidenceBuilder
             }
             return null;
         };
-        $whatsapp = count($pages) > 0 && ($pageHas('wa.me/') || $pageHas('api.whatsapp.com')
-            || $pageHas('whatsapp.com/') || $pageHas('whatsapp://') || $pageHas('message us on whatsapp'));
+        $whatsappTechnology = $technologies->first(fn (object $tech) => str_contains($this->normalize($tech->name.' '.$tech->category), 'whatsapp'));
+        $whatsapp = (bool) $whatsappTechnology || (count($pages) > 0 && ($pageHas('wa.me/') || $pageHas('api.whatsapp.com')
+            || $pageHas('whatsapp.com/') || $pageHas('whatsapp://') || $pageHas('message us on whatsapp')));
         $crm = $technologies->first(fn (object $tech) => str_contains($this->normalize($tech->category.' '.$tech->name), 'crm'));
         $explicitNoWhatsapp = $pageHas('we do not use whatsapp') || $pageHas('whatsapp is not available') || $pageHas('do not contact us on whatsapp');
         $explicitNoCrm = $pageHas('we do not use a crm') || $pageHas('we do not use crm') || $pageHas('crm is not used');
         $techOpportunity = $technologies->first(fn (object $tech) => (bool) preg_match('/legacy|deprecated|flash|outdated|unsupported/i', $tech->name.' '.$tech->category));
 
         $reference = fn (?object $record, string $source, ?string $url = null) => $record ? ['source' => $source, 'id' => $record->id ?? null, 'url' => $url] : null;
+        $issueReference = function (?object $record): ?array {
+            if (! $record) return null;
+            $evidence = is_array($record->evidence ?? null) ? $record->evidence : json_decode($record->evidence ?? '{}', true);
+            return ['source' => 'website_issue', 'id' => $record->id, 'page_id' => $record->website_page_id,
+                'url' => $evidence['source_url'] ?? null, 'observed' => $evidence['excerpt'] ?? null];
+        };
+        $technologyReference = function (?object $record): ?array {
+            if (! $record) return null;
+            $evidence = is_array($record->evidence ?? null) ? $record->evidence : json_decode($record->evidence ?? '{}', true);
+            return ['source' => 'detected_technology', 'id' => $record->id, 'page_id' => $record->website_page_id,
+                'name' => $record->name, 'url' => $evidence['source_url'] ?? null, 'observed' => $evidence['marker'] ?? null];
+        };
         $signal = static fn (string $status, ?array $ref = null, ?string $reason = null): array => [
             'status' => $status,
             'present' => $status === 'positive',
@@ -125,11 +152,12 @@ final class LeadEvidenceBuilder
                 : (! $industryKnown
                     ? $signal('unknown', null, 'Company industry evidence is missing.')
                     : $known($industryMatch, ['source' => 'company_record', 'field' => 'industry', 'value' => $company->industry, 'criteria' => $industries], 'Company industry matches configured ICP industries.', 'Company industry does not match configured ICP industries.')),
-            'outdated_website' => $outdated ? $signal('positive', $reference($outdated, 'website_issue'), 'A stored website issue identifies outdated technology or content.') : $signal('unknown'),
-            'poor_mobile_ux' => $mobile ? $signal('positive', $reference($mobile, 'website_issue'), 'A stored website issue identifies a mobile usability gap.') : $signal('unknown'),
-            'poor_lead_capture' => $leadCapture ? $signal('positive', $reference($leadCapture, 'website_issue'), 'A stored website issue identifies a lead-capture gap.') : $signal('unknown'),
+            'outdated_website' => $outdated ? $signal('positive', $issueReference($outdated), 'A stored website issue identifies outdated technology or content.') : $signal('unknown'),
+            'poor_mobile_ux' => $mobile ? $signal('positive', $issueReference($mobile), 'A stored website issue identifies a mobile usability gap.') : $signal('unknown'),
+            'poor_lead_capture' => $leadCapture ? $signal('positive', $issueReference($leadCapture), 'A stored website issue identifies a lead-capture gap.')
+                : ($observedLeadCaptureMechanism ? $signal('negative', $issueReference($observedLeadCaptureMechanism), 'A public contact or enquiry mechanism is present; no capture deficiency is inferred.') : $signal('unknown')),
             'no_whatsapp' => $signal($whatsappState,
-                $whatsapp ? $pageReference('wa.me/', 'A WhatsApp contact link is present, contradicting the no-WhatsApp opportunity.')
+                $whatsapp ? $technologyReference($whatsappTechnology) ?? $pageReference('wa.me/', 'A WhatsApp contact link is present, contradicting the no-WhatsApp opportunity.')
                     ?? $pageReference('api.whatsapp.com', 'A WhatsApp contact link is present, contradicting the no-WhatsApp opportunity.')
                     ?? $pageReference('whatsapp.com/', 'A WhatsApp contact link is present, contradicting the no-WhatsApp opportunity.')
                     ?? $pageReference('whatsapp://', 'A WhatsApp contact link is present, contradicting the no-WhatsApp opportunity.')

@@ -16,11 +16,13 @@ final class IcpConfigurationController extends Controller
     {
         $this->authorizeManager($request);
         $tenantId = (string) app('tenant.id');
+        $eligibleServiceKeys = app(TenantServiceCatalog::class)->recommendationServices($tenantId)->keys();
 
         return response()->json([
             'active' => DB::table('tenant_icp_configurations')->where('tenant_id', $tenantId)->where('status', 'active')->first(),
             'versions' => DB::table('tenant_icp_configurations')->where('tenant_id', $tenantId)->orderByDesc('version')->get(),
-            'available_service_keys' => app(TenantServiceCatalog::class)->recommendationServices($tenantId)->keys()->values(),
+            'available_service_keys' => $eligibleServiceKeys->values(),
+            'available_service_capabilities' => $eligibleServiceKeys->map(fn (string $key): array => ['key' => $key, 'label' => YaanduServiceTaxonomy::SERVICES[$key]])->values(),
         ]);
     }
 

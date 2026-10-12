@@ -191,6 +191,7 @@ Route::prefix('v1')->group(function (): void {
     Route::put('/opportunities/{id}/value', [SalesController::class, 'updateValue']);
     Route::post('/opportunities/{id}/qualified', [SalesController::class, 'markQualified']);
     Route::post('/opportunities/{id}/not-qualified', [SalesController::class, 'markNotQualified']);
+    Route::get('/tenant-services/capabilities', [ProposalController::class, 'serviceCapabilities']);
     Route::get('/tenant-services', [ProposalController::class, 'services']);
     Route::post('/tenant-services', [ProposalController::class, 'storeService']);
     Route::patch('/tenant-services/{service}', [ProposalController::class, 'updateService']);

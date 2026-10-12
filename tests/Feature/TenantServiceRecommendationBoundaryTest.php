@@ -14,6 +14,7 @@ use App\Models\User;
 use App\AI\ApprovedPromptRepository;
 use App\WebsiteIntelligence\PublicContactExtractor;
 use App\WebsiteIntelligence\TenantServiceCatalog;
+use App\WebsiteIntelligence\YaanduServiceTaxonomy;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Storage;
@@ -29,17 +30,18 @@ final class TenantServiceRecommendationBoundaryTest extends TestCase
     {
         [$tenant, $owner] = $this->workspace('service-boundary-a');
         [$other] = $this->workspace('service-boundary-b');
-        $this->service($tenant, $owner, 'website_modernization', true, true);
-        $this->service($tenant, $owner, 'custom_software', false, true);
-        $this->service($tenant, null, 'ai_agents', true, true);
-        $this->service($tenant, $owner, 'made_up_service', true, true);
-        $this->service($tenant, $owner, 'seo', true, false);
-        $this->service($other, $owner, 'ecommerce_development_migration', true, true);
+        $this->service($tenant, $owner, 'YND-WEB-PERF', true, true, 'website_modernization');
+        $this->service($tenant, $owner, 'YND-WEB-REVAMP', true, true, 'website_modernization');
+        $this->service($tenant, $owner, 'YND-CUSTOM', false, true, 'custom_software');
+        $this->service($tenant, null, 'YND-AI', true, true, 'ai_agents');
+        $this->service($tenant, $owner, 'seo', true, true); // A taxonomy-like SKU alone must not create capability eligibility.
+        $this->service($tenant, $owner, 'YND-EXPIRED', true, false, 'conversion_rate_optimization');
+        $this->service($other, $owner, 'YND-ECOM', true, true, 'ecommerce_development_migration');
 
         $services = app(TenantServiceCatalog::class)->recommendationServices($tenant->id);
 
         self::assertSame(['website_modernization'], $services->keys()->all());
-        self::assertSame('website_modernization', $services->first()->sku);
+        self::assertSame(['YND-WEB-PERF', 'YND-WEB-REVAMP'], $services->get('website_modernization')->pluck('sku')->all());
     }
 
     public function test_intelligence_readiness_is_blocked_without_recommendation_capable_tenant_services(): void
@@ -71,6 +73,37 @@ final class TenantServiceRecommendationBoundaryTest extends TestCase
             ->assertJsonPath('service_catalog.active_approved_count', 1)
             ->assertJsonPath('service_catalog.recommendation_capable_count', 0)
             ->assertJsonPath('service_catalog.prompt_service_key_compatible', false);
+    }
+
+    public function test_manager_can_map_a_commercial_sku_to_a_canonical_capability_without_changing_sku(): void
+    {
+        [$tenant, $owner] = $this->workspace('service-capability-mapping');
+        $serviceId = $this->service($tenant, $owner, 'YND-ECOM-MOD', true, true);
+        Sanctum::actingAs($owner);
+
+        $this->withHeader('X-Tenant-ID', $tenant->id)->getJson('/api/v1/tenant-services/capabilities')->assertOk()
+            ->assertJsonPath('ecommerce_development_migration', 'E-commerce development / migration');
+        $this->withHeader('X-Tenant-ID', $tenant->id)->patchJson('/api/v1/tenant-services/'.$serviceId, [
+            'canonical_service_key' => 'ecommerce_development_migration',
+        ])->assertOk()->assertJsonPath('sku', 'YND-ECOM-MOD')->assertJsonPath('canonical_service_key', 'ecommerce_development_migration');
+        $this->withHeader('X-Tenant-ID', $tenant->id)->patchJson('/api/v1/tenant-services/'.$serviceId, [
+            'canonical_service_key' => 'YND-WEB-PERF',
+        ])->assertUnprocessable();
+        self::assertDatabaseHas('tenant_services', ['tenant_id' => $tenant->id, 'id' => $serviceId,
+            'sku' => 'YND-ECOM-MOD', 'canonical_service_key' => 'ecommerce_development_migration']);
+    }
+
+    public function test_database_rejects_non_taxonomy_canonical_service_key(): void
+    {
+        [$tenant, $owner] = $this->workspace('invalid-canonical-key');
+        foreach (YaanduServiceTaxonomy::keys() as $index => $key) $this->service($tenant, $owner, 'VALID-'.$index, true, true, $key);
+        self::assertSame(count(YaanduServiceTaxonomy::keys()), DB::table('tenant_services')->where('tenant_id', $tenant->id)->whereNotNull('canonical_service_key')->count());
+        try {
+            $this->service($tenant, $owner, 'YND-INVALID', true, true, 'not_a_taxonomy_key');
+            self::fail('The tenant_services canonical-key constraint should reject unsupported values.');
+        } catch (\Illuminate\Database\QueryException) {
+            self::assertDatabaseMissing('tenant_services', ['tenant_id' => $tenant->id, 'sku' => 'YND-INVALID']);
+        }
     }
 
     public function test_v2_prompt_receives_only_tenant_approved_services_and_returns_no_recommendations_when_catalog_is_empty(): void
@@ -120,7 +153,8 @@ final class TenantServiceRecommendationBoundaryTest extends TestCase
     {
         Storage::fake('local');
         [$tenant, $owner] = $this->workspace('recommendation-evidence-chain');
-        $this->service($tenant, $owner, 'website_modernization', true, true);
+        $primaryService = $this->service($tenant, $owner, 'YND-WEB-PERF', true, true, 'website_modernization');
+        $secondaryService = $this->service($tenant, $owner, 'YND-WEB-REVAMP', true, true, 'website_modernization');
         $companyId = (string) Str::uuid(); $websiteId = (string) Str::uuid(); $scanId = (string) Str::uuid();
         $pageId = (string) Str::uuid(); $runId = (string) Str::uuid();
         DB::table('companies')->insert(['id' => $companyId, 'tenant_id' => $tenant->id, 'name' => 'Example Company', 'status' => 'new', 'created_at' => now(), 'updated_at' => now()]);
@@ -151,17 +185,27 @@ final class TenantServiceRecommendationBoundaryTest extends TestCase
             ], 'unknowns' => [], 'evidence' => [['evidence_id' => $pageId, 'source_url' => 'https://recommendation.test/', 'excerpt' => $excerpt]],
             'confidence' => 0.9, 'next_actions' => [['action' => 'Review the enquiry journey with the owner.', 'evidence_ids' => [$pageId], 'confidence' => 0.8]]];
         $provider = new class($data) implements AIProviderInterface {
+            public array $schema = [];
+            public string $systemInstruction = '';
             public function __construct(private array $data) {}
             public function providerKey(): string { return 'anthropic'; }
             public function capabilities(): array { return ['structured_json']; }
-            public function generate(AIRequest $request, string $model): AIResponse { return new AIResponse($this->data, 'anthropic', $model); }
+            public function generate(AIRequest $request, string $model): AIResponse { $this->schema = $request->outputSchema; $this->systemInstruction = $request->systemInstruction; return new AIResponse($this->data, 'anthropic', $model); }
         };
         $agent = new WebsiteIntelligenceAgent(new AIModelRouter([$provider], config('ai.tasks')), new PublicContactExtractor(app(ContactMethodValue::class)), app(ApprovedPromptRepository::class));
         $result = $agent->execute(new AgentContext($tenant->id, $runId, (string) $owner->id, (string) Str::uuid()), ['website_scan_id' => $scanId]);
 
         self::assertCount(1, $result->data['service_recommendations']);
         self::assertSame([$pageId], $result->data['service_recommendations'][0]['evidence_ids']);
-        self::assertNotEmpty($result->data['service_recommendations'][0]['tenant_service_id']);
+        self::assertSame('website_modernization', $result->data['service_recommendations'][0]['service_key']);
+        self::assertSame([$primaryService, $secondaryService], array_column($result->data['service_recommendations'][0]['tenant_services'], 'id'));
+        self::assertArrayNotHasKey('tenant_service_id', $result->data['service_recommendations'][0], 'A shared capability must not be silently assigned to one SKU.');
+        self::assertSame(['website_modernization'], $provider->schema['properties']['service_recommendations']['items']['properties']['service_key']['enum']);
+        $offeringsSection = explode("Tenant-approved active service offerings (the only offerings that may be recommended; map every recommendation to an exact service_key; if empty, return no service recommendations):\n", $provider->systemInstruction)[1] ?? '[]';
+        $offeringsJson = explode("\n\nApproved analysis template", $offeringsSection)[0];
+        $offerings = json_decode($offeringsJson, true, flags: JSON_THROW_ON_ERROR);
+        self::assertSame(['website_modernization', 'website_modernization'], array_column($offerings, 'service_key'));
+        self::assertSame(['YND-WEB-PERF', 'YND-WEB-REVAMP'], array_column($offerings, 'sku'));
         $persisted = DB::table('website_intelligence_results')->where('tenant_id', $tenant->id)->where('agent_run_id', $runId)->first();
         $structured = json_decode($persisted->structured_output, true);
         self::assertSame([$pageId], $structured['service_recommendations'][0]['evidence_ids']);
@@ -170,6 +214,9 @@ final class TenantServiceRecommendationBoundaryTest extends TestCase
         self::assertDatabaseHas('lead_evidence', ['tenant_id' => $tenant->id, 'source_url' => 'https://recommendation.test/', 'excerpt' => $excerpt]);
         self::assertDatabaseMissing('lead_insights', ['tenant_id' => $tenant->id, 'company_id' => $companyId, 'agent_run_id' => $runId,
             'kind' => 'opportunity', 'statement' => 'The website may need modernization.']);
+        self::assertSame(0, DB::table('campaign_recipients')->where('tenant_id', $tenant->id)->count());
+        self::assertSame(0, DB::table('outbound_messages')->where('tenant_id', $tenant->id)->count());
+        self::assertSame(0, DB::table('workflow_approvals')->where('tenant_id', $tenant->id)->where('action', 'SEND_OUTREACH')->count());
         self::assertSame('positive', app(\App\LeadScoring\LeadEvidenceBuilder::class)->build($tenant->id, $companyId)['strong_business_fit']['status'],
             'Only the separately validated opportunity may contribute to business-fit scoring.');
 
@@ -187,14 +234,16 @@ final class TenantServiceRecommendationBoundaryTest extends TestCase
         return [$tenant, $owner];
     }
 
-    private function service(Tenant $tenant, ?User $approvedBy, string $sku, bool $active, bool $effective): void
+    private function service(Tenant $tenant, ?User $approvedBy, string $sku, bool $active, bool $effective, ?string $canonicalKey = null): string
     {
+        $id = (string) Str::uuid();
         DB::table('tenant_services')->insert([
-            'id' => (string) Str::uuid(), 'tenant_id' => $tenant->id, 'sku' => $sku,
+            'id' => $id, 'tenant_id' => $tenant->id, 'sku' => $sku, 'canonical_service_key' => $canonicalKey,
             'name' => ucwords(str_replace('_', ' ', $sku)), 'description' => 'test', 'unit_price' => '1.00', 'currency' => 'INR',
             'active' => $active, 'commercial_model' => 'FIXED_PRICE', 'unit' => 'project', 'approved_by' => $approvedBy?->id,
             'effective_from' => $effective ? now()->subDay() : now()->addDay(), 'effective_until' => null,
             'created_at' => now(), 'updated_at' => now(),
         ]);
+        return $id;
     }
 }
