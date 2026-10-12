@@ -4,6 +4,7 @@ namespace App\AI;
 
 use RuntimeException;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
 
 final class AIModelRouter
@@ -59,19 +60,61 @@ final class AIModelRouter
             tenantId: $request->tenantId,
         );
         $usageId = $this->reserveUsage($effectiveRequest, $configuration['provider'], $configuration['model']);
+        $parseInputTokens = null;
+        $parseOutputTokens = null;
+        $parseLatencyMs = 0;
         try {
-            $response = $provider->generate($effectiveRequest, $configuration['model']);
+            $response = null;
+            $parseRetryCount = 0;
+            for ($parseAttempt = 0; $parseAttempt < 2; $parseAttempt++) {
+                try {
+                    $response = $provider->generate($effectiveRequest, $configuration['model']);
+                    break;
+                } catch (Providers\AIProviderException $error) {
+                    if ($request->task !== 'website_reasoning' || $parseAttempt !== 0 || ! $error->isResponseParseFailure()) throw $error;
+                    Log::notice('Retrying Website Intelligence after an unusable structured response.', [
+                        'correlation_id' => $request->correlationId,
+                        'task' => $request->task,
+                        'retry_count' => 1,
+                        ...$error->safeDiagnostics(),
+                    ]);
+                    $parseInputTokens = $this->addOptionalCounts($parseInputTokens, $error->inputTokens);
+                    $parseOutputTokens = $this->addOptionalCounts($parseOutputTokens, $error->outputTokens);
+                    $parseLatencyMs += $error->elapsedMs ?? 0;
+                    $parseRetryCount++;
+                }
+            }
+            if (! $response instanceof AIResponse) throw new RuntimeException('AI provider did not return a structured response.');
+            if ($parseRetryCount > 0) {
+                $response = new AIResponse($response->data, $response->provider, $response->model, $response->inputTokens,
+                    $response->outputTokens, $response->latencyMs, $response->httpStatus, $response->endpoint,
+                    [...$response->parseDiagnostics, 'parse_retry_count' => $parseRetryCount]);
+                $response = new AIResponse($response->data, $response->provider, $response->model,
+                    $this->addOptionalCounts($parseInputTokens, $response->inputTokens),
+                    $this->addOptionalCounts($parseOutputTokens, $response->outputTokens),
+                    $response->latencyMs === null && $parseLatencyMs === 0 ? null : $parseLatencyMs + ($response->latencyMs ?? 0),
+                    $response->httpStatus, $response->endpoint, $response->parseDiagnostics);
+            }
             try {
-                $this->schemaValidator->validate($response->data, $request->outputSchema);
+                if ($response->data === [] && ($response->parseDiagnostics['top_level_type'] ?? null) === 'object') {
+                    $required = $request->outputSchema['required'] ?? [];
+                    if ($required !== []) throw new RuntimeException('Structured output at $ is missing required field ['.$required[0].'].');
+                } else {
+                    $this->schemaValidator->validate($response->data, $request->outputSchema);
+                }
             } catch (\Throwable $error) {
                 $outcome = $response->provider === 'openai' ? 'OPENAI_RESPONSE_RECEIVED' : 'PROVIDER_RESPONSE_RECEIVED';
                 $safeMessage = 'AI provider response did not satisfy the required output schema.';
+                $stage = 'response_schema';
                 if (preg_match('/missing required field \[([a-zA-Z0-9_.-]{1,80})\]/', $error->getMessage(), $missingField)) {
                     $safeMessage = 'AI provider response is missing required field ['.$missingField[1].'].';
+                    $stage = 'response_missing_required_fields';
                 }
-                throw new Providers\AIProviderException($safeMessage, 'response_schema', $outcome,
+                throw new Providers\AIProviderException($safeMessage, $stage, $outcome,
                     httpStatus: $response->httpStatus, endpoint: $response->endpoint, model: $response->model,
-                    elapsedMs: $response->latencyMs, previous: $error);
+                    elapsedMs: $response->latencyMs, responseLength: $response->parseDiagnostics['response_length'] ?? null,
+                    responseFingerprint: $response->parseDiagnostics['response_fingerprint'] ?? null,
+                    normalizations: $response->parseDiagnostics['normalizations'] ?? [], previous: $error);
             }
             try {
                 $this->completeUsage($usageId, $request, $response);
@@ -86,6 +129,11 @@ final class AIModelRouter
             if ($usageId) DB::table('ai_usage_records')->where('id', $usageId)->update(['status' => 'FAILED']);
             throw $error;
         }
+    }
+
+    private function addOptionalCounts(?int $left, ?int $right): ?int
+    {
+        return $left === null && $right === null ? null : ($left ?? 0) + ($right ?? 0);
     }
 
     private function reserveUsage(AIRequest $request, string $provider, string $model): ?string

@@ -29,6 +29,13 @@ final readonly class AgentFailure
             'PROVIDER_RATE_LIMIT' => 'The configured AI provider rate limit was reached.',
             'PROVIDER_TIMEOUT' => 'The AI provider request timed out.',
             'PROVIDER_SCHEMA' => 'The AI provider response did not match the required structured format.',
+            'PROVIDER_RESPONSE_EMPTY' => 'The AI provider returned empty structured output.',
+            'PROVIDER_RESPONSE_MALFORMED_JSON' => 'The AI provider returned malformed structured output.',
+            'PROVIDER_RESPONSE_TRUNCATED' => 'The AI provider structured output appears truncated.',
+            'PROVIDER_RESPONSE_WRONG_TYPE' => 'The AI provider returned the wrong structured output type.',
+            'PROVIDER_REQUIRED_FIELDS' => 'The AI provider response is missing required structured fields.',
+            'PROVIDER_CONTENT_REFUSAL' => 'The AI provider declined to provide the requested structured output.',
+            'PROVIDER_ENVELOPE_PARSE' => 'The AI provider response envelope could not be parsed.',
             default => 'The agent could not complete this request.',
         }, $correlationId);
     }

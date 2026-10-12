@@ -13,5 +13,6 @@ final readonly class AIResponse
         public ?int $latencyMs = null,
         public ?int $httpStatus = null,
         public ?string $endpoint = null,
+        public array $parseDiagnostics = [],
     ) {}
 }

@@ -53,9 +53,11 @@ abstract class AbstractJsonProvider implements AIProviderInterface
                     $json = null;
                 }
                 if (! is_array($json)) {
-                    throw new AIProviderException('AI provider returned a response that was not valid JSON.', 'response_parse', $this->responseOutcome(),
+                    $bodyText = (string) $response->body();
+                    throw new AIProviderException('AI provider response envelope was not valid JSON.', 'provider_envelope_malformed', $this->responseOutcome(),
                         httpStatus: $response->status(), endpoint: $endpoint, model: $model,
-                        elapsedMs: (int) ((microtime(true) - $started) * 1000));
+                        elapsedMs: (int) ((microtime(true) - $started) * 1000), responseLength: strlen($bodyText),
+                        responseFingerprint: hash('sha256', $bodyText), jsonError: json_last_error_msg());
                 }
                 return $json;
             }
@@ -128,13 +130,108 @@ abstract class AbstractJsonProvider implements AIProviderInterface
 
     protected function decode(string $text, string $model, ?int $input = null, ?int $output = null): AIResponse
     {
+        $original = $text;
+        $normalizations = [];
+        $text = trim($text);
+        if (str_starts_with($text, "\xEF\xBB\xBF")) {
+            $text = substr($text, 3);
+            $normalizations[] = 'utf8_bom_removed';
+        }
+        $text = trim($text);
+        if ($text === '') throw $this->responseParseException('Provider returned empty structured output.', 'response_empty', $original, $model, $normalizations, inputTokens: $input, outputTokens: $output);
+
+        if (preg_match('/^```(?:json)?\s*([\s\S]*?)\s*```$/i', $text, $fence) === 1) {
+            $text = trim($fence[1]);
+            $normalizations[] = 'markdown_fence_removed';
+        }
+
         $decoded = json_decode($text, true);
-        if (! is_array($decoded)) {
-            throw new AIProviderException('AI provider returned content that was not valid JSON.', 'response_parse', $this->responseOutcome(),
-                httpStatus: $this->lastHttpStatus, endpoint: $this->lastEndpoint, model: $model, elapsedMs: $this->lastLatencyMs);
+        if (json_last_error() !== JSON_ERROR_NONE) {
+            $jsonError = json_last_error_msg();
+            [$candidate, $truncated, $candidateCount] = $this->singleJsonCandidate($text);
+            if ($candidate !== null && $candidateCount === 1) {
+                $candidateDecoded = json_decode($candidate, true);
+                if (json_last_error() === JSON_ERROR_NONE) {
+                    $text = $candidate;
+                    $decoded = $candidateDecoded;
+                    $normalizations[] = 'surrounding_prose_removed';
+                    $jsonError = null;
+                } else {
+                    $jsonError = json_last_error_msg();
+                }
+            }
+            if ($jsonError !== null) {
+                $stage = $truncated ? 'response_truncated' : 'response_malformed';
+                $message = $truncated ? 'Provider structured output appears truncated.' : 'Provider structured output was malformed JSON.';
+                throw $this->responseParseException($message, $stage, $original, $model, $normalizations, $jsonError, $input, $output);
+            }
+        }
+
+        if (! is_array($decoded) || ! str_starts_with(ltrim($text), '{')) {
+            throw $this->responseParseException('Provider structured output had the wrong top-level type.', 'response_wrong_type', $original, $model, $normalizations, inputTokens: $input, outputTokens: $output);
         }
         return new AIResponse($decoded, $this->providerKey(), $model, $input, $output,
-            $this->lastLatencyMs, $this->lastHttpStatus, $this->lastEndpoint);
+            $this->lastLatencyMs, $this->lastHttpStatus, $this->lastEndpoint, [
+                'classification' => $normalizations === [] ? 'valid_json' : 'normalized_json',
+                'top_level_type' => 'object',
+                'response_length' => strlen($original),
+                'response_fingerprint' => hash('sha256', $original),
+                'normalizations' => $normalizations,
+            ]);
+    }
+
+    protected function rejectContentRefusal(string $model, ?string $signal = null): never
+    {
+        $safeSignal = in_array($signal, ['refusal', 'content_filter', 'safety', 'blocklist', 'prohibited_content'], true) ? $signal : 'refusal';
+        throw new AIProviderException('AI provider refused to return the requested structured output.', 'content_refusal', $this->responseOutcome(),
+            httpStatus: $this->lastHttpStatus, providerErrorCode: $safeSignal, endpoint: $this->lastEndpoint,
+            model: $model, elapsedMs: $this->lastLatencyMs);
+    }
+
+    /** @return array{0:?string,1:bool,2:int} */
+    private function singleJsonCandidate(string $text): array
+    {
+        $candidates = [];
+        $truncated = false;
+        $length = strlen($text);
+        for ($start = 0; $start < $length; $start++) {
+            if ($text[$start] !== '{' && $text[$start] !== '[') continue;
+            $stack = [];
+            $insideString = false;
+            $escaped = false;
+            for ($i = $start; $i < $length; $i++) {
+                $char = $text[$i];
+                if ($insideString) {
+                    if ($escaped) $escaped = false;
+                    elseif ($char === '\\') $escaped = true;
+                    elseif ($char === '"') $insideString = false;
+                    continue;
+                }
+                if ($char === '"') { $insideString = true; continue; }
+                if ($char === '{' || $char === '[') { $stack[] = $char; continue; }
+                if ($char === '}' || $char === ']') {
+                    $expected = $char === '}' ? '{' : '[';
+                    if (array_pop($stack) !== $expected) break;
+                    if ($stack === []) {
+                        $candidates[] = substr($text, $start, $i - $start + 1);
+                        $start = $i;
+                        continue 2;
+                    }
+                }
+            }
+            if ($stack !== []) $truncated = true;
+            break;
+        }
+        return [count($candidates) === 1 ? $candidates[0] : null, $truncated, count($candidates)];
+    }
+
+    private function responseParseException(string $message, string $stage, string $raw, string $model, array $normalizations = [], ?string $jsonError = null,
+        ?int $inputTokens = null, ?int $outputTokens = null): AIProviderException
+    {
+        return new AIProviderException($message, $stage, $this->responseOutcome(), httpStatus: $this->lastHttpStatus,
+            endpoint: $this->lastEndpoint, model: $model, elapsedMs: $this->lastLatencyMs,
+            responseLength: strlen($raw), responseFingerprint: hash('sha256', $raw), jsonError: $jsonError,
+            normalizations: $normalizations, inputTokens: $inputTokens, outputTokens: $outputTokens);
     }
 
     protected function prompt(AIRequest $request): string

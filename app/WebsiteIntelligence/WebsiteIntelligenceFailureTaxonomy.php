@@ -11,7 +11,9 @@ final class WebsiteIntelligenceFailureTaxonomy
     public const CATEGORIES = ['DNS', 'TLS', 'HTTP_4XX', 'HTTP_5XX', 'ROBOTS', 'REDIRECT_POLICY', 'SSRF_POLICY', 'TIMEOUT',
         'UNSUPPORTED_CONTENT', 'RENDER_FAILURE', 'PARSER_FAILURE', 'PROVIDER_AUTH', 'MODEL_UNAVAILABLE', 'PROVIDER_RATE_LIMIT',
         'PROVIDER_QUOTA', 'PROVIDER_TIMEOUT', 'PROVIDER_CONNECTION', 'PROVIDER_REQUEST_INVALID', 'PROVIDER_SCHEMA',
-        'PROVIDER_RESPONSE_PARSE', 'PROVIDER_SERVER', 'PROMPT_MISSING', 'MODEL_ROUTE_MISSING', 'PERSISTENCE', 'UNKNOWN'];
+        'PROVIDER_RESPONSE_PARSE', 'PROVIDER_RESPONSE_EMPTY', 'PROVIDER_RESPONSE_MALFORMED_JSON', 'PROVIDER_RESPONSE_TRUNCATED',
+        'PROVIDER_RESPONSE_WRONG_TYPE', 'PROVIDER_REQUIRED_FIELDS', 'PROVIDER_CONTENT_REFUSAL', 'PROVIDER_ENVELOPE_PARSE',
+        'PROVIDER_SERVER', 'PROMPT_MISSING', 'MODEL_ROUTE_MISSING', 'PERSISTENCE', 'UNKNOWN'];
 
     public function classify(Throwable $error): string
     {
@@ -72,6 +74,18 @@ final class WebsiteIntelligenceFailureTaxonomy
             $code = strtolower($error->providerErrorCode ?? '');
             $type = strtolower($error->providerErrorType ?? '');
             $message = strtolower($error->getMessage());
+
+            $responseStage = match ($error->stage) {
+                'response_empty' => 'PROVIDER_RESPONSE_EMPTY',
+                'response_malformed' => 'PROVIDER_RESPONSE_MALFORMED_JSON',
+                'response_truncated' => 'PROVIDER_RESPONSE_TRUNCATED',
+                'response_wrong_type' => 'PROVIDER_RESPONSE_WRONG_TYPE',
+                'response_missing_required_fields' => 'PROVIDER_REQUIRED_FIELDS',
+                'content_refusal' => 'PROVIDER_CONTENT_REFUSAL',
+                'provider_envelope_malformed' => 'PROVIDER_ENVELOPE_PARSE',
+                default => null,
+            };
+            if ($responseStage !== null) return $responseStage;
 
             return match (true) {
                 $status === 401 || $status === 403 => 'PROVIDER_AUTH',

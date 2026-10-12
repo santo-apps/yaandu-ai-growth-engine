@@ -208,7 +208,7 @@ final class WebsiteIntelligenceAgent implements AgentInterface
         $structured['next_actions'] ??= [];
         $structured['structured_output_metadata'] = ['provider' => $response->provider, 'model' => $response->model,
             'prompt_template_id' => $prompt->id, 'prompt_version' => $prompt->version, 'agent_run_id' => $context->runId,
-            'correlation_id' => $context->correlationId];
+            'correlation_id' => $context->correlationId, 'provider_response' => $response->parseDiagnostics];
         DB::transaction(function () use ($issues, $technologies, $insights, $scan, $context, $pagesByUrl, $companyId, $structured, $response, $prompt, $executionDurationMs): void {
         DB::table('lead_insights')->where('tenant_id', $context->tenantId)->where('agent_run_id', $context->runId)->delete();
 

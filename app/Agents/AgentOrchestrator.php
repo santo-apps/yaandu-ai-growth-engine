@@ -67,6 +67,16 @@ final class AgentOrchestrator
             return $result;
         } catch (\Throwable $error) {
             $failure = AgentFailure::from($error, $correlationId);
+            if ($name === 'WebsiteIntelligenceAgent' && $error instanceof \App\AI\Providers\AIProviderException) {
+                Log::warning('Website Intelligence provider response was rejected safely.', [
+                    'tenant_id' => $tenantId,
+                    'agent_name' => $name,
+                    'agent_run_id' => $runId,
+                    'correlation_id' => $correlationId,
+                    'error_code' => $failure->code,
+                    ...$error->safeDiagnostics(),
+                ]);
+            }
             if ($stage === 'workflow_policy') {
                 Log::warning('Agent execution blocked by workflow policy.', [
                     'correlation_id' => $correlationId,
