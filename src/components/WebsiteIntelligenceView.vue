@@ -55,9 +55,19 @@ function componentRows(value: unknown): Array<{ label: string; value: string; ev
     return {
       label: key.replaceAll('_', ' '),
       value: typeof result === 'boolean' ? (result ? 'Yes' : 'No') : String(result),
-      evidence: String(detail.evidence ?? detail.reason ?? ''),
+      evidence: formatEvidence(detail.evidence_reference ?? detail.evidence ?? detail.reference ?? detail.reason),
     }
   })
+}
+
+function formatEvidence(value: unknown): string {
+  if (value === null || value === undefined || value === '') return ''
+  if (typeof value !== 'object') return String(value)
+  if (Array.isArray(value)) return value.map(formatEvidence).filter(Boolean).join(' · ')
+  const detail = value as RecordValue
+  const fields = ['source', 'field', 'observed', 'value', 'criteria', 'name', 'url']
+  return fields.filter((key) => detail[key] !== null && detail[key] !== undefined && detail[key] !== '')
+    .map((key) => `${key.replaceAll('_', ' ')}: ${Array.isArray(detail[key]) ? detail[key].join(', ') : String(detail[key])}`).join(' · ')
 }
 </script>
 
@@ -130,7 +140,7 @@ function componentRows(value: unknown): Array<{ label: string; value: string; ev
         </div>
         <p v-else class="empty-state">No technical observations were recorded for this scan.</p>
         <div v-if="(intelligence.technologies?.length || report?.technical_findings?.length)" class="technology-list">
-          <h4>Detected technologies</h4><span v-for="item in (intelligence.technologies ?? report?.technical_findings ?? [])" :key="item.id || item.summary">{{ item.name || item.summary }}</span>
+          <h4>Detected technologies and page signals</h4><span v-for="item in (intelligence.technologies ?? report?.technical_findings ?? [])" :key="item.id || item.summary">{{ item.name || item.summary }}</span>
         </div>
       </section>
 

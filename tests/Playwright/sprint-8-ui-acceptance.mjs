@@ -54,7 +54,7 @@ try {
       issues: [{ id: 'issue-1', type: 'mobile_ux', severity: 'medium', summary: 'Navigation may be difficult on small screens.', confidence: 0.8, evidence: JSON.stringify({ source_url: 'https://synthetic-pilot.example.test', excerpt: 'Synthetic fixture evidence excerpt.' }) }],
       technologies: [{ id: 'tech-1', name: 'Synthetic CMS' }],
       pages: [{ id: 'page-1', final_url: 'https://synthetic-pilot.example.test', requested_url: 'https://synthetic-pilot.example.test', title: 'Synthetic Pilot', http_status: 200, extracted_text: 'Synthetic page evidence.' }],
-      scores: [{ id: 'score-1', score: null, evidence_coverage: 50, rule_version: 1, components: { industry_fit: { points: 5, evidence: 'Synthetic business profile' } } }],
+      scores: [{ id: 'score-1', score: null, evidence_coverage: 50, rule_version: 1, components: { industry_fit: { points: 5, evidence_reference: { source: 'company_record', field: 'industry', value: 'Manufacturing', criteria: ['manufacturing'], url: 'https://synthetic-pilot.example.test' } } } }],
       intelligence_results: [{ structured_output: { business_identity: { description: 'Synthetic company summary.' }, observations: [{ statement: 'The site lists a contact page.', evidence_id: 'page-1', confidence: 0.9 }], opportunities: [], technical_findings: [], unknowns: ['CRM use is unknown.'], evidence: [{ evidence_id: 'page-1', source_url: 'https://synthetic-pilot.example.test', excerpt: 'Synthetic page evidence.' }] } }],
       screenshots: [],
     }
@@ -83,6 +83,9 @@ try {
     if (label === 'Prospects') {
       await page.getByText('Synthetic Pilot Company', { exact: true }).first().click()
       await page.locator('h1').getByText('Synthetic Pilot Company').waitFor()
+      const scoreEvidence = await page.locator('body').innerText()
+      assert.match(scoreEvidence, /Source: company_record · Field: industry · Value: Manufacturing/)
+      assert.ok(!scoreEvidence.includes('[object Object]'), 'Structured score evidence renders as concise readable text')
       results.push(await inspect(page, 'Prospect 360', outputDirectory))
       await page.getByRole('button', { name: 'Website', exact: true }).click()
       await page.getByText('Latest scan').waitFor()

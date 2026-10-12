@@ -9,6 +9,7 @@ use App\WebsiteIntelligence\PublicContactExtractor;
 use App\WebsiteIntelligence\YaanduServiceTaxonomy;
 use App\WebsiteIntelligence\TenantServiceCatalog;
 use App\WebsiteIntelligence\WebsiteIntelligencePilotPromptV2;
+use App\WebsiteIntelligence\WebsiteTechnicalEvidenceAnalyzer;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
 use RuntimeException;
@@ -16,7 +17,7 @@ use RuntimeException;
 final class WebsiteIntelligenceAgent implements AgentInterface
 {
     public function __construct(private readonly AIModelRouter $router, private readonly PublicContactExtractor $contacts, private readonly ApprovedPromptRepository $prompts,
-        private readonly ?TenantServiceCatalog $serviceCatalog = null) {}
+        private readonly ?TenantServiceCatalog $serviceCatalog = null, private readonly ?WebsiteTechnicalEvidenceAnalyzer $technicalEvidence = null) {}
     public function name(): string { return 'WebsiteIntelligenceAgent'; }
     public function description(): string { return 'Summarize a completed public website scan with evidence-backed issues and business facts.'; }
     public function inputSchema(): array { return ['required' => ['website_scan_id']]; }
@@ -41,12 +42,36 @@ final class WebsiteIntelligenceAgent implements AgentInterface
         $executionStartedAtNs = hrtime(true);
         $scan = DB::table('website_scans')->where('id', $input['website_scan_id'])->where('tenant_id', $context->tenantId)->first();
         if (! $scan || $scan->status !== 'completed') throw new RuntimeException('A completed scan in this tenant is required.');
+        // Analyze the stored crawl before any AI request; this also enriches existing completed scans on an intelligence rerun.
+        ($this->technicalEvidence ?? app(WebsiteTechnicalEvidenceAnalyzer::class))->analyze($context->tenantId, $scan->id);
         $route = DB::table('ai_model_configurations')->where('tenant_id', $context->tenantId)->where('task_key', 'website_reasoning')->first();
         if (! $route || ! $route->enabled || ! filled($route->provider) || ! filled($route->model)) {
             throw new RuntimeException('No AI model configured for task [website_reasoning].');
         }
         $pages = DB::table('website_pages')->where('website_scan_id', $scan->id)->where('tenant_id', $context->tenantId)->limit(20)->get(['id', 'final_url', 'title', 'extracted_text', 'http_status']);
-        $evidence = $pages->map(fn ($page) => ['id' => $page->id, 'url' => $page->final_url, 'title' => $page->title, 'status' => $page->http_status, 'text' => mb_substr(strip_tags((string) $page->extracted_text), 0, 6000)])->all();
+        $technicalByPage = [];
+        foreach (DB::table('website_issues')->where('tenant_id', $context->tenantId)->where('website_scan_id', $scan->id)
+            ->where('detector_version', 'deterministic-v1')->get(['website_page_id', 'summary', 'evidence']) as $item) {
+            $metadata = is_array($item->evidence) ? $item->evidence : json_decode($item->evidence ?? '{}', true);
+            $technicalByPage[$item->website_page_id][] = ['kind' => 'issue_observation', 'summary' => $item->summary,
+                'marker' => $metadata['marker'] ?? $metadata['excerpt'] ?? null];
+        }
+        foreach (DB::table('website_technologies')->where('tenant_id', $context->tenantId)->where('website_scan_id', $scan->id)
+            ->where('detection_method', 'deterministic-v1')->get(['website_page_id', 'name', 'category', 'evidence']) as $item) {
+            $metadata = is_array($item->evidence) ? $item->evidence : json_decode($item->evidence ?? '{}', true);
+            $technicalByPage[$item->website_page_id][] = ['kind' => 'technical_observation', 'name' => $item->name,
+                'category' => $item->category, 'marker' => $metadata['marker'] ?? $metadata['excerpt'] ?? null];
+        }
+        $evidence = $pages->map(function ($page) use ($technicalByPage): array {
+            $observations = array_slice($technicalByPage[$page->id] ?? [], 0, 12);
+            $observationText = implode("\n", array_map(static fn (array $observation): string => '[Stored deterministic observation] '.implode(' · ', array_filter([
+                $observation['kind'], $observation['name'] ?? $observation['summary'] ?? null, $observation['marker'] ?? null,
+            ])), $observations));
+            $pageText = mb_substr(strip_tags((string) $page->extracted_text), 0, 5000);
+            $combined = trim($pageText."\n".$observationText);
+            return ['id' => $page->id, 'url' => $page->final_url, 'title' => $page->title, 'status' => $page->http_status,
+                'text' => mb_substr($combined, 0, 6000), 'deterministic_observations' => $observations];
+        })->all();
         $pagesByUrl = [];
         foreach ($pages as $index => $page) $pagesByUrl[(string) $page->final_url] = ['id' => $page->id, 'text' => trim((string) $page->title.' '.$evidence[$index]['text'])];
         $prompt = $this->prompts->get($context->tenantId, $this->name(), '');

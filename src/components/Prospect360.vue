@@ -47,7 +47,17 @@ function componentRows(value: any) {
   let parsed = value
   if (typeof parsed === 'string') { try { parsed = JSON.parse(parsed) } catch { return [] } }
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return []
-  return Object.entries(parsed).map(([key, data]: [string, any]) => ({ key: humanize(key), value: typeof data === 'number' ? data : (data?.points ?? data?.score ?? data?.value ?? 0), evidence: data?.evidence ?? data?.reason ?? null }))
+  return Object.entries(parsed).map(([key, data]: [string, any]) => ({ key: humanize(key), value: typeof data === 'number' ? data : (data?.points ?? data?.score ?? data?.value ?? 0), evidence: formatEvidence(data?.evidence_reference ?? data?.evidence ?? data?.reference ?? data?.reason) }))
+}
+
+function formatEvidence(value: any): string | null {
+  if (value === null || value === undefined || value === '') return null
+  if (typeof value !== 'object') return String(value)
+  if (Array.isArray(value)) return value.map(formatEvidence).filter(Boolean).join(' · ') || null
+  const fields = ['source', 'field', 'observed', 'value', 'criteria', 'name', 'url']
+  const parts = fields.filter((key) => value[key] !== null && value[key] !== undefined && value[key] !== '')
+    .map((key) => `${humanize(key)}: ${Array.isArray(value[key]) ? value[key].join(', ') : String(value[key])}`)
+  return parts.join(' · ') || null
 }
 
 function recommendationEvidence(recommendation: any) {
