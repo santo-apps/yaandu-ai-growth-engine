@@ -91,7 +91,7 @@ try {
       issues: [...deterministicIssues, { id: 'ai-issue-1', type: 'ai_observation', severity: 'low', summary: 'AI-only advisory observation.', confidence: 0.8, evidence: JSON.stringify({ source_url: 'https://synthetic-pilot.example.test', excerpt: 'Synthetic fixture evidence excerpt.' }) }],
       technologies: [...deterministicTechnologies, { id: 'ai-tech-1', name: 'AI identified framework', category: 'observed', detection_method: 'ai_inference', confidence: 0.7 }],
       pages: fixturePages,
-      scores: [{ id: 'score-1', score: null, evidence_coverage: 50, rule_version: 1, components: { industry_fit: { points: 5, evidence_reference: { source: 'company_record', field: 'industry', value: 'Manufacturing', criteria: ['manufacturing'], url: 'https://synthetic-pilot.example.test' } } } }],
+      scores: [{ id: 'score-1', score: 67, evidence_coverage: 60, rule_version: 1, components: { icp_fit: { status: 'POSITIVE', raw_points: 10, points: 10, evidence_reference: { source: 'company_record', field: 'industry', value: 'Manufacturing', criteria: ['manufacturing'], url: 'https://synthetic-pilot.example.test' } }, outdated_website: { status: 'POSITIVE', raw_points: 15, points: 15 } } }],
       intelligence_results: [{ structured_output: { business_identity: { description: 'Synthetic company summary.' }, observations: [{ statement: 'The site lists a contact page.', evidence_id: 'page-1', confidence: 0.9 }], opportunities: [], technical_findings: [], unknowns: ['CRM use is unknown.'], evidence: [{ evidence_id: 'page-1', source_url: 'https://synthetic-pilot.example.test', excerpt: 'Synthetic page evidence.' }] } }],
       screenshots: [],
     }
@@ -124,6 +124,9 @@ try {
       await page.getByText('Synthetic Pilot Company', { exact: true }).first().click()
       await page.locator('h1').getByText('Synthetic Pilot Company').waitFor()
       await page.getByText('Prospect overview', { exact: true }).waitFor()
+      await page.getByText('High Priority', { exact: true }).waitFor()
+      await page.locator('[aria-label="Derived lead priority"]').getByText('EVIDENCE COVERAGE', { exact: true }).waitFor()
+      assert.match(await page.locator('[aria-label="Derived lead priority"]').innerText(), /67 \/ 100[\s\S]*60%[\s\S]*High Priority[\s\S]*High evidence/)
       const scoreEvidence = await page.locator('body').innerText()
       assert.match(scoreEvidence, /Source: company_record · Field: industry · Value: Manufacturing/)
       assert.ok(!scoreEvidence.includes('[object Object]'), 'Structured score evidence renders as concise readable text')

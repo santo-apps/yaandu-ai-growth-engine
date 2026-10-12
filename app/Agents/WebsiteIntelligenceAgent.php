@@ -98,7 +98,7 @@ final class WebsiteIntelligenceAgent implements AgentInterface
         $systemInstruction."\n\nApproved analysis template (version {$prompt->version}):\n".$prompt->template,
         $evidence,
         $schema,
-        maxOutputTokens: 3500,
+        maxOutputTokens: 4096,
         correlationId: $context->correlationId,
         tenantId: $context->tenantId,
     )
