@@ -8,8 +8,8 @@ const { deriveLeadPriority } = await import(`data:text/javascript;base64,${Buffe
 const scored = (score, evidence_coverage, components = {}) => ({ score, evidence_coverage, components })
 const positive = (status = 'POSITIVE') => ({ status, raw_points: status === 'POSITIVE' ? 10 : 0 })
 
-assert.equal(deriveLeadPriority(scored(67, 60, { outdated_website: positive() })).label, 'High Priority')
-assert.equal(deriveLeadPriority(scored(67, 60, { strong_business_fit: positive() })).label, 'High Priority')
+assert.equal(deriveLeadPriority(scored(67, 60, { outdated_website: positive(), technology_opportunity: positive() })).label, 'High Priority')
+assert.equal(deriveLeadPriority(scored(67, 60, { poor_mobile_ux: positive(), strong_business_fit: positive() })).label, 'High Priority')
 assert.equal(deriveLeadPriority(scored(60, 50, { poor_mobile_ux: positive() })).label, 'Medium Priority')
 assert.equal(deriveLeadPriority(scored(67, 30, { outdated_website: positive() })).label, 'Low Confidence')
 
@@ -27,6 +27,7 @@ assert.equal(deriveLeadPriority(scored(67, 60, { icp_fit: positive(), relevant_i
 assert.notEqual(deriveLeadPriority(scored(67, 60, { icp_fit: positive() })).label, 'High Priority')
 assert.notEqual(deriveLeadPriority(scored(67, 60, { relevant_industry: positive() })).label, 'High Priority')
 assert.equal(deriveLeadPriority(scored(55, 40, { relevant_industry: positive() })).label, 'Medium Priority')
+assert.equal(deriveLeadPriority(scored(45, 55)).label, 'Medium Priority', 'Only the four approved labels are emitted for a scored record.')
 
 const original = scored(67, 60, { outdated_website: positive(), icp_fit: positive() })
 const snapshot = structuredClone(original)
@@ -38,10 +39,10 @@ assert.equal(derived.confidenceLabel, 'High evidence')
 assert.equal(deriveLeadPriority(scored(67, 50)).opportunitySignalCount, 0)
 
 const examples = {
-  'The Home': deriveLeadPriority(scored(67, 60, { technology_opportunity: positive() })),
-  Ebarza: deriveLeadPriority(scored(67, 60, { strong_business_fit: positive() })),
+  'The Home': deriveLeadPriority(scored(67, 60, { outdated_website: positive(), technology_opportunity: positive() })),
+  Ebarza: deriveLeadPriority(scored(67, 60, { poor_mobile_ux: positive(), strong_business_fit: positive() })),
   'Full Flat': deriveLeadPriority(scored(60, 50, { poor_mobile_ux: positive() })),
-  'OC HOME': deriveLeadPriority(scored(60, 50, { poor_lead_capture: positive() })),
+  'OC HOME': deriveLeadPriority(scored(60, 50, { poor_mobile_ux: positive() })),
   'Bo Concept': deriveLeadPriority(scored(67, 30, { outdated_website: positive() })),
   Danube: deriveLeadPriority(null, { status: 'failed', failure_category: 'ROBOTS' }),
   Homecentre: deriveLeadPriority(null, { status: 'failed', failure_category: 'HTTP_4XX' }),

@@ -1,6 +1,6 @@
 export type LeadPriority = {
-  key: 'high' | 'medium' | 'low_confidence' | 'blocked' | 'review'
-  label: 'High Priority' | 'Medium Priority' | 'Low Confidence' | 'Blocked / Unscored' | 'Needs Review'
+  key: 'high' | 'medium' | 'low_confidence' | 'blocked'
+  label: 'High Priority' | 'Medium Priority' | 'Low Confidence' | 'Blocked / Unscored'
   confidence: 'high' | 'moderate' | 'low' | 'insufficient'
   confidenceLabel: 'High evidence' | 'Moderate evidence' | 'Low evidence' | 'Insufficient evidence'
   score: number | null
@@ -88,6 +88,6 @@ export function deriveLeadPriority(scoreRecord: any, latestScan: any = null): Le
     return { key: 'medium', label: 'Medium Priority', confidence, confidenceLabel, score, coverage, opportunitySignalCount, reasons, failureReason: null }
   }
 
-  reasons.push('The current score and evidence do not meet a priority rule.')
-  return { key: 'review', label: 'Needs Review', confidence, confidenceLabel, score, coverage, opportunitySignalCount, reasons, failureReason: null }
+  reasons.push('The current score and evidence do not meet the high-priority or low-confidence rule.')
+  return { key: 'medium', label: 'Medium Priority', confidence, confidenceLabel, score, coverage, opportunitySignalCount, reasons, failureReason: null }
 }
