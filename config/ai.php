@@ -4,7 +4,7 @@ return [
     'local_acceptance' => ['enabled' => env('AI_DETERMINISTIC_ENABLED', false)],
     'tasks' => [
         'website_visual_analysis' => ['provider' => env('AI_VISUAL_PROVIDER', 'openai'), 'model' => env('AI_VISUAL_MODEL', 'gpt-4.1-mini')],
-        'website_reasoning' => ['provider' => env('AI_REASONING_PROVIDER', 'anthropic'), 'model' => env('AI_REASONING_MODEL', 'claude-3-7-sonnet-latest')],
+        'website_reasoning' => ['provider' => env('AI_REASONING_PROVIDER', 'anthropic'), 'model' => env('AI_REASONING_MODEL', 'claude-3-7-sonnet-latest'), 'parameters' => ['max_output_tokens' => 4096]],
         'lead_classification' => ['provider' => env('AI_CLASSIFICATION_PROVIDER', 'gemini'), 'model' => env('AI_CLASSIFICATION_MODEL', 'gemini-2.5-flash')],
         'sales_reasoning' => ['provider' => env('AI_SALES_PROVIDER', 'anthropic'), 'model' => env('AI_SALES_MODEL', 'claude-3-7-sonnet-latest')],
         'content_generation' => ['provider' => env('AI_CONTENT_PROVIDER', 'openai'), 'model' => env('AI_CONTENT_MODEL', 'gpt-4.1-mini')],

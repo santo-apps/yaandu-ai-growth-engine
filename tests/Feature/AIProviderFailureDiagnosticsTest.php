@@ -225,6 +225,32 @@ final class AIProviderFailureDiagnosticsTest extends TestCase
         }
     }
 
+    public function test_website_reasoning_uses_4096_output_tokens_without_changing_other_task_limits(): void
+    {
+        $provider = new class implements AIProviderInterface {
+            /** @var array<string, int> */
+            public array $limits = [];
+            public function providerKey(): string { return 'openai'; }
+            public function capabilities(): array { return ['text', 'json']; }
+            public function generate(AIRequest $request, string $model): AIResponse
+            {
+                $this->limits[$request->task] = $request->maxOutputTokens;
+                return new AIResponse(['result' => 'ok'], 'openai', $model);
+            }
+        };
+        $router = new AIModelRouter([$provider], [
+            'website_reasoning' => ['provider' => 'openai', 'model' => 'gpt-4.1-mini', 'parameters' => ['max_output_tokens' => 4096]],
+            'sales_reasoning' => ['provider' => 'openai', 'model' => 'gpt-4.1-mini', 'parameters' => ['max_output_tokens' => 2048]],
+        ]);
+        $request = $this->request();
+        $router->generate($request);
+        $router->generate(new AIRequest('sales_reasoning', 'Synthetic.', [], $request->outputSchema, maxOutputTokens: 1200));
+
+        self::assertSame(['website_reasoning' => 4096, 'sales_reasoning' => 2048], $provider->limits);
+        self::assertSame(4096, config('ai.tasks.website_reasoning.parameters.max_output_tokens'));
+        self::assertArrayNotHasKey('parameters', config('ai.tasks.sales_reasoning'));
+    }
+
     public function test_success_preserves_structured_data_and_token_usage(): void
     {
         Http::fake(['api.openai.test/*' => Http::response(['choices' => [['message' => ['content' => '{"result":"ok"}']]],
