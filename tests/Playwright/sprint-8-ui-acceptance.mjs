@@ -46,6 +46,9 @@ for (const [index, page] of fixturePages.entries()) {
   deterministicTechnologies.push(makeTech('WooCommerce', 'ecommerce', `Commerce platform ${index}`, 0.93))
 }
 const deterministicIssues = []
+let fixtureReview = null
+let fixtureMode = 'full'
+const fixtureServices = [{ id: '40000000-0000-4000-8000-000000000001', name: 'Website Revamp', active: true }]
 for (const [index, page] of fixturePages.entries()) {
   const issue = (type, summary, severity, confidence = 0.98) => ({
     id: `issue-${type}-${index}`, type, summary, severity, confidence, detector_version: 'deterministic-v1', website_page_id: page.id,
@@ -61,7 +64,8 @@ const server = spawn('npm', ['run', 'dev', '--', '--host', '127.0.0.1', '--port'
   stdio: 'ignore',
   env: { ...process.env, BROWSER: 'none' },
 })
-const outputDirectory = await mkdtemp(join(tmpdir(), 'yaandu-sprint8-ui-'))
+const outputDirectory = process.env.PLAYWRIGHT_ARTIFACT_DIR || await mkdtemp(join(tmpdir(), 'yaandu-sprint8-ui-'))
+const removeOutputDirectory = !process.env.PLAYWRIGHT_ARTIFACT_DIR
 let browser
 
 try {
@@ -78,20 +82,30 @@ try {
   browser = await chromium.launch({ headless: true, args: ['--no-sandbox'] })
   const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } })
   const mutatingRequests = []
+  const salesReviewRequests = []
   await page.addInitScript((id) => localStorage.setItem('tenant_id', id), tenantId)
   await page.route('**/api/v1/**', async (route) => {
     const path = new URL(route.request().url()).pathname.replace('/api/v1', '')
     let body = { data: [] }
+    const responseStatus = path === `/companies/${companyId}/sales-review` && route.request().method() === 'GET' && fixtureMode === 'review_error' ? 503 : 200
     if (path === '/me') body = { id: 1, name: 'Synthetic Reviewer', email: 'reviewer@example.test' }
     else if (path === '/tenants') body = [{ id: tenantId, name: 'Synthetic Pilot Workspace', role: 'owner', status: 'active' }]
     else if (path === '/companies' || path.startsWith('/companies?')) body = { data: [fixtureCompany] }
     else if (path === `/companies/${companyId}`) body = fixtureCompany
+    else if (path === `/companies/${companyId}/sales-review` && route.request().method() === 'PUT') {
+      const input = route.request().postDataJSON()
+      fixtureReview = { decision: input.decision, selected_service_id: input.selected_service_id, notes: input.notes,
+        reviewer_name: 'Synthetic Reviewer', reviewed_at: '2026-10-12T09:00:00Z', service_name: fixtureServices.find((service) => service.id === input.selected_service_id)?.name ?? null }
+      body = { review: fixtureReview }
+    }
+    else if (path === `/companies/${companyId}/sales-review`) body = { review: fixtureReview }
+    else if (path === '/tenant-services') body = { data: fixtureServices }
     else if (path === `/companies/${companyId}/intelligence`) body = {
       latest_scan: { status: 'completed', created_at: '2026-01-01T00:00:00Z' },
       issues: [...deterministicIssues, { id: 'ai-issue-1', type: 'ai_observation', severity: 'low', summary: 'AI-only advisory observation.', confidence: 0.8, evidence: JSON.stringify({ source_url: 'https://synthetic-pilot.example.test', excerpt: 'Synthetic fixture evidence excerpt.' }) }],
       technologies: [...deterministicTechnologies, { id: 'ai-tech-1', name: 'AI identified framework', category: 'observed', detection_method: 'ai_inference', confidence: 0.7 }],
       pages: fixturePages,
-      scores: [{ id: 'score-1', score: 67, evidence_coverage: 60, rule_version: 1, components: { icp_fit: { status: 'POSITIVE', raw_points: 10, points: 10, evidence_reference: { source: 'company_record', field: 'industry', value: 'Manufacturing', criteria: ['manufacturing'], url: 'https://synthetic-pilot.example.test' } }, outdated_website: { status: 'POSITIVE', raw_points: 15, points: 15 } } }],
+      scores: [{ id: 'score-1', score: 67, evidence_coverage: 60, rule_version: 1, components: { icp_fit: { status: 'POSITIVE', raw_points: 10, points: 10, evidence_reference: { source: 'company_record', field: 'industry', value: 'Manufacturing', criteria: ['manufacturing'], url: 'https://synthetic-pilot.example.test' } }, outdated_website: { status: 'POSITIVE', raw_points: 15, points: 15 }, whatsapp_gap: { status: 'NEGATIVE', raw_points: 0, points: 0 }, crm_gap: { status: 'UNKNOWN', raw_points: 0, points: 0 } } }],
       intelligence_results: [{ structured_output: { business_identity: { description: 'Synthetic company summary.' }, observations: [{ statement: 'The site lists a contact page.', evidence_id: 'page-1', confidence: 0.9 }], opportunities: [], technical_findings: [], unknowns: ['CRM use is unknown.'], evidence: [{ evidence_id: 'page-1', source_url: 'https://synthetic-pilot.example.test', excerpt: 'Synthetic page evidence.' }] } }],
       screenshots: [],
     }
@@ -99,13 +113,21 @@ try {
     else if (path.startsWith('/pilot/dashboard')) body = { cohort: null, simulated: true, sales_intelligence_mode: 'human_assisted', metrics: {}, funnel: {}, rates_percent: {} }
     else if (path === '/pilot/sales-intelligence-mode') body = { sales_intelligence_mode: 'human_assisted' }
     else if (path === '/local-acceptance/status') body = { mode: 'disabled', providers: { ai: 'Synthetic AI', outbound: 'Disabled', scheduling: 'Disabled' }, queue: 'isolated', company_id: null, campaign_id: null, campaign_status: 'disabled', message: null, inbound_count: 0, conversation_id: null, opportunity_id: null, meeting_id: null, proposal_id: null, proposal_delivery_count: 0 }
-    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) })
+    if (path === `/companies/${companyId}/intelligence` && fixtureMode === 'blocked') body = {
+      latest_scan: { status: 'failed', failure_category: 'ROBOTS', created_at: '2026-10-12T00:00:00Z' },
+      issues: [], technologies: [], pages: [], scores: [], intelligence_results: [], screenshots: [],
+    }
+    if (path === `/companies/${companyId}/intelligence` && fixtureMode === 'empty') body = {
+      latest_scan: null, issues: [], technologies: [], pages: [], scores: [], intelligence_results: [], screenshots: [],
+    }
+    await route.fulfill({ status: responseStatus, contentType: 'application/json', body: JSON.stringify(body) })
   })
 
   const pageErrors = []
   page.on('pageerror', (error) => pageErrors.push(`${error.message} ${error.stack ?? ''}`))
   page.on('request', (request) => {
     if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(request.method()) && /intelligence|score|campaign|message|outreach/i.test(request.url())) mutatingRequests.push(`${request.method()} ${request.url()}`)
+    if (request.method() === 'PUT' && request.url().includes('/sales-review')) salesReviewRequests.push(request.url())
   })
   await page.goto(baseUrl, { waitUntil: 'networkidle' })
   await page.getByText('Synthetic Pilot Workspace').waitFor({ timeout: 5000 })
@@ -123,13 +145,50 @@ try {
     if (label === 'Prospects') {
       await page.getByText('Synthetic Pilot Company', { exact: true }).first().click()
       await page.locator('h1').getByText('Synthetic Pilot Company').waitFor()
+      assert.equal(await page.locator('.local-acceptance').count(), 0, 'Local acceptance tooling is not displayed in the sales workspace')
       await page.getByText('Prospect overview', { exact: true }).waitFor()
-      await page.getByText('High Priority', { exact: true }).waitFor()
+      await page.locator('[aria-label="Derived lead priority"]').getByText('High Priority', { exact: true }).waitFor()
       await page.locator('[aria-label="Derived lead priority"]').getByText('EVIDENCE COVERAGE', { exact: true }).waitFor()
       assert.match(await page.locator('[aria-label="Derived lead priority"]').innerText(), /67 \/ 100[\s\S]*60%[\s\S]*High Priority[\s\S]*High evidence/)
       const scoreEvidence = await page.locator('body').innerText()
       assert.match(scoreEvidence, /Source: company_record · Field: industry · Value: Manufacturing/)
       assert.ok(!scoreEvidence.includes('[object Object]'), 'Structured score evidence renders as concise readable text')
+      assert.match(await page.locator('.opportunity-summary-card').innerText(), /Opportunity signals[\s\S]*Existing capabilities/)
+      await page.getByText('Full score details', { exact: true }).click()
+      assert.match(await page.locator('.prospect-overview-grid').first().innerText(), /Capability present[\s\S]*Unknown \/ insufficient evidence/)
+      await page.getByRole('heading', { name: 'What should happen with this prospect?' }).waitFor()
+      assert.equal(await page.getByLabel('Sales decision').inputValue(), '', 'Human decision is not prefilled from AI priority')
+      assert.equal(await page.locator('.priority-summary').getByText('Not Reviewed', { exact: true }).count(), 1, 'Unreviewed state is explicit')
+      const decisionControl = page.getByLabel('Sales decision')
+      await decisionControl.focus()
+      await page.keyboard.press('Tab')
+      assert.equal(await page.evaluate(() => document.activeElement?.getAttribute('aria-label') || document.activeElement?.tagName), 'SELECT', 'Review controls follow keyboard focus order')
+      await page.getByLabel('Sales decision').selectOption('pursue')
+      await page.getByLabel(/Relevant service/).selectOption(fixtureServices[0].id)
+      await page.getByLabel(/Decision notes/).fill('<script>synthetic note</script>')
+      await page.getByRole('button', { name: 'Save sales decision' }).click()
+      await page.getByText('AI priority remains advisory and unchanged.', { exact: false }).waitFor()
+      assert.equal(await page.getByText('Reviewed by Synthetic Reviewer').count(), 1, 'Saved reviewer and timestamp are visible')
+      assert.equal(await page.locator('.sales-review-card').locator('script').count(), 0, 'Reviewer notes render as text, never markup')
+      assert.equal(salesReviewRequests.length, 1, 'Saving human review makes one review-only PUT')
+      assert.deepEqual(mutatingRequests, [], 'Human review does not call scoring, crawling, AI, campaign, or outreach endpoints')
+      await page.reload({ waitUntil: 'networkidle' })
+      await page.getByRole('button', { name: /Prospects/ }).first().click()
+      await page.getByText('Synthetic Pilot Company', { exact: true }).first().click()
+      await page.getByRole('heading', { name: 'What should happen with this prospect?' }).waitFor()
+      assert.equal(await page.getByLabel('Sales decision').inputValue(), 'pursue', 'Saved review reloads correctly')
+      assert.equal(await page.getByLabel(/Relevant service/).inputValue(), fixtureServices[0].id)
+      await page.setViewportSize({ width: 390, height: 740 })
+      const nav = page.locator('.sidebar-navigation')
+      assert.ok(await nav.getByRole('button', { name: /AI Configuration/ }).count(), 'Lower management navigation remains available on mobile')
+      await nav.evaluate((element) => { element.scrollLeft = element.scrollWidth })
+      assert.ok(await nav.getByRole('button', { name: /Workflow diagnostics/ }).count(), 'Lower operations navigation remains reachable in the scrollable navigation')
+      assert.ok(await page.locator('.sidebar-bottom').isVisible(), 'Sidebar account/footer actions remain visible on mobile')
+      await page.setViewportSize({ width: 1440, height: 420 })
+      await page.locator('.sidebar-navigation').evaluate((element) => { element.scrollTop = element.scrollHeight })
+      assert.ok(await page.locator('.sidebar-navigation').getByRole('button', { name: /Workflow diagnostics/ }).isVisible(), 'Sidebar body scrolls independently in a short viewport')
+      assert.ok(await page.locator('.sidebar-bottom').getByRole('button', { name: 'Sign out' }).isVisible(), 'Sidebar footer actions remain reachable in a short viewport')
+      await page.setViewportSize({ width: 1440, height: 1000 })
       results.push(await inspect(page, 'Prospect 360', outputDirectory))
       await page.getByRole('button', { name: 'Website', exact: true }).click()
       await page.getByText('Latest scan').waitFor()
@@ -177,13 +236,37 @@ try {
     results.push(await inspect(page, label, outputDirectory))
   }
 
+  await page.getByRole('button', { name: /Prospects/ }).first().click()
+  await page.getByText('Synthetic Pilot Company', { exact: true }).first().click()
+  await page.getByRole('button', { name: 'Website', exact: true }).click()
+  fixtureMode = 'blocked'
+  await page.reload({ waitUntil: 'networkidle' })
+  await page.getByRole('button', { name: /Prospects/ }).first().click()
+  await page.getByText('Synthetic Pilot Company', { exact: true }).first().click()
+  await page.getByRole('button', { name: 'Website', exact: true }).click()
+  assert.ok(await page.getByText('Crawl permission could not be verified from robots.txt.', { exact: true }).count() >= 1, 'Blocked crawl has a safe, readable explanation')
+  assert.equal(await page.locator('.score-row').count(), 0, 'Blocked fixture does not display stale score rows')
+  fixtureMode = 'empty'
+  await page.reload({ waitUntil: 'networkidle' })
+  await page.getByRole('button', { name: /Prospects/ }).first().click()
+  await page.getByText('Synthetic Pilot Company', { exact: true }).first().click()
+  await page.getByRole('button', { name: 'Website', exact: true }).click()
+  await page.getByText('No Website Intelligence yet', { exact: true }).waitFor()
+  fixtureMode = 'review_error'
+  await page.reload({ waitUntil: 'networkidle' })
+  await page.getByRole('button', { name: /Prospects/ }).first().click()
+  await page.getByText('Synthetic Pilot Company', { exact: true }).first().click()
+  await page.getByText('Saved sales review could not be loaded.', { exact: true }).waitFor()
+  await page.getByLabel('Sales decision').selectOption('hold')
+  assert.equal(await page.getByRole('button', { name: 'Save sales decision' }).isDisabled(), true, 'A failed review read cannot be overwritten as if no decision existed')
+
   assert.deepEqual(pageErrors, [], `No browser runtime exceptions: ${pageErrors.join('; ')}`)
   assert.deepEqual(mutatingRequests, [], 'Acceptance did not trigger scoring, campaign, or outbound mutations')
   console.log(JSON.stringify({ browser: 'Chromium', data: 'synthetic only', screens: results }, null, 2))
 } finally {
   await browser?.close()
   server.kill('SIGTERM')
-  await rm(outputDirectory, { recursive: true, force: true })
+  if (removeOutputDirectory) await rm(outputDirectory, { recursive: true, force: true })
 }
 
 async function inspect(page, label, directory) {
@@ -191,6 +274,10 @@ async function inspect(page, label, directory) {
   const row = { screen: label, widths: {} }
   for (const width of widths) {
     await page.setViewportSize({ width, height: 1000 })
+    if (label === 'Prospect 360' && width === 390) {
+      await page.evaluate(() => window.scrollTo(0, 0))
+      await page.locator('.sidebar-navigation').evaluate((element) => { element.scrollLeft = 0; element.scrollTop = 0 })
+    }
     await page.waitForTimeout(100)
     const metrics = await page.evaluate(() => ({
       viewport: window.innerWidth,
@@ -206,7 +293,7 @@ async function inspect(page, label, directory) {
     assert.ok(metrics.headingVisible, `${label} heading is visible at ${width}px`)
     assert.ok(metrics.document <= width + 1, `${label} has no page overflow at ${width}px (scrollWidth ${metrics.document}; offenders ${JSON.stringify(metrics.overflowing)})`)
     row.widths[width] = 'PASS'
-    if (width === 1440) await page.screenshot({ path: join(directory, `${label.toLowerCase().replaceAll(' ', '-')}.png`), fullPage: true })
+    if (width === 1440 || (label === 'Prospect 360' && [390, 768].includes(width))) await page.screenshot({ path: join(directory, `${label.toLowerCase().replaceAll(' ', '-')}${width === 390 || width === 768 ? `-${width}` : ''}.png`), fullPage: true })
   }
   return row
 }

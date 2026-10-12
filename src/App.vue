@@ -342,30 +342,32 @@ onBeforeUnmount(() => screenshotUrls.value.forEach((screenshot) => URL.revokeObj
     <aside class="sidebar">
       <div class="brand"><span class="brand-mark">Y</span><span>yaandu<span class="brand-light">growth</span></span></div>
       <div class="workspace"><div class="workspace-icon">Y</div><div><b>{{ selectedTenant?.name || 'Yaandu' }}</b><small>{{ selectedTenant ? (isManager ? 'Manager workspace' : 'Sales workspace') : 'Growth workspace' }}</small></div><span class="chevron">⌄</span></div>
-      <p class="nav-label">SALES</p>
-      <button v-for="page in salesPages" :key="page.name" class="nav-item" :class="{ selected: active === page.name || (active === 'Prospect 360' && page.name === 'Prospects') }" @click="select(page.name)"><span class="nav-icon">{{ page.icon }}</span>{{ page.name }}</button>
-      <template v-if="isManager">
-        <p class="nav-label secondary-nav-label">MANAGEMENT</p>
-        <button class="nav-item" :class="{selected:active==='Approval Center'}" @click="select('Approval Center')"><span class="nav-icon">✓</span>Approvals</button>
-        <button class="nav-item" :class="{selected:active==='Automation'}" @click="select('Automation')"><span class="nav-icon">⚙</span>Automation</button>
-        <p class="nav-label secondary-nav-label">SETUP</p>
-        <button class="nav-item" :class="{selected:active==='Setup'}" @click="select('Setup')"><span class="nav-icon">⚙</span>Setup &amp; readiness</button>
-        <button class="nav-item" :class="{selected:active==='ICP Configuration'}" @click="select('ICP Configuration')"><span class="nav-icon">☷</span>ICP &amp; Scoring</button>
-        <button class="nav-item" :class="{selected:active==='Services & Pricing'}" @click="select('Services & Pricing')"><span class="nav-icon">▤</span>Services &amp; Pricing</button>
-        <button class="nav-item" :class="{selected:active==='AI Configuration'}" @click="select('AI Configuration')"><span class="nav-icon">✳</span>AI Configuration</button>
-        <p class="nav-label secondary-nav-label">OPERATIONS</p>
-        <button class="nav-item" :class="{selected:active==='Agent Runs'}" @click="select('Agent Runs')"><span class="nav-icon">◷</span>Agent Runs</button>
-        <button class="nav-item" :class="{selected:active==='Pilot Operations'}" @click="select('Pilot Operations')"><span class="nav-icon">▤</span>Pilot operations</button>
-        <button class="nav-item" :class="{selected:active==='Corpus Operations'}" @click="select('Corpus Operations')"><span class="nav-icon">▤</span>Corpus operations</button>
-        <button class="nav-item" :class="{selected:active==='Workflows'}" @click="select('Workflows')"><span class="nav-icon">⇢</span>Workflow diagnostics</button>
-      </template>
+      <div class="sidebar-navigation">
+        <p class="nav-label">SALES</p>
+        <button v-for="page in salesPages" :key="page.name" class="nav-item" :class="{ selected: active === page.name || (active === 'Prospect 360' && page.name === 'Prospects') }" @click="select(page.name)"><span class="nav-icon">{{ page.icon }}</span>{{ page.name }}</button>
+        <template v-if="isManager">
+          <p class="nav-label secondary-nav-label">MANAGEMENT</p>
+          <button class="nav-item" :class="{selected:active==='Approval Center'}" @click="select('Approval Center')"><span class="nav-icon">✓</span>Approvals</button>
+          <button class="nav-item" :class="{selected:active==='Automation'}" @click="select('Automation')"><span class="nav-icon">⚙</span>Automation</button>
+          <p class="nav-label secondary-nav-label">SETUP</p>
+          <button class="nav-item" :class="{selected:active==='Setup'}" @click="select('Setup')"><span class="nav-icon">⚙</span>Setup &amp; readiness</button>
+          <button class="nav-item" :class="{selected:active==='ICP Configuration'}" @click="select('ICP Configuration')"><span class="nav-icon">☷</span>ICP &amp; Scoring</button>
+          <button class="nav-item" :class="{selected:active==='Services & Pricing'}" @click="select('Services & Pricing')"><span class="nav-icon">▤</span>Services &amp; Pricing</button>
+          <button class="nav-item" :class="{selected:active==='AI Configuration'}" @click="select('AI Configuration')"><span class="nav-icon">✳</span>AI Configuration</button>
+          <p class="nav-label secondary-nav-label">OPERATIONS</p>
+          <button class="nav-item" :class="{selected:active==='Agent Runs'}" @click="select('Agent Runs')"><span class="nav-icon">◷</span>Agent Runs</button>
+          <button class="nav-item" :class="{selected:active==='Pilot Operations'}" @click="select('Pilot Operations')"><span class="nav-icon">▤</span>Pilot operations</button>
+          <button class="nav-item" :class="{selected:active==='Corpus Operations'}" @click="select('Corpus Operations')"><span class="nav-icon">▤</span>Corpus operations</button>
+          <button class="nav-item" :class="{selected:active==='Workflows'}" @click="select('Workflows')"><span class="nav-icon">⇢</span>Workflow diagnostics</button>
+        </template>
+      </div>
       <div class="sidebar-bottom"><div class="avatar">{{ currentUser?.name?.slice(0, 2).toUpperCase() || 'YA' }}</div><div><b>{{ currentUser?.name || 'Workspace user' }}</b><small>{{ currentUser?.email || 'Yaandu account' }}</small></div><button class="more" v-if="signedIn" aria-label="Sign out" @click="signOut">⇥</button></div>
     </aside>
     <main class="main">
       <header class="topbar"><div class="breadcrumbs">Workspace <span>/</span> <b>{{ active }}</b></div><div class="top-actions"><select v-if="signedIn && tenantOptions.length > 1" v-model="tenant" class="tenant-switch" aria-label="Select workspace" @change="load"><option v-for="option in tenantOptions" :key="option.id" :value="option.id">{{ option.name }}</option></select><button class="help-button">? <span>Help center</span></button><div class="avatar small">{{ currentUser?.name?.slice(0, 2).toUpperCase() || 'YA' }}</div></div></header>
       <div class="content">
         <div class="page-heading"><div><div class="eyebrow">{{ active === 'Prospect 360' ? 'PROSPECTS' : currentPage.group }}</div><h1>{{ active === 'Prospect 360' ? selectedCompany?.name || 'Prospect 360' : active }}</h1><p>{{ active === 'Home' || active === 'Dashboard' ? 'Your sales work, priorities, and next steps.' : active === 'Prospect 360' ? 'Company context, evidence, relationships, and sales activity.' : `Review and manage your ${active.toLowerCase()} workspace.` }}</p></div></div>
-        <LocalAcceptancePanel v-if="signedIn && tenant" :tenant-id="tenant" />
+        <LocalAcceptancePanel v-if="signedIn && tenant && active !== 'Prospect 360'" :tenant-id="tenant" />
         <div v-if="!signedIn" class="tenant-card"><div><b>Sign in to your workspace</b><p>Use your Yaandu account to securely load tenant data.</p></div><input v-model="email" type="email" placeholder="Work email"/><input v-model="password" type="password" placeholder="Password" @keyup.enter="signIn"/><button class="primary" @click="signIn">Sign in</button></div>
         <div v-else-if="!tenant" class="tenant-card"><div><b>Choose a tenant</b><p>Select a workspace linked to your account.</p></div><select v-if="tenantOptions.length" v-model="tenant"><option value="" disabled>Select workspace</option><option v-for="option in tenantOptions" :key="option.id" :value="option.id">{{ option.name }}</option></select><input v-else v-model="tenant" placeholder="Tenant UUID"/><button class="primary" @click="load">Connect</button></div>
         <div v-if="loginError" class="notice">{{ loginError }}</div>
