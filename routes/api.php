@@ -5,6 +5,7 @@ use App\Http\Controllers\Api\V1\AIConfigurationController;
 use App\Http\Controllers\Api\V1\AuthController;
 use App\Http\Controllers\Api\V1\ScoringRuleController;
 use App\Http\Controllers\Api\V1\CompanyController;
+use App\Http\Controllers\Api\V1\CompanyHumanSalesReviewController;
 use App\Http\Controllers\Api\V1\DiscoveryController;
 use App\Http\Controllers\Api\V1\CampaignController;
 use App\Http\Controllers\Api\V1\OutreachController;
@@ -62,6 +63,8 @@ Route::prefix('v1')->group(function (): void {
     Route::get('/website-screenshots/{screenshot}/content', [CompanyController::class, 'screenshotContent']);
     Route::apiResource('companies', CompanyController::class)->only(['index', 'store', 'show']);
     Route::get('/companies/{company}/intelligence', [CompanyController::class, 'intelligence']);
+    Route::get('/companies/{company}/sales-review', [CompanyHumanSalesReviewController::class, 'show']);
+    Route::put('/companies/{company}/sales-review', [CompanyHumanSalesReviewController::class, 'update'])->middleware('throttle:30,1');
     Route::get('/companies/{company}/website-discovery', [CompanyController::class, 'websiteDiscovery']);
     Route::post('/companies/{company}/website-discovery', [CompanyController::class, 'findWebsite'])->middleware('throttle:10,1');
     Route::post('/websites/{website}/scan', [CompanyController::class, 'scan']);
