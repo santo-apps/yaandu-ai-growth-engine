@@ -16,12 +16,18 @@ final class AIProviderException extends RuntimeException
         public readonly ?string $endpoint = null,
         public readonly ?string $model = null,
         public readonly ?int $elapsedMs = null,
+        public readonly ?int $responseLength = null,
+        public readonly ?string $responseFingerprint = null,
+        public readonly ?string $jsonError = null,
+        public readonly array $normalizations = [],
+        public readonly ?int $inputTokens = null,
+        public readonly ?int $outputTokens = null,
         ?\Throwable $previous = null,
     ) {
         parent::__construct($message, 0, $previous);
     }
 
-    /** @return array<string, int|string|null> */
+    /** @return array<string, mixed> */
     public function safeDiagnostics(): array
     {
         return [
@@ -35,6 +41,17 @@ final class AIProviderException extends RuntimeException
             'endpoint' => $this->endpoint,
             'model' => $this->model,
             'elapsed_ms' => $this->elapsedMs,
+            'response_length' => $this->responseLength,
+            'response_fingerprint' => $this->responseFingerprint,
+            'json_error' => $this->jsonError,
+            'normalizations' => $this->normalizations,
+            'input_tokens' => $this->inputTokens,
+            'output_tokens' => $this->outputTokens,
         ];
+    }
+
+    public function isResponseParseFailure(): bool
+    {
+        return in_array($this->stage, ['response_empty', 'response_malformed', 'response_truncated'], true);
     }
 }

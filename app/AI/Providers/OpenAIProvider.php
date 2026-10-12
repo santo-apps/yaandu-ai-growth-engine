@@ -21,6 +21,10 @@ final class OpenAIProvider extends AbstractJsonProvider
                 'response_format' => ['type' => 'json_object'],
                 'messages' => [['role' => 'system', 'content' => $request->systemInstruction], ['role' => 'user', 'content' => $this->prompt($request)]],
             ], $model);
-        return $this->decode($body['choices'][0]['message']['content'] ?? '', $model, $body['usage']['prompt_tokens'] ?? null, $body['usage']['completion_tokens'] ?? null);
+        $message = $body['choices'][0]['message'] ?? [];
+        $finishReason = $body['choices'][0]['finish_reason'] ?? null;
+        if (is_array($message) && is_string($message['refusal'] ?? null) && trim($message['refusal']) !== '') $this->rejectContentRefusal($model, 'refusal');
+        if ($finishReason === 'content_filter') $this->rejectContentRefusal($model, 'content_filter');
+        return $this->decode(is_string($message['content'] ?? null) ? $message['content'] : '', $model, $body['usage']['prompt_tokens'] ?? null, $body['usage']['completion_tokens'] ?? null);
     }
 }

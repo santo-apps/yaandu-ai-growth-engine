@@ -19,7 +19,12 @@ final class GeminiProvider extends AbstractJsonProvider
         $body = $this->post($url, ['x-goog-api-key' => $key], ['systemInstruction' => ['parts' => [['text' => $request->systemInstruction]]],
             'contents' => [['role' => 'user', 'parts' => [['text' => $this->prompt($request)]]]],
             'generationConfig' => ['temperature' => $request->temperature, 'maxOutputTokens' => $request->maxOutputTokens, 'responseMimeType' => 'application/json']], $model);
-        return $this->decode($body['candidates'][0]['content']['parts'][0]['text'] ?? '', $model,
+        $blockReason = strtolower((string) ($body['promptFeedback']['blockReason'] ?? ''));
+        if (in_array($blockReason, ['safety', 'blocklist', 'prohibited_content', 'recitation'], true)) $this->rejectContentRefusal($model, $blockReason);
+        $finishReason = strtolower((string) ($body['candidates'][0]['finishReason'] ?? ''));
+        if (in_array($finishReason, ['safety', 'blocklist', 'prohibited_content', 'recitation'], true)) $this->rejectContentRefusal($model, $finishReason);
+        $text = $body['candidates'][0]['content']['parts'][0]['text'] ?? '';
+        return $this->decode(is_string($text) ? $text : '', $model,
             $body['usageMetadata']['promptTokenCount'] ?? null, $body['usageMetadata']['candidatesTokenCount'] ?? null);
     }
 }
