@@ -218,15 +218,34 @@ final class OutreachDraftGenerationTest extends TestCase
         DB::table('website_issues')->insert(['id'=>$otherIssue,'tenant_id'=>$tenant->id,'website_scan_id'=>$otherScan,'type'=>'outdated_website','severity'=>'medium',
             'summary'=>'This belongs to a different company.','evidence'=>json_encode(['excerpt'=>'Other company evidence.']),'confidence'=>.95,'detector_version'=>'ai-v1','created_at'=>now(),'updated_at'=>now()]);
 
+        $wrongPageIssue=(string)Str::uuid();$lowConfidenceIssue=(string)Str::uuid();$pendingScan=(string)Str::uuid();$pendingIssue=(string)Str::uuid();
+        DB::table('website_issues')->insert(['id'=>$wrongPageIssue,'tenant_id'=>$tenant->id,'website_scan_id'=>$scan,'website_page_id'=>$page,'type'=>'poor_lead_capture','severity'=>'medium',
+            'summary'=>'Reference page does not match.','evidence'=>json_encode(['excerpt'=>'This reference must not be offered.']),'confidence'=>.95,'detector_version'=>'ai-v1','created_at'=>now(),'updated_at'=>now()]);
+        DB::table('website_issues')->insert(['id'=>$lowConfidenceIssue,'tenant_id'=>$tenant->id,'website_scan_id'=>$scan,'website_page_id'=>$page,'type'=>'digital_opportunity','severity'=>'medium',
+            'summary'=>'Confidence is below threshold.','evidence'=>json_encode(['excerpt'=>'Low confidence issue.']),'confidence'=>.69,'detector_version'=>'ai-v1','created_at'=>now(),'updated_at'=>now()]);
+        DB::table('website_scans')->insert(['id'=>$pendingScan,'tenant_id'=>$tenant->id,'company_website_id'=>$website,'status'=>'queued','max_depth'=>2,'max_pages'=>10,'created_at'=>now(),'updated_at'=>now()]);
+        DB::table('website_issues')->insert(['id'=>$pendingIssue,'tenant_id'=>$tenant->id,'website_scan_id'=>$pendingScan,'type'=>'service_relevance','severity'=>'medium',
+            'summary'=>'Issue from a scan that is not complete.','evidence'=>json_encode(['excerpt'=>'Pending scan evidence.']),'confidence'=>.95,'detector_version'=>'ai-v1','created_at'=>now(),'updated_at'=>now()]);
+
+        [$otherTenant]=$this->fixture('outreach-other-tenant-issue');
+        $foreignWebsite=(string)Str::uuid();$foreignScan=(string)Str::uuid();$foreignIssue=(string)Str::uuid();
+        DB::table('company_websites')->insert(['id'=>$foreignWebsite,'tenant_id'=>$otherTenant->id,'company_id'=>DB::table('companies')->where('tenant_id',$otherTenant->id)->value('id'),
+            'url'=>'https://foreign-company.test/','host'=>'foreign-company.test','created_at'=>now(),'updated_at'=>now()]);
+        DB::table('website_scans')->insert(['id'=>$foreignScan,'tenant_id'=>$otherTenant->id,'company_website_id'=>$foreignWebsite,'status'=>'completed','max_depth'=>2,'max_pages'=>10,'created_at'=>now(),'updated_at'=>now()]);
+        DB::table('website_issues')->insert(['id'=>$foreignIssue,'tenant_id'=>$otherTenant->id,'website_scan_id'=>$foreignScan,'type'=>'technology_opportunity','severity'=>'medium',
+            'summary'=>'Foreign tenant issue.','evidence'=>json_encode(['excerpt'=>'Must not cross tenant boundary.']),'confidence'=>.95,'detector_version'=>'ai-v1','created_at'=>now(),'updated_at'=>now()]);
+
         $unrelated=(string)Str::uuid();
         DB::table('lead_scores')->where('tenant_id',$tenant->id)->where('company_id',$company->id)->update(['components'=>json_encode([
             'poor_mobile_ux'=>['status'=>'POSITIVE','evidence_reference'=>['source'=>'website_issue','id'=>$issue,'page_id'=>$page,'url'=>'https://ebarza.com/','observed'=>'viewport excerpt']],
             'strong_business_fit'=>['status'=>'POSITIVE','evidence_reference'=>['source'=>'business_insight','id'=>$insight,'url'=>'https://ebarza.com/']],
             'outdated_website'=>['status'=>'POSITIVE','evidence_reference'=>['source'=>'website_issue','id'=>$otherIssue]],
-            'technology_opportunity'=>['status'=>'POSITIVE','evidence_reference'=>['source'=>'website_page','id'=>$unrelated,'url'=>'https://ebarza.com/','excerpt'=>'unrelated page text']],
-            'poor_lead_capture'=>['status'=>'NEGATIVE','evidence_reference'=>['source'=>'website_issue','id'=>$issue]],
-            'no_whatsapp'=>['status'=>'UNKNOWN','evidence_reference'=>['source'=>'website_issue','id'=>$issue]],
-            'no_crm'=>['status'=>'NOT_CONFIGURED','evidence_reference'=>['source'=>'website_issue','id'=>$issue]],
+            'poor_lead_capture'=>['status'=>'POSITIVE','evidence_reference'=>['source'=>'website_issue','id'=>$wrongPageIssue,'page_id'=>(string)Str::uuid()]],
+            'digital_opportunity'=>['status'=>'POSITIVE','evidence_reference'=>['source'=>'website_issue','id'=>$lowConfidenceIssue]],
+            'service_relevance'=>['status'=>'POSITIVE','evidence_reference'=>['source'=>'website_issue','id'=>$pendingIssue]],
+            'technology_opportunity'=>['status'=>'POSITIVE','evidence_reference'=>['source'=>'website_issue','id'=>$foreignIssue]],
+            'no_whatsapp'=>['status'=>'NEGATIVE','evidence_reference'=>['source'=>'website_issue','id'=>$issue]],
+            'no_crm'=>['status'=>'UNKNOWN','evidence_reference'=>['source'=>'website_issue','id'=>$issue]],
         ])]);
         DB::table('ai_model_configurations')->insert(['id'=>(string)Str::uuid(),'tenant_id'=>$tenant->id,'task_key'=>'outreach_drafting','provider'=>'conversation-test','model'=>'synthetic-test-model','enabled'=>true,
             'parameters'=>json_encode(['max_output_tokens'=>1800]),'version'=>1,'created_at'=>now(),'updated_at'=>now()]);
@@ -243,12 +262,27 @@ final class OutreachDraftGenerationTest extends TestCase
         self::assertSame(['website issue','business insight'],array_column($workspace['findings'],'source'));
         self::assertSame(['website_issue','business_insight'],array_column(array_column($workspace['findings'],'evidence_reference'),'source'));
         self::assertSame([$issue,$insight],array_column($workspace['findings'],'id'));
-        self::assertSame(['poor_mobile_ux','strong_business_fit'],array_column($workspace['findings'],'type'));
+        self::assertSame(['website_issue','strong_business_fit'],array_column($workspace['findings'],'type'));
+        self::assertSame('meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1"',$workspace['findings'][0]['evidence']);
         self::assertTrue(collect($workspace['readiness']['checks'])->firstWhere('key','findings')['ready']);
         self::assertTrue($workspace['generation_ready']);
         self::assertCount(0,$provider->requests,'Readiness/workspace loading must not call AI.');
+        self::assertSame(0,DB::table('outreach_drafts')->where('tenant_id',$tenant->id)->count(),'Loading candidate findings must not create an outreach record.');
+        $this->assertDatabaseCount('outbound_messages',0);
+        $this->assertDatabaseCount('campaign_recipients',0);
         self::assertDatabaseHas('lead_scores',['tenant_id'=>$tenant->id,'company_id'=>$company->id,'score'=>60]);
         $this->assertDatabaseHas('company_human_sales_reviews',['tenant_id'=>$tenant->id,'company_id'=>$company->id,'decision'=>'pursue']);
+
+        DB::table('website_issues')->where('tenant_id',$tenant->id)->where('id',$issue)->update(['evidence'=>json_encode(['source_url'=>'https://ebarza.com/','marker'=>'internal detector marker'])]);
+        $referenceExcerpt='meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1"';
+        DB::table('lead_scores')->where('tenant_id',$tenant->id)->where('company_id',$company->id)->update(['components'=>json_encode([
+            'poor_mobile_ux'=>['status'=>'POSITIVE','evidence_reference'=>['source'=>'website_issue','id'=>$issue,'page_id'=>$page,'observed'=>$referenceExcerpt]],
+            'strong_business_fit'=>['status'=>'POSITIVE','evidence_reference'=>['source'=>'business_insight','id'=>$insight]],
+        ])]);
+        $referenceEvidenceWorkspace=$this->withHeaders(['X-Tenant-ID'=>$tenant->id])->getJson('/api/v1/companies/'.$company->id.'/outreach-drafts')->assertOk()->json();
+        self::assertSame($referenceExcerpt,$referenceEvidenceWorkspace['findings'][0]['evidence'],'Use only the explicit scorer observation when the stored issue payload has no reviewer-safe excerpt.');
+        self::assertStringNotContainsString('internal detector marker',$referenceEvidenceWorkspace['findings'][0]['evidence']);
+        DB::table('website_issues')->where('tenant_id',$tenant->id)->where('id',$issue)->update(['evidence'=>json_encode(['source_url'=>'https://ebarza.com/','excerpt'=>$referenceExcerpt])]);
 
         $unsupportedInsight=(string)Str::uuid();
         DB::table('lead_insights')->insert(['id'=>$unsupportedInsight,'tenant_id'=>$tenant->id,'company_id'=>$company->id,'kind'=>'business_fit','statement'=>'Unsubstantiated fit claim.','confidence'=>.95,'created_at'=>now(),'updated_at'=>now()]);

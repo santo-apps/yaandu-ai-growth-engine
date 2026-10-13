@@ -136,19 +136,23 @@ final class OutreachDraftService
         if(!is_string($id)||!Str::isUuid($id))return null;
 
         if($source==='website_issue'){
+            if(is_array($reference)&&isset($reference['page_id'])&&(!is_string($reference['page_id'])||!Str::isUuid($reference['page_id'])))return null;
             $issue=DB::table('website_issues')->join('website_scans','website_scans.id','=','website_issues.website_scan_id')
                 ->join('company_websites','company_websites.id','=','website_scans.company_website_id')
                 ->where('website_issues.id',$id)->where('website_issues.tenant_id',$tenantId)->where('website_scans.tenant_id',$tenantId)
                 ->where('company_websites.tenant_id',$tenantId)->where('company_websites.company_id',$companyId)
                 ->where('website_scans.status','completed')
                 ->where('website_issues.type',$dimension)->where('website_issues.confidence','>=',0.7)
-                ->first(['website_issues.id','website_issues.summary','website_issues.evidence','website_issues.confidence']);
+                ->when(is_array($reference)&&isset($reference['page_id']),fn($query)=>$query->where('website_issues.website_page_id',$reference['page_id']))
+                ->first(['website_issues.id','website_issues.website_page_id','website_issues.summary','website_issues.evidence','website_issues.confidence']);
             if(!$issue)return null;
             $evidence=is_array($issue->evidence)?$issue->evidence:(json_decode((string)$issue->evidence,true)?:[]);
             $summary=$this->safeEvidenceSummary($evidence);
+            if($summary===''&&is_array($reference)&&is_string($reference['observed']??null))$summary=$this->safeEvidenceSummary($reference['observed']);
             if($summary==='')return null;
-            return ['id'=>(string)$issue->id,'key'=>$dimension,'type'=>$dimension,'label'=>$label,'summary'=>mb_substr((string)$issue->summary,0,400),
-                'evidence'=>$summary,'confidence'=>(float)$issue->confidence,'source'=>'website issue','evidence_reference'=>['source'=>'website_issue','id'=>(string)$issue->id]];
+            return ['id'=>(string)$issue->id,'key'=>$dimension,'type'=>'website_issue','label'=>$label,'summary'=>mb_substr((string)$issue->summary,0,400),
+                'evidence'=>$summary,'confidence'=>(float)$issue->confidence,'source'=>'website issue','evidence_reference'=>[
+                    'source'=>'website_issue','id'=>(string)$issue->id,'page_id'=>$issue->website_page_id ? (string)$issue->website_page_id : null]];
         }
 
         if($source==='business_insight'&&$dimension==='strong_business_fit'){
