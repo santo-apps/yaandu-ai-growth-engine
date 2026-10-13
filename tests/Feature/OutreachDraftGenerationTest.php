@@ -140,6 +140,61 @@ final class OutreachDraftGenerationTest extends TestCase
         self::assertSame(['poor_mobile_ux'],array_column($workspace['findings'],'type'));
     }
 
+    public function test_workspace_uses_only_canonical_lead_evidence_reference_and_ignores_mixed_reference_metadata(): void
+    {
+        [$tenant,$user,$company,,$finding]=$this->fixture('outreach-mixed-evidence-reference');
+        $unrelatedUuid=(string)Str::uuid();
+        $lowConfidenceInsight=(string)Str::uuid();$lowConfidenceEvidence=(string)Str::uuid();
+        DB::table('lead_insights')->insert(['id'=>$lowConfidenceInsight,'tenant_id'=>$tenant->id,'company_id'=>$company->id,'kind'=>'website','statement'=>'Low confidence finding.','confidence'=>.5,'created_at'=>now(),'updated_at'=>now()]);
+        DB::table('lead_evidence')->insert(['id'=>$lowConfidenceEvidence,'tenant_id'=>$tenant->id,'lead_insight_id'=>$lowConfidenceInsight,'evidence_type'=>'website_issue',
+            'source_url'=>'https://ebarza.com/','excerpt'=>'Low confidence evidence.','observed_at'=>now(),'confidence'=>.5,'created_at'=>now(),'updated_at'=>now()]);
+        DB::table('lead_scores')->where('tenant_id',$tenant->id)->where('company_id',$company->id)->update(['components'=>json_encode([
+            'poor_mobile_ux'=>['status'=>'POSITIVE','evidence_reference'=>[
+                'source'=>'lead_evidence','id'=>$finding,'url'=>'https://ebarza.com/','evidence_type'=>'website_issue',
+                'source_id'=>$unrelatedUuid,'page_id'=>(string)Str::uuid(),'excerpt'=>'meta name="viewport" content="width=device-width"',
+            ]],
+            'outdated_website'=>['status'=>'POSITIVE','evidence_reference'=>[
+                'source'=>'website_issue','id'=>(string)Str::uuid(),'url'=>'https://ebarza.com/','evidence_type'=>'website_issue',
+                'source_id'=>$unrelatedUuid,'page_id'=>(string)Str::uuid(),'observed'=>'meta name="viewport" content="width=device-width"',
+            ]],
+            'technology_opportunity'=>['status'=>'POSITIVE','evidence_reference'=>['source'=>'lead_evidence','id'=>$lowConfidenceEvidence]],
+            'no_whatsapp'=>['status'=>'NEGATIVE','evidence_reference'=>$finding],
+            'no_crm'=>['status'=>'UNKNOWN','evidence_reference'=>$finding],
+        ])]);
+
+        $provider=$this->provider($tenant->id,$finding);
+        $queries=[];
+        DB::listen(function($query)use(&$queries):void{
+            if(str_contains($query->sql,'lead_evidence'))$queries[]=['sql'=>$query->sql,'bindings'=>$query->bindings];
+        });
+        Sanctum::actingAs($user);
+        $workspace=$this->withHeaders(['X-Tenant-ID'=>$tenant->id])->getJson('/api/v1/companies/'.$company->id.'/outreach-drafts')->assertOk()->json();
+
+        self::assertSame([$finding],array_column($workspace['findings'],'id'));
+        self::assertSame(['poor_mobile_ux'],array_column($workspace['findings'],'type'));
+        $evidenceQuery=collect($queries)->first(fn(array $query):bool=>str_contains($query['sql'],'lead_evidence')&&str_contains($query['sql'],' in '));
+        self::assertNotNull($evidenceQuery,'The canonical lead evidence query should execute.');
+        $normalizedSql=str_replace('"','',$evidenceQuery['sql']);
+        self::assertStringContainsString('lead_evidence.tenant_id',$normalizedSql);
+        self::assertStringContainsString('lead_insights.tenant_id',$normalizedSql);
+        self::assertStringContainsString('lead_insights.company_id',$normalizedSql);
+        self::assertMatchesRegularExpression('/lead_evidence.*id.*\s+in\s*\(\?\)/',$normalizedSql);
+        self::assertSame([$tenant->id,$tenant->id,$company->id,$finding,0.7],$evidenceQuery['bindings'],
+            'The ID filter must receive only the canonical evidence ID; tenant/company/confidence scoping must remain.');
+        self::assertNotContains($lowConfidenceEvidence,array_column($workspace['findings'],'id'));
+        self::assertNotContains('https://ebarza.com/',$evidenceQuery['bindings']);
+        self::assertNotContains('website_issue',$evidenceQuery['bindings']);
+        self::assertNotContains('meta name="viewport" content="width=device-width"',$evidenceQuery['bindings']);
+        self::assertNotContains($unrelatedUuid,$evidenceQuery['bindings']);
+        self::assertSame(0.92,(float)$workspace['findings'][0]['confidence']);
+        self::assertCount(0,$provider->requests,'Loading the workspace must not call AI.');
+        $this->assertDatabaseCount('outbound_messages',0);
+        $this->assertDatabaseCount('campaign_recipients',0);
+        $this->assertDatabaseCount('campaign_events',0);
+        $this->assertDatabaseCount('outreach_drafts',0);
+        $this->assertDatabaseHas('lead_scores',['tenant_id'=>$tenant->id,'company_id'=>$company->id,'score'=>60]);
+    }
+
     public function test_unusable_provider_output_fails_safely_without_persisting_or_leaking_raw_output(): void
     {
         [$tenant,$user,$company,,$finding]=$this->fixture('outreach-invalid-output');

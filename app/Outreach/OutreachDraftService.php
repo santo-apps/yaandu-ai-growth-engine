@@ -121,13 +121,37 @@ final class OutreachDraftService
         foreach($issues as $row){if(($components[$row->type]['status']??null)!=='POSITIVE')continue;$evidence=is_array($row->evidence)?$row->evidence:(json_decode((string)$row->evidence,true)?:[]);
             $findings[]=['id'=>(string)$row->id,'type'=>$row->type,'label'=>self::LABELS[$row->type],'summary'=>mb_substr((string)$row->summary,0,400),'evidence'=>$this->safeEvidenceSummary($evidence),'confidence'=>(float)$row->confidence,'source'=>'deterministic website finding'];}
         foreach(self::LABELS as $dimension=>$label){$component=$components[$dimension]??null;if(($component['status']??null)!=='POSITIVE'||empty($component['evidence_reference']))continue;
-            $ref=$component['evidence_reference'];$refs=is_string($ref)?[$ref]:(is_array($ref)?array_values($ref):[]);
+            $refs=$this->leadEvidenceIds($component['evidence_reference']);
+            if($refs===[])continue;
             $rows=DB::table('lead_evidence')->join('lead_insights',function($join):void{$join->on('lead_insights.id','=','lead_evidence.lead_insight_id')->on('lead_insights.tenant_id','=','lead_evidence.tenant_id');})
                 ->where('lead_evidence.tenant_id',$tenantId)->where('lead_insights.tenant_id',$tenantId)->where('lead_insights.company_id',$companyId)->whereIn('lead_evidence.id',$refs)->where('lead_evidence.confidence','>=',0.7)
                 ->get(['lead_evidence.id','lead_evidence.excerpt','lead_evidence.confidence','lead_insights.statement']);
             foreach($rows as $row){if(collect($findings)->contains('id',(string)$row->id))continue;$findings[]=['id'=>(string)$row->id,'type'=>$dimension,'label'=>$label,'summary'=>mb_substr((string)$row->statement,0,400),'evidence'=>mb_substr((string)$row->excerpt,0,500),'confidence'=>(float)$row->confidence,'source'=>'validated scoring evidence'];}}
         return array_slice($findings,0,12);
     }
+
+    /**
+     * Score references are polymorphic. Only the explicit legacy scalar ID and
+     * fields that name lead_evidence IDs are valid input to lead_evidence.id.
+     * URLs, excerpts, page/source IDs, and other UUIDs are intentionally ignored.
+     */
+    private function leadEvidenceIds(mixed $reference):array
+    {
+        $candidates=[];
+        if(is_string($reference)){
+            // Older scoring records store a lead_evidence ID directly.
+            $candidates[]=$reference;
+        }elseif(is_array($reference)){
+            if(($reference['source']??null)==='lead_evidence'&&isset($reference['id']))$candidates[]=$reference['id'];
+        }
+
+        $ids=[];
+        foreach($candidates as $candidate){
+            if(is_string($candidate)&&Str::isUuid($candidate))$ids[]=$candidate;
+        }
+        return array_values(array_unique($ids));
+    }
+
     private function company(string $tenantId,string $id):object{$row=DB::table('companies')->where('tenant_id',$tenantId)->where('id',$id)->where('status','!=','discovery_candidate')->first();abort_unless($row,404);return $row;}
     private function review(string $tenantId,string $id):?object{return DB::table('company_human_sales_reviews as review')->where('review.tenant_id',$tenantId)->where('review.company_id',$id)
         ->leftJoin('tenant_services as service',function($join):void{$join->on('service.id','=','review.selected_service_id')->on('service.tenant_id','=','review.tenant_id');})
