@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
+import EmptyState from './ui/EmptyState.vue'
 
 type Conversation = {
   id: string; status: string; channel: string; intent: string | null; intent_confidence: number | null
@@ -298,7 +299,7 @@ onMounted(() => { void loadList(); void loadSchedulingConfiguration(); void load
           <small>{{ item.company?.name }} · {{ item.intent?.replaceAll('_', ' ') || item.channel }}</small>
           <span class="conversation-preview">{{ item.ai_summary || 'No AI summary yet.' }}</span>
         </button>
-        <div v-if="!conversations.length" class="empty-table">{{ loading ? 'Loading conversations…' : 'No conversations yet. Accepted campaign messages will appear here.' }}</div>
+        <div v-if="loading && !conversations.length" class="empty-table" role="status">Loading conversations…</div><EmptyState v-else-if="!conversations.length" title="No conversations yet" description="New prospect replies and conversations will appear here when available." icon="✉" />
       </section>
 
       <template v-if="selected">
@@ -338,7 +339,7 @@ onMounted(() => { void loadList(); void loadSchedulingConfiguration(); void load
           <div v-else class="empty-table">No evidence is available for this company yet.</div>
         </section>
       </template>
-      <section v-else class="panel conversation-detail empty-table">Select a conversation to inspect its messages and lead context.</section>
+      <section v-else class="panel conversation-detail conversation-detail--empty"><EmptyState title="Choose a conversation" description="Select a person or company from the inbox to review the message history, lead context, and next action." icon="◌" /></section>
     </div>
   </div>
 </template>

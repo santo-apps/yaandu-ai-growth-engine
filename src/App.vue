@@ -15,8 +15,10 @@ import SetupWorkspace from './components/SetupWorkspace.vue'
 import LocalAcceptancePanel from './components/LocalAcceptancePanel.vue'
 import CorpusOperationsWorkspace from './components/CorpusOperationsWorkspace.vue'
 import PilotOperationsDashboard from './components/PilotOperationsDashboard.vue'
+import PilotDashboard from './components/PilotDashboard.vue'
 import IcpConfigurationWorkspace from './components/IcpConfigurationWorkspace.vue'
 import WebsiteIntelligenceView from './components/WebsiteIntelligenceView.vue'
+import AppPageHeader from './components/ui/AppPageHeader.vue'
 
 type Page = 'Home' | 'Prospects' | 'Prospect 360' | 'Outreach' | 'Inbox' | 'Pipeline' | 'Meetings' | 'Dashboard' | 'Companies' | 'Campaigns' | 'Marketing Intelligence' | 'Conversation Inbox' | 'Proposals' | 'Workflows' | 'Approval Center' | 'Automation' | 'Company Details' | 'Website Intelligence' | 'Contacts' | 'Lead Scores' | 'ICP Configuration' | 'Agent Runs' | 'Corpus Operations' | 'Pilot Operations' | 'AI Configuration' | 'Setup' | 'Services & Pricing'
 const pages: { name: Page; icon: string; group: string }[] = [
@@ -36,6 +38,8 @@ const tenantOptions = ref<{ id: string; name: string; role: string }[]>([])
 const currentUser = ref<{ id: number; name: string; email: string } | null>(null)
 const email = ref('')
 const password = ref('')
+const loginBusy = ref(false)
+const mobileNavOpen = ref(false)
 const signedIn = ref(false)
 const loginError = ref('')
 const showAdd = ref(false)
@@ -89,6 +93,8 @@ async function load() {
 }
 
 async function signIn() {
+  if (loginBusy.value) return
+  loginBusy.value = true
   loginError.value = ''
   try {
     await fetch('/sanctum/csrf-cookie', { credentials: 'include' })
@@ -101,6 +107,7 @@ async function signIn() {
     if (!tenantOptions.value.some((item) => item.id === tenant.value)) tenant.value = tenantOptions.value.length === 1 ? tenantOptions.value[0].id : ''
     await load()
   } catch (exception) { loginError.value = exception instanceof Error ? exception.message : 'Unable to sign in.' }
+  finally { loginBusy.value = false }
 }
 
 async function restoreSession() {
@@ -295,6 +302,7 @@ async function scoreCompany(company: any) {
 }
 
 function select(page: Page) {
+  mobileNavOpen.value = false
   if (page === 'Outreach') outreachKnowledgeOnly.value = false
   active.value = page
   if (page === 'Agent Runs') void load()
@@ -339,7 +347,8 @@ onBeforeUnmount(() => screenshotUrls.value.forEach((screenshot) => URL.revokeObj
 
 <template>
   <div class="shell">
-    <aside class="sidebar">
+    <button v-if="mobileNavOpen" class="mobile-nav-backdrop" aria-label="Close navigation" @click="mobileNavOpen = false"></button>
+    <aside class="sidebar" :class="{ 'sidebar--open': mobileNavOpen }">
       <div class="brand"><span class="brand-mark">Y</span><span>yaandu<span class="brand-light">growth</span></span></div>
       <div class="workspace"><div class="workspace-icon">Y</div><div><b>{{ selectedTenant?.name || 'Yaandu' }}</b><small>{{ selectedTenant ? (isManager ? 'Manager workspace' : 'Sales workspace') : 'Growth workspace' }}</small></div><span class="chevron">⌄</span></div>
       <div class="sidebar-navigation">
@@ -364,14 +373,16 @@ onBeforeUnmount(() => screenshotUrls.value.forEach((screenshot) => URL.revokeObj
       <div class="sidebar-bottom"><div class="avatar">{{ currentUser?.name?.slice(0, 2).toUpperCase() || 'YA' }}</div><div><b>{{ currentUser?.name || 'Workspace user' }}</b><small>{{ currentUser?.email || 'Yaandu account' }}</small></div><button class="more" v-if="signedIn" aria-label="Sign out" @click="signOut">⇥</button></div>
     </aside>
     <main class="main">
-      <header class="topbar"><div class="breadcrumbs">Workspace <span>/</span> <b>{{ active }}</b></div><div class="top-actions"><select v-if="signedIn && tenantOptions.length > 1" v-model="tenant" class="tenant-switch" aria-label="Select workspace" @change="load"><option v-for="option in tenantOptions" :key="option.id" :value="option.id">{{ option.name }}</option></select><button class="help-button">? <span>Help center</span></button><div class="avatar small">{{ currentUser?.name?.slice(0, 2).toUpperCase() || 'YA' }}</div></div></header>
+      <header class="topbar"><button class="mobile-nav-toggle" type="button" aria-label="Open navigation" :aria-expanded="mobileNavOpen" @click="mobileNavOpen = !mobileNavOpen">☰</button><div class="breadcrumbs">Workspace <span>/</span> <b>{{ active }}</b></div><div class="top-actions"><select v-if="signedIn && tenantOptions.length > 1" v-model="tenant" class="tenant-switch" aria-label="Select workspace" @change="load"><option v-for="option in tenantOptions" :key="option.id" :value="option.id">{{ option.name }}</option></select><button class="help-button">? <span>Help center</span></button><div class="avatar small">{{ currentUser?.name?.slice(0, 2).toUpperCase() || 'YA' }}</div></div></header>
       <div class="content">
-        <div class="page-heading"><div><div class="eyebrow">{{ active === 'Prospect 360' ? 'PROSPECTS' : currentPage.group }}</div><h1>{{ active === 'Prospect 360' ? selectedCompany?.name || 'Prospect 360' : active }}</h1><p>{{ active === 'Home' || active === 'Dashboard' ? 'Your sales work, priorities, and next steps.' : active === 'Prospect 360' ? 'Company context, evidence, relationships, and sales activity.' : `Review and manage your ${active.toLowerCase()} workspace.` }}</p></div></div>
-        <LocalAcceptancePanel v-if="signedIn && tenant && active !== 'Prospect 360'" :tenant-id="tenant" />
-        <div v-if="!signedIn" class="tenant-card"><div><b>Sign in to your workspace</b><p>Use your Yaandu account to securely load tenant data.</p></div><input v-model="email" type="email" placeholder="Work email"/><input v-model="password" type="password" placeholder="Password" @keyup.enter="signIn"/><button class="primary" @click="signIn">Sign in</button></div>
+        <AppPageHeader :eyebrow="active === 'Prospect 360' ? 'Prospects' : currentPage.group" :title="active === 'Prospect 360' ? selectedCompany?.name || 'Prospect 360' : active" :description="active === 'Home' || active === 'Dashboard' ? 'Your sales work, priorities, and next steps.' : active === 'Prospect 360' ? 'Company context, evidence, relationships, and sales activity.' : `Review and manage your ${active.toLowerCase()} workspace.`">
+          <template #actions><button v-if="active === 'Prospects' || active === 'Companies'" class="primary" @click="select('Prospects'); showAdd = true">Add prospect</button></template>
+        </AppPageHeader>
+        <LocalAcceptancePanel v-if="signedIn && tenant && isManager && ['Setup', 'Pilot Operations'].includes(active)" :tenant-id="tenant" />
+        <form v-if="!signedIn" class="tenant-card login-card" @submit.prevent="signIn"><div class="login-copy"><span class="login-mark">Y</span><div><b>Welcome to Yaandu Growth</b><p>Sign in to securely open your sales workspace.</p></div></div><label class="login-field"><span>Work email</span><input v-model="email" type="email" autocomplete="username" required placeholder="you@company.com"/></label><label class="login-field"><span>Password</span><input v-model="password" type="password" autocomplete="current-password" required placeholder="Enter your password"/></label><button class="primary login-submit" :disabled="loginBusy">{{ loginBusy ? 'Signing in…' : 'Sign in' }}</button></form>
         <div v-else-if="!tenant" class="tenant-card"><div><b>Choose a tenant</b><p>Select a workspace linked to your account.</p></div><select v-if="tenantOptions.length" v-model="tenant"><option value="" disabled>Select workspace</option><option v-for="option in tenantOptions" :key="option.id" :value="option.id">{{ option.name }}</option></select><input v-else v-model="tenant" placeholder="Tenant UUID"/><button class="primary" @click="load">Connect</button></div>
-        <div v-if="loginError" class="notice">{{ loginError }}</div>
-        <div v-if="error && tenant" class="notice">{{ error }} <button @click="load">Retry</button></div>
+        <div v-if="loginError" class="notice" role="alert">{{ loginError }}</div>
+        <div v-if="error && tenant" class="notice" role="alert">{{ error }} <button @click="load">Retry</button></div>
         <div v-if="discoveryNotice" class="notice success-notice">{{ discoveryNotice }}</div>
         <form v-if="showDiscovery && active === 'Companies'" class="tenant-card add-company" @submit.prevent="startDiscovery"><div><b>Discover a company</b><p>Register a company from a public business website. Discovery runs asynchronously.</p></div><input v-model="discoveryDraft.name" required maxlength="255" placeholder="Company name"/><input v-model="discoveryDraft.website" required type="url" maxlength="2048" placeholder="https://company.com"/><input v-model="discoveryDraft.industry" maxlength="150" placeholder="Industry"/><input v-model="discoveryDraft.location" maxlength="150" placeholder="Location"/><button class="primary" :disabled="discoveryBusy">{{ discoveryBusy ? 'Queueing…' : 'Start discovery' }}</button></form>
         <form v-if="showAdd && active === 'Companies'" class="tenant-card add-company" @submit.prevent="createCompany"><input v-model="companyDraft.name" required placeholder="Company name"/><input v-model="companyDraft.website" type="url" placeholder="https://company.com"/><input v-model="companyDraft.industry" placeholder="Industry"/><input v-model="companyDraft.location" placeholder="Location"/><button class="primary">Save company</button></form>
@@ -384,7 +395,7 @@ onBeforeUnmount(() => screenshotUrls.value.forEach((screenshot) => URL.revokeObj
         <PipelineWorkspace v-else-if="active === 'Pipeline' && signedIn && tenant" :tenant-id="tenant" :focus-id="focusedOpportunityId" @open-prospect="openProspect" @open-inbox="openInbox" @open-meetings="select('Meetings')" @open-proposals="select('Proposals')" />
         <MeetingsWorkspace v-else-if="active === 'Meetings' && signedIn && tenant" :tenant-id="tenant" @open-prospect="openProspect" @open-inbox="openInbox" @open-pipeline="openPipeline" />
         <CorpusOperationsWorkspace v-else-if="active === 'Corpus Operations' && signedIn && tenant && isManager" :tenant-id="tenant" />
-        <PilotOperationsDashboard v-else-if="active === 'Pilot Operations' && signedIn && tenant && isManager" :tenant-id="tenant" @open-prospects="select('Prospects')" />
+        <template v-else-if="active === 'Pilot Operations' && signedIn && tenant && isManager"><PilotDashboard :tenant-id="tenant" /><PilotOperationsDashboard :tenant-id="tenant" @open-prospects="select('Prospects')" /></template>
         <template v-else-if="active === 'Dashboard'">
           <div class="stats-grid">
             <article class="stat-card"><div class="stat-top"><span>Total companies</span><span class="stat-icon blue">▦</span></div><strong>{{ dashboardSummary.companies }}</strong><small>In your prospecting database</small></article>

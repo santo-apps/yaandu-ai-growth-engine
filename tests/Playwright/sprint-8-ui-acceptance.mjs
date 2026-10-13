@@ -102,7 +102,14 @@ try {
     if (path === '/me') body = { id: 1, name: 'Synthetic Reviewer', email: 'reviewer@example.test' }
     else if (path === '/tenants') body = [{ id: tenantId, name: 'Synthetic Pilot Workspace', role: 'owner', status: 'active' }]
     else if (path === '/companies' || path.startsWith('/companies?')) body = { data: [fixtureCompany] }
-    else if (path === `/companies/${companyId}/outreach-drafts` && method === 'GET') body = { eligible: fixtureReview?.decision === 'pursue' && Boolean(fixtureReview?.selected_service_id), review: fixtureReview, findings: [{ id: '50000000-0000-4000-8000-000000000001', type: 'poor_mobile_ux', label: 'Poor mobile experience', summary: 'Viewport metadata disables user zoom on the inspected page.', confidence: .99, source: 'deterministic website finding' }], drafts: fixtureOutreachDraft ? [fixtureOutreachDraft] : [] }
+    else if (path === `/companies/${companyId}/outreach-drafts` && method === 'GET') body = { eligible: fixtureReview?.decision === 'pursue' && Boolean(fixtureReview?.selected_service_id), generation_ready: true, readiness: { checks: [
+      { key: 'sales_decision', label: 'Prospect marked Pursue', ready: true, detail: 'Approved sales decision is in place.' },
+      { key: 'service', label: 'Active service selected', ready: true, detail: 'The selected service is active and approved.' },
+      { key: 'findings', label: 'Approved findings selected', ready: true, detail: '1 validated finding available for human selection.' },
+      { key: 'route', label: 'AI writing route configured', ready: true, detail: 'A tenant-specific route is enabled.' },
+      { key: 'credential', label: 'AI provider available', ready: true, detail: 'Provider credentials are configured.' },
+      { key: 'prompt', label: 'Approved outreach prompt', ready: true, detail: 'An approved active prompt is available.' },
+    ], route: { provider: 'openai', model: 'synthetic-test', enabled: true }, prompt: { approved_active: true } }, review: fixtureReview, findings: [{ id: '50000000-0000-4000-8000-000000000001', type: 'poor_mobile_ux', label: 'Poor mobile experience', summary: 'Viewport metadata disables user zoom on the inspected page.', confidence: .99, source: 'deterministic website finding' }], drafts: fixtureOutreachDraft ? [fixtureOutreachDraft] : [] }
     else if (path === `/companies/${companyId}/outreach-drafts` && method === 'POST') {
       draftMutationRequests.push(route.request().postDataJSON())
       fixtureOutreachDraft = { id: '60000000-0000-4000-8000-000000000001', version: fixtureOutreachDraft ? fixtureOutreachDraft.version + 1 : 1,
@@ -180,6 +187,7 @@ try {
   ]
   const results = []
   for (const [label, navLabel] of screens) {
+    await page.setViewportSize({ width: 1440, height: 1000 })
     if (navLabel !== 'Home') await page.getByRole('button', { name: new RegExp(navLabel) }).first().click()
     await page.locator('h1').first().waitFor()
     const heading = await page.locator('h1').first().innerText()
@@ -227,6 +235,7 @@ try {
       assert.equal(salesReviewRequests.length, 1, 'Saving human review makes one review-only PUT')
       assert.deepEqual(mutatingRequests, [], 'Human review does not call scoring, crawling, AI, campaign, or outreach endpoints')
       await page.reload({ waitUntil: 'networkidle' })
+      await page.setViewportSize({ width: 1440, height: 1000 })
       await page.getByRole('button', { name: /Prospects/ }).first().click()
       await page.getByText('Synthetic Pilot Company', { exact: true }).first().click()
       await page.getByRole('heading', { name: 'What should happen with this prospect?' }).waitFor()
@@ -234,8 +243,11 @@ try {
       assert.equal(await page.getByLabel(/Relevant service/).inputValue(), fixtureServices[0].id)
       await page.getByRole('button', { name: 'Outreach', exact: true }).click()
       await page.getByRole('heading', { name: 'Outreach draft' }).waitFor()
+      await page.getByRole('heading', { name: 'Outreach draft readiness' }).waitFor()
+      assert.equal(await page.getByText('Select findings', { exact: true }).count(), 1, 'The UI requires explicit finding selection before generation')
       assert.equal(await page.locator('.finding-option input').first().isChecked(), false, 'Evidence findings are never preselected')
       await page.locator('.finding-option input').first().check()
+      assert.equal(await page.getByText('Ready to generate', { exact: true }).count(), 1, 'The generation gate becomes ready after explicit selection')
       await page.getByRole('button', { name: 'Generate outreach draft' }).click()
       await page.getByText('Draft saved for your review. Nothing was sent.').waitFor()
       await page.getByText('A thought on mobile usability', { exact: true }).waitFor()
@@ -252,17 +264,20 @@ try {
       await page.getByRole('heading', { name: 'Outreach draft' }).waitFor()
       await page.getByText('Draft 1').waitFor()
       await page.setViewportSize({ width: 390, height: 740 })
+      await page.getByRole('button', { name: 'Open navigation' }).click()
       const nav = page.locator('.sidebar-navigation')
       assert.ok(await nav.getByRole('button', { name: /AI Configuration/ }).count(), 'Lower management navigation remains available on mobile')
-      await nav.evaluate((element) => { element.scrollLeft = element.scrollWidth })
+      await nav.evaluate((element) => { element.scrollTop = element.scrollHeight })
       assert.ok(await nav.getByRole('button', { name: /Workflow diagnostics/ }).count(), 'Lower operations navigation remains reachable in the scrollable navigation')
       assert.ok(await page.locator('.sidebar-bottom').isVisible(), 'Sidebar account/footer actions remain visible on mobile')
+      await page.setViewportSize({ width: 1440, height: 1000 })
       await page.setViewportSize({ width: 1440, height: 420 })
       await page.locator('.sidebar-navigation').evaluate((element) => { element.scrollTop = element.scrollHeight })
       assert.ok(await page.locator('.sidebar-navigation').getByRole('button', { name: /Workflow diagnostics/ }).isVisible(), 'Sidebar body scrolls independently in a short viewport')
       assert.ok(await page.locator('.sidebar-bottom').getByRole('button', { name: 'Sign out' }).isVisible(), 'Sidebar footer actions remain reachable in a short viewport')
       await page.setViewportSize({ width: 1440, height: 1000 })
       results.push(await inspect(page, 'Prospect 360', outputDirectory))
+      await page.setViewportSize({ width: 1440, height: 1000 })
       await page.getByRole('button', { name: 'Website', exact: true }).click()
       await page.getByText('Latest scan').waitFor()
       await page.getByText('Executive summary', { exact: true }).waitFor()
@@ -299,8 +314,10 @@ try {
       assert.ok(!/gap|missing|poor|problem/i.test(await whatsappCard.innerText()), 'WhatsApp presence is not labeled as a gap')
       assert.deepEqual(mutatingRequests, [], 'Viewing website evidence has no scoring or workflow side effects')
       results.push(await inspect(page, 'Website Intelligence', outputDirectory))
+      await page.setViewportSize({ width: 1440, height: 1000 })
       await page.getByRole('button', { name: 'Contacts', exact: false }).click()
       results.push(await inspect(page, 'Contacts', outputDirectory))
+      await page.setViewportSize({ width: 1440, height: 1000 })
       await page.getByRole('button', { name: /^Activity/ }).click()
       results.push(await inspect(page, 'Activity', outputDirectory))
     }
@@ -308,10 +325,23 @@ try {
   }
 
   for (const label of ['Outreach', 'Inbox', 'Pipeline', 'Meetings', 'Proposals', 'Approvals', 'Automation', 'Agent Runs', 'Services & Pricing', 'AI Configuration', 'Setup']) {
+    await page.setViewportSize({ width: 1440, height: 1000 })
     await page.getByRole('button', { name: new RegExp(label) }).first().click()
     await page.locator('h1').first().waitFor()
     results.push(await inspect(page, label, outputDirectory))
   }
+
+  await page.setViewportSize({ width: 1440, height: 1000 })
+  await page.getByRole('button', { name: /Outreach/ }).first().click()
+  await page.getByRole('button', { name: 'Drafts / Review' }).click()
+  await page.getByRole('button', { name: 'Knowledge & prompts' }).click()
+  await page.getByRole('button', { name: 'Use outreach draft starter' }).waitFor()
+  results.push(await inspect(page, 'Prompt Configuration', outputDirectory))
+  await page.setViewportSize({ width: 1440, height: 1000 })
+  await page.getByRole('button', { name: 'Use outreach draft starter' }).click()
+  assert.equal(await page.locator('.marketing-workspace .config-form select').first().inputValue(), 'OutreachDraftAgent', 'The prompt starter selects the correct agent without approving it')
+  assert.match(await page.locator('textarea').first().inputValue(), /draft-only[\s\S]*never send/i, 'The prepared prompt keeps outbound draft-only restrictions')
+  assert.equal(await page.getByRole('button', { name: 'Save prompt draft' }).count(), 1, 'Prompt creation remains an explicit action in tenant prompt governance')
 
   for (const fixture of [
     { name: 'The Home', mode: 'the_home', priority: 'High Priority', score: '67 / 100', coverage: '60%', opportunityCount: '2 evidenced opportunity signals' },
@@ -323,6 +353,7 @@ try {
     fixtureCompany.name = fixture.name
     fixtureReview = null
     await page.reload({ waitUntil: 'networkidle' })
+    await page.setViewportSize({ width: 1440, height: 1000 })
     await page.getByRole('button', { name: /Prospects/ }).first().click()
     await page.getByText(fixture.name, { exact: true }).first().click()
     await page.getByText('What should happen with this prospect?', { exact: true }).waitFor()
@@ -377,7 +408,7 @@ try {
   assert.deepEqual(consoleErrors, [], `No browser console errors: ${consoleErrors.join('; ')}`)
   assert.deepEqual(mutatingRequests, [], 'Acceptance did not trigger scoring, campaign, or outbound mutations')
   await page.locator('.sidebar-bottom').getByRole('button', { name: 'Sign out' }).click()
-  await page.locator('.tenant-card').getByText('Sign in to your workspace', { exact: true }).waitFor()
+  await page.locator('.tenant-card').getByText('Welcome to Yaandu Growth', { exact: true }).waitFor()
   results.push(await inspect(page, 'Sign in', outputDirectory))
   await page.emulateMedia({ reducedMotion: 'reduce' })
   assert.match(await page.locator('.content').evaluate((element) => getComputedStyle(element).animationDuration), /0\.00001s|1e-05s/, 'Reduced-motion mode disables non-essential transitions')

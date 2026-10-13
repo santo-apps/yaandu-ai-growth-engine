@@ -15,6 +15,38 @@ use Tests\TestCase;
 
 final class OutreachDraftGenerationTest extends TestCase
 {
+    public function test_outreach_readiness_surfaces_missing_tenant_route_without_enabling_generation(): void
+    {
+        [$tenant, $owner, $company] = $this->fixture('outreach-readiness-route');
+        Sanctum::actingAs($owner);
+
+        $response = $this->withHeaders(['X-Tenant-ID' => $tenant->id])->getJson('/api/v1/companies/'.$company->id.'/outreach-drafts')->assertOk();
+        self::assertTrue($response->json('eligible'), 'The existing sales eligibility contract remains Pursue plus approved service.');
+        self::assertFalse($response->json('generation_ready'));
+        self::assertFalse(collect($response->json('readiness.checks'))->firstWhere('key', 'route')['ready']);
+        self::assertFalse(collect($response->json('readiness.checks'))->firstWhere('key', 'credential')['ready']);
+        self::assertTrue(collect($response->json('readiness.checks'))->firstWhere('key', 'prompt')['ready']);
+    }
+
+    public function test_outreach_readiness_requires_enabled_tenant_route_and_runtime_provider_credential(): void
+    {
+        [$tenant, $owner, $company] = $this->fixture('outreach-readiness-ready');
+        DB::table('ai_model_configurations')->insert(['id' => (string) Str::uuid(), 'tenant_id' => $tenant->id, 'task_key' => 'outreach_drafting',
+            'provider' => 'openai', 'model' => 'gpt-4.1-mini', 'enabled' => true, 'parameters' => json_encode(['max_output_tokens' => 1800, 'temperature' => 0.3]),
+            'version' => 1, 'created_at' => now(), 'updated_at' => now()]);
+        config(['ai.providers.openai.key' => 'synthetic-test-key']);
+        Sanctum::actingAs($owner);
+
+        $response = $this->withHeaders(['X-Tenant-ID' => $tenant->id])->getJson('/api/v1/companies/'.$company->id.'/outreach-drafts')->assertOk();
+        self::assertTrue($response->json('generation_ready'));
+        foreach (['sales_decision', 'service', 'findings', 'route', 'credential', 'prompt'] as $key) {
+            self::assertTrue(collect($response->json('readiness.checks'))->firstWhere('key', $key)['ready'], $key.' readiness should be true.');
+        }
+        self::assertSame('openai', $response->json('readiness.route.provider'));
+        self::assertSame('gpt-4.1-mini', $response->json('readiness.route.model'));
+        self::assertArrayNotHasKey('key', $response->json('readiness.route'));
+    }
+
     use RefreshDatabase;
 
     public function test_pursue_review_can_create_grounded_drafts_without_sending_or_changing_sales_state(): void

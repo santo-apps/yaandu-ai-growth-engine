@@ -21,9 +21,26 @@ final class OutreachDraftService
     {
         $this->company($tenantId,$companyId); $review=$this->review($tenantId,$companyId);
         $drafts=DB::table('outreach_drafts')->where('tenant_id',$tenantId)->where('company_id',$companyId)->orderByDesc('version')->limit(20)->get();
-        return ['eligible'=>$review?->decision==='pursue' && $review->selected_service_id && $review->service_active && $review->service_approved,
+        $eligible=$review?->decision==='pursue' && $review->selected_service_id && $review->service_active && $review->service_approved
+            && (!$review->service_effective_from || $review->service_effective_from <= now())
+            && (!$review->service_effective_until || $review->service_effective_until >= now());
+        $findings=$this->validatedFindings($tenantId,$companyId);
+        $route=DB::table('ai_model_configurations')->where('tenant_id',$tenantId)->where('task_key','outreach_drafting')->first(['provider','model','enabled']);
+        $credentialConfigured=$route ? is_string(config('ai.providers.'.$route->provider.'.key')) && trim((string)config('ai.providers.'.$route->provider.'.key')) !== '' : false;
+        $promptReady=DB::table('prompt_templates')->where('tenant_id',$tenantId)->where('agent_key','OutreachDraftAgent')->where('status','approved')->where('active',true)->exists();
+        $checks=[
+            ['key'=>'sales_decision','label'=>'Prospect marked Pursue','ready'=>(bool)$eligible,'detail'=>$eligible?'Approved sales decision is in place.':'A current Pursue decision and active selected service are required.'],
+            ['key'=>'service','label'=>'Active service selected','ready'=>(bool)($eligible && $review?->selected_service_id),'detail'=>$eligible?'The selected service is active and approved.':'Select an active approved service in Human Sales Review.'],
+            ['key'=>'findings','label'=>'Validated findings available','ready'=>count($findings)>0,'detail'=>count($findings).' finding'.(count($findings)===1?'':'s').' available for human selection.'],
+            ['key'=>'route','label'=>'AI writing route configured','ready'=>(bool)($route && $route->enabled),'detail'=>$route && $route->enabled?'A tenant-specific route is enabled.':'An enabled tenant outreach_drafting route is required.'],
+            ['key'=>'credential','label'=>'AI provider available','ready'=>$credentialConfigured,'detail'=>$credentialConfigured?'Provider credentials are configured.':'The selected provider credential is not available in this runtime.'],
+            ['key'=>'prompt','label'=>'Approved outreach prompt','ready'=>$promptReady,'detail'=>$promptReady?'An approved active prompt is available.':'An owner must approve and activate an OutreachDraftAgent prompt.'],
+        ];
+        return ['eligible'=>(bool)$eligible,'generation_ready'=>collect($checks)->every(fn(array $check):bool=>$check['ready']),
+            'readiness'=>['checks'=>$checks,'route'=>$route?['provider'=>$route->provider,'model'=>$route->model,'enabled'=>(bool)$route->enabled]:null,
+                'prompt'=>['approved_active'=>$promptReady]],
             'review'=>$review ? ['decision'=>$review->decision,'selected_service_id'=>$review->selected_service_id,'service_name'=>$review->service_name,'notes'=>$review->notes] : null,
-            'findings'=>$this->validatedFindings($tenantId,$companyId),'drafts'=>$drafts->map(fn($draft)=>$this->present($draft))->all()];
+            'findings'=>$findings,'drafts'=>$drafts->map(fn($draft)=>$this->present($draft))->all()];
     }
 
     public function generate(string $tenantId,string $companyId,string $actorId,array $findingIds,string $idempotencyKey,?string $previousDraftId=null,string $tone='consultative'): object
