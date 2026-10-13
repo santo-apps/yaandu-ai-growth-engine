@@ -63,6 +63,7 @@ final class AIModelRouter
         $parseInputTokens = null;
         $parseOutputTokens = null;
         $parseLatencyMs = 0;
+        $responseIncludesParseUsage = false;
         try {
             $response = null;
             $parseRetryCount = 0;
@@ -94,6 +95,7 @@ final class AIModelRouter
                     $this->addOptionalCounts($parseOutputTokens, $response->outputTokens),
                     $response->latencyMs === null && $parseLatencyMs === 0 ? null : $parseLatencyMs + ($response->latencyMs ?? 0),
                     $response->httpStatus, $response->endpoint, $response->parseDiagnostics);
+                $responseIncludesParseUsage = true;
             }
             try {
                 if ($response->data === [] && ($response->parseDiagnostics['top_level_type'] ?? null) === 'object') {
@@ -114,7 +116,8 @@ final class AIModelRouter
                     httpStatus: $response->httpStatus, endpoint: $response->endpoint, model: $response->model,
                     elapsedMs: $response->latencyMs, responseLength: $response->parseDiagnostics['response_length'] ?? null,
                     responseFingerprint: $response->parseDiagnostics['response_fingerprint'] ?? null,
-                    normalizations: $response->parseDiagnostics['normalizations'] ?? [], previous: $error);
+                    normalizations: $response->parseDiagnostics['normalizations'] ?? [], inputTokens: $response->inputTokens,
+                    outputTokens: $response->outputTokens, previous: $error);
             }
             try {
                 $this->completeUsage($usageId, $request, $response);
@@ -122,11 +125,20 @@ final class AIModelRouter
                 $outcome = $response->provider === 'openai' ? 'OPENAI_RESPONSE_RECEIVED' : 'PROVIDER_RESPONSE_RECEIVED';
                 throw new Providers\AIProviderException('AI usage metadata could not be persisted after the provider response.', 'usage_persistence', $outcome,
                     httpStatus: $response->httpStatus, endpoint: $response->endpoint, model: $response->model,
-                    elapsedMs: $response->latencyMs, previous: $error);
+                    elapsedMs: $response->latencyMs, inputTokens: $response->inputTokens,
+                    outputTokens: $response->outputTokens, previous: $error);
             }
             return $response;
         } catch (\Throwable $error) {
-            if ($usageId) DB::table('ai_usage_records')->where('id', $usageId)->update(['status' => 'FAILED']);
+            if ($usageId) {
+                $inputTokens = $error instanceof Providers\AIProviderException ? $error->inputTokens : null;
+                $outputTokens = $error instanceof Providers\AIProviderException ? $error->outputTokens : null;
+                if ($parseRetryCount > 0 && ! $responseIncludesParseUsage) {
+                    $inputTokens = $this->addOptionalCounts($parseInputTokens, $inputTokens);
+                    $outputTokens = $this->addOptionalCounts($parseOutputTokens, $outputTokens);
+                }
+                $this->failUsage($usageId, $request, $configuration['provider'], $configuration['model'], $error, $inputTokens, $outputTokens);
+            }
             throw $error;
         }
     }
@@ -146,7 +158,7 @@ final class AIModelRouter
             $settings = DB::table('tenant_automation_settings')->where('tenant_id', $request->tenantId)->lockForUpdate()->first();
             $today = DB::table('ai_usage_records')->where('tenant_id', $request->tenantId)->whereDate('created_at', today());
             $calls = (clone $today)->count();
-            $tokens = (int) (clone $today)->sum(DB::raw('COALESCE(input_tokens,0) + COALESCE(output_tokens,0) + COALESCE(reserved_tokens,0)'));
+            $tokens = (int) (clone $today)->sum($this->tokenUsageExpression());
             $callLimit = $this->effectiveLimit($settings?->daily_ai_call_limit, config('ai.daily_call_limit', 0));
             if ($callLimit > 0 && $calls >= $callLimit) throw new RuntimeException('Tenant daily AI call budget reached.');
             $reserve = max(1, $request->maxOutputTokens);
@@ -190,7 +202,7 @@ final class AIModelRouter
         $daily = DB::table('ai_usage_records')->where('tenant_id', $request->tenantId)->whereDate('created_at', today());
         $callLimit = $this->effectiveLimit($settings?->daily_ai_call_limit, config('ai.daily_call_limit', 0));
         $callsExceeded = $callLimit > 0 && (clone $daily)->count() > $callLimit;
-        $tokenTotal = (int) (clone $daily)->sum(DB::raw('COALESCE(input_tokens,0) + COALESCE(output_tokens,0) + COALESCE(reserved_tokens,0)'));
+        $tokenTotal = (int) (clone $daily)->sum($this->tokenUsageExpression());
         $tokenLimit = $this->effectiveLimit($settings?->daily_token_limit, config('ai.daily_token_limit', 0));
         $tokensExceeded = $tokenLimit > 0 && $tokenTotal > $tokenLimit;
         $month = DB::table('ai_usage_records')->where('tenant_id', $request->tenantId)->where('created_at', '>=', now()->startOfMonth());
@@ -207,6 +219,40 @@ final class AIModelRouter
         $application = max(0, (int) $applicationLimit);
         if ($tenant > 0 && $application > 0) return min($tenant, $application);
         return max($tenant, $application);
+    }
+
+    private function tokenUsageExpression(): \Illuminate\Database\Query\Expression
+    {
+        return DB::raw("CASE
+            WHEN status = 'RESERVED' THEN COALESCE(reserved_tokens, 0)
+            WHEN status IN ('COMPLETED', 'FAILED') THEN COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0)
+            ELSE 0
+        END");
+    }
+
+    private function failUsage(string $usageId, AIRequest $request, string $provider, string $model, \Throwable $error,
+        ?int $inputTokens, ?int $outputTokens): void
+    {
+        $changes = ['status' => 'FAILED', 'reserved_tokens' => 0];
+        if ($inputTokens !== null) $changes['input_tokens'] = $inputTokens;
+        if ($outputTokens !== null) $changes['output_tokens'] = $outputTokens;
+
+        if ($inputTokens !== null && $outputTokens !== null) {
+            $pricing = $this->modelPricing->resolve($provider, $model);
+            $cost = $pricing ? $this->modelPricing->estimate($pricing, $inputTokens, $outputTokens) : null;
+            if ($cost !== null) {
+                $changes['estimated_cost'] = $cost;
+                $changes['estimated_cost_currency'] = $pricing['currency'];
+                $changes['pricing_effective_date'] = $pricing['effective_from'];
+                $changes['pricing_version'] = $pricing['version'];
+            }
+        }
+
+        if ($error instanceof Providers\AIProviderException && $error->elapsedMs !== null) {
+            $changes['provider_latency_ms'] = $error->elapsedMs;
+        }
+
+        DB::table('ai_usage_records')->where('tenant_id', $request->tenantId)->where('id', $usageId)->update($changes);
     }
 
 }
