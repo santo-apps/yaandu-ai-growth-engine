@@ -67,24 +67,14 @@ final class LeadEvidenceBuilder
         $decisionMaker = DB::table('contacts')->where('tenant_id', $tenantId)->where('company_id', $companyId)
             ->whereNotNull('name')->whereNotNull('title')->first();
 
-        $issue = function (array $patterns) use ($issues): ?object {
-            return $issues->first(function (object $item) use ($patterns): bool {
-                $text = $this->normalize($item->type.' '.$item->summary);
-                foreach ($patterns as $pattern) if (str_contains($text, $pattern)) return true;
-                return false;
-            });
-        };
-        $outdated = $issue(['outdated', 'legacy', 'obsolete', 'deprecated', 'unmaintained', 'end of life']);
-        $mobile = $issue(['mobile', 'responsive', 'viewport', 'touch target']);
+        // Opportunity dimensions consume canonical issue types only. Matching
+        // arbitrary issue summaries can confuse observed capabilities (such as
+        // responsive viewport metadata) with verified business deficiencies.
+        $issueOfType = fn (string $type): ?object => $issues->firstWhere('type', $type);
+        $outdated = $issueOfType('outdated_website');
+        $mobile = $issueOfType('poor_mobile_ux');
         $observedLeadCaptureMechanism = $issues->firstWhere('type', 'lead_capture_mechanism_present');
-        $leadCapture = $issues->first(function (object $item): bool {
-            if ($item->type === 'lead_capture_mechanism_present') return false;
-            $text = $this->normalize($item->type.' '.$item->summary);
-            foreach (['lead capture', 'contact form', 'conversion', 'call to action', 'contact method'] as $pattern) {
-                if (str_contains($text, $pattern)) return true;
-            }
-            return false;
-        });
+        $leadCapture = $issueOfType('poor_lead_capture');
 
         $pageHas = function (string $needle) use ($pages): bool {
             foreach ($pages as $page) {
