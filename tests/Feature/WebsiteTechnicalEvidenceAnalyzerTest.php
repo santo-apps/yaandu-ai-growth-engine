@@ -142,6 +142,56 @@ HTML);
         self::assertNotNull($score['score']);
     }
 
+    public function test_responsive_capability_cannot_score_as_mobile_usability_defect(): void
+    {
+        $tenant = $this->tenant('ebarza-responsive-capability');
+        $company = $this->company($tenant->id, 'Ebarza', 'ebarza.com');
+        $website = $this->website($tenant->id, $company->id);
+        $scan = $this->scan($tenant->id, $website);
+        $page = $this->page($tenant->id, $scan, 'https://ebarza.com/', <<<'HTML'
+<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1.0, height=device-height, minimum-scale=1.0, maximum-scale=5.0"></head><body>Responsive viewport metadata is present enabling mobile-friendly scaling. Legacy contact form.</body></html>
+HTML);
+        $responsiveIssue = (string) Str::uuid();
+        DB::table('website_issues')->insert(['id' => $responsiveIssue, 'tenant_id' => $tenant->id, 'website_scan_id' => $scan, 'website_page_id' => $page,
+            'type' => 'responsive', 'severity' => 'low', 'summary' => 'Responsive viewport metadata is present enabling mobile-friendly scaling. Legacy contact form.',
+            'evidence' => json_encode(['source_url' => 'https://ebarza.com/', 'excerpt' => 'maximum-scale=5.0']), 'confidence' => 0.95,
+            'detector_version' => 'ai-v1', 'created_at' => now(), 'updated_at' => now()]);
+        $responsiveTechnology = (string) Str::uuid();
+        DB::table('website_technologies')->insert(['id' => $responsiveTechnology, 'tenant_id' => $tenant->id, 'website_scan_id' => $scan, 'website_page_id' => $page,
+            'name' => 'Responsive viewport metadata', 'category' => 'responsive', 'detection_method' => 'deterministic-v1', 'confidence' => 0.99,
+            'evidence' => json_encode(['source_url' => 'https://ebarza.com/', 'excerpt' => 'maximum-scale=5.0']), 'created_at' => now(), 'updated_at' => now()]);
+
+        $builder = app(LeadEvidenceBuilder::class);
+        $responsiveEvidence = $builder->build($tenant->id, $company->id);
+        $responsiveScore = app(ScoringRuleEvaluator::class)->score($responsiveEvidence);
+        self::assertSame('unknown', $responsiveEvidence['poor_mobile_ux']['status']);
+        self::assertNull($responsiveEvidence['poor_mobile_ux']['reference']);
+        self::assertSame(0, $responsiveScore['components']['poor_mobile_ux']['raw_points']);
+        self::assertSame(0, $responsiveScore['components']['poor_mobile_ux']['points']);
+        self::assertSame(0, $responsiveScore['components']['poor_mobile_ux']['possible_points']);
+        self::assertSame(0, $responsiveScore['evidence_coverage']);
+        self::assertNull($responsiveScore['score']);
+        self::assertSame('unknown', $responsiveEvidence['outdated_website']['status'], 'A non-canonical responsive issue cannot create an outdated-website signal from summary text.');
+        self::assertSame('unknown', $responsiveEvidence['poor_lead_capture']['status'], 'A non-canonical responsive issue cannot create a lead-capture gap from summary text.');
+        self::assertSame('unknown', $responsiveEvidence['technology_opportunity']['status'], 'Responsive capability is not a technology replacement opportunity.');
+        $this->assertDatabaseHas('website_technologies', ['id' => $responsiveTechnology, 'tenant_id' => $tenant->id, 'category' => 'responsive']);
+        self::assertNotSame($responsiveIssue, $responsiveEvidence['poor_mobile_ux']['reference']['id'] ?? null);
+
+        $defectIssue = (string) Str::uuid();
+        DB::table('website_issues')->insert(['id' => $defectIssue, 'tenant_id' => $tenant->id, 'website_scan_id' => $scan, 'website_page_id' => $page,
+            'type' => 'poor_mobile_ux', 'severity' => 'medium', 'summary' => 'Viewport metadata disables user zoom on the inspected page.',
+            'evidence' => json_encode(['source_url' => 'https://ebarza.com/', 'excerpt' => 'maximum-scale=1, user-scalable=no']), 'confidence' => 0.95,
+            'detector_version' => 'ai-v1', 'created_at' => now(), 'updated_at' => now()]);
+
+        $defectEvidence = $builder->build($tenant->id, $company->id);
+        $defectScore = app(ScoringRuleEvaluator::class)->score($defectEvidence);
+        self::assertSame('positive', $defectEvidence['poor_mobile_ux']['status']);
+        self::assertSame($defectIssue, $defectEvidence['poor_mobile_ux']['reference']['id']);
+        self::assertSame('poor_mobile_ux', DB::table('website_issues')->where('id', $defectEvidence['poor_mobile_ux']['reference']['id'])->value('type'));
+        self::assertSame(10, $defectScore['components']['poor_mobile_ux']['raw_points']);
+        self::assertSame(10, $defectScore['components']['poor_mobile_ux']['points']);
+    }
+
     public function test_site_with_no_directly_observed_technical_evidence_stays_insufficient(): void
     {
         $tenant = $this->tenant('tech-e');
