@@ -111,7 +111,10 @@ try {
       { key: 'route', label: 'AI writing route configured', ready: true, detail: 'A tenant-specific route is enabled.' },
       { key: 'credential', label: 'AI provider available', ready: true, detail: 'Provider credentials are configured.' },
       { key: 'prompt', label: 'Approved outreach prompt', ready: true, detail: 'An approved active prompt is available.' },
-    ], route: { provider: 'openai', model: 'synthetic-test', enabled: true }, prompt: { approved_active: true } }, review: fixtureReview, findings: [{ id: '50000000-0000-4000-8000-000000000001', type: 'poor_mobile_ux', label: 'Poor mobile experience', summary: 'Viewport metadata disables user zoom on the inspected page.', confidence: .99, source: 'deterministic website finding' }], drafts: fixtureOutreachDraft ? [fixtureOutreachDraft] : [] }
+    ], route: { provider: 'openai', model: 'synthetic-test', enabled: true }, prompt: { approved_active: true } }, review: fixtureReview, findings: [
+      { id: '50000000-0000-4000-8000-000000000001', key: 'poor_mobile_ux', type: 'poor_mobile_ux', label: 'Poor mobile UX', summary: 'Viewport metadata disables user zoom on the inspected page.', evidence: 'meta name="viewport" disables user zoom.', confidence: .99, source: 'website issue', evidence_reference: { source: 'website_issue', id: '50000000-0000-4000-8000-000000000001' } },
+      { id: '50000000-0000-4000-8000-000000000002', key: 'strong_business_fit', type: 'strong_business_fit', label: 'Strong business fit', summary: 'The business aligns with Yaandu services.', evidence: 'The public company overview supports the fit.', confidence: .92, source: 'business insight', evidence_reference: { source: 'business_insight', id: '50000000-0000-4000-8000-000000000002' } },
+    ], drafts: fixtureOutreachDraft ? [fixtureOutreachDraft] : [] }
     else if (path === `/companies/${companyId}/outreach-drafts` && method === 'POST') {
       draftMutationRequests.push(route.request().postDataJSON())
       fixtureOutreachDraft = { id: '60000000-0000-4000-8000-000000000001', version: fixtureOutreachDraft ? fixtureOutreachDraft.version + 1 : 1,
@@ -247,9 +250,17 @@ try {
       await page.getByRole('heading', { name: 'Outreach draft' }).waitFor()
       await page.getByRole('heading', { name: 'Outreach draft readiness' }).waitFor()
       assert.equal(await page.getByText('Select findings', { exact: true }).count(), 1, 'The UI requires explicit finding selection before generation')
+      await page.getByText('Validated findings for outreach', { exact: true }).waitFor()
+      assert.equal(await page.locator('.finding-option').count(), 2, 'Only backend-validated commercial findings are offered')
+      assert.match(await page.locator('.finding-option').nth(0).innerText(), /Poor mobile UX[\s\S]*Source: website issue[\s\S]*Evidence: meta name/)
+      assert.match(await page.locator('.finding-option').nth(1).innerText(), /Strong business fit[\s\S]*Source: business insight[\s\S]*Evidence: The public company overview/)
       assert.equal(await page.locator('.finding-option input').first().isChecked(), false, 'Evidence findings are never preselected')
+      assert.equal(await page.getByRole('button', { name: 'Generate outreach draft' }).isDisabled(), true, 'Draft generation is disabled before human selection')
+      assert.equal(draftMutationRequests.length, 0, 'Loading the candidate list makes no AI or draft-generation request')
       await page.locator('.finding-option input').first().check()
       assert.equal(await page.getByText('Ready to generate', { exact: true }).count(), 1, 'The generation gate becomes ready after explicit selection')
+      assert.ok(await page.locator('.draft-readiness__selection.ready').isVisible(), 'Human-selected findings becomes ready after selection')
+      assert.equal(await page.getByRole('button', { name: 'Generate outreach draft' }).isEnabled(), true, 'Generate Draft enables after selecting an eligible finding')
       await page.getByRole('button', { name: 'Generate outreach draft' }).click()
       await page.getByText('Draft saved for your review. Nothing was sent.').waitFor()
       await page.getByText('A thought on mobile usability', { exact: true }).waitFor()

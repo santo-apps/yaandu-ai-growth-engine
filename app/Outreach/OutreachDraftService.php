@@ -11,7 +11,7 @@ use Illuminate\Validation\ValidationException;
 
 final class OutreachDraftService
 {
-    private const LABELS = ['poor_mobile_ux'=>'Poor mobile experience','outdated_website'=>'Website modernization opportunity',
+    private const LABELS = ['poor_mobile_ux'=>'Poor mobile UX','outdated_website'=>'Outdated website',
         'poor_lead_capture'=>'Lead capture opportunity','technology_opportunity'=>'Technology modernization opportunity',
         'strong_business_fit'=>'Strong business fit','digital_opportunity'=>'Digital opportunity','service_relevance'=>'Service relevance'];
 
@@ -114,19 +114,13 @@ final class OutreachDraftService
         $score=DB::table('lead_scores')->where('tenant_id',$tenantId)->where('company_id',$companyId)->orderByDesc('scored_at')->first(['components']);
         if(!$score)return [];
         $components=is_array($score->components)?$score->components:(json_decode((string)$score->components,true)?:[]);$findings=[];
-        $issues=DB::table('website_issues')->join('website_scans','website_scans.id','=','website_issues.website_scan_id')->join('company_websites','company_websites.id','=','website_scans.company_website_id')
-            ->where('website_issues.tenant_id',$tenantId)->where('website_scans.tenant_id',$tenantId)->where('company_websites.tenant_id',$tenantId)->where('company_websites.company_id',$companyId)
-            ->where('website_issues.detector_version','deterministic-v1')->where('website_issues.confidence','>=',0.7)->whereIn('website_issues.type',['poor_mobile_ux','outdated_website','poor_lead_capture','technology_opportunity'])
-            ->orderByDesc('website_issues.created_at')->limit(20)->get(['website_issues.id','website_issues.type','website_issues.summary','website_issues.evidence','website_issues.confidence']);
-        foreach($issues as $row){if(($components[$row->type]['status']??null)!=='POSITIVE')continue;$evidence=is_array($row->evidence)?$row->evidence:(json_decode((string)$row->evidence,true)?:[]);
-            $findings[]=['id'=>(string)$row->id,'type'=>$row->type,'label'=>self::LABELS[$row->type],'summary'=>mb_substr((string)$row->summary,0,400),'evidence'=>$this->safeEvidenceSummary($evidence),'confidence'=>(float)$row->confidence,'source'=>'deterministic website finding'];}
-        foreach(self::LABELS as $dimension=>$label){$component=$components[$dimension]??null;if(($component['status']??null)!=='POSITIVE'||empty($component['evidence_reference']))continue;
-            $refs=$this->leadEvidenceIds($component['evidence_reference']);
-            if($refs===[])continue;
-            $rows=DB::table('lead_evidence')->join('lead_insights',function($join):void{$join->on('lead_insights.id','=','lead_evidence.lead_insight_id')->on('lead_insights.tenant_id','=','lead_evidence.tenant_id');})
-                ->where('lead_evidence.tenant_id',$tenantId)->where('lead_insights.tenant_id',$tenantId)->where('lead_insights.company_id',$companyId)->whereIn('lead_evidence.id',$refs)->where('lead_evidence.confidence','>=',0.7)
-                ->get(['lead_evidence.id','lead_evidence.excerpt','lead_evidence.confidence','lead_insights.statement']);
-            foreach($rows as $row){if(collect($findings)->contains('id',(string)$row->id))continue;$findings[]=['id'=>(string)$row->id,'type'=>$dimension,'label'=>$label,'summary'=>mb_substr((string)$row->statement,0,400),'evidence'=>mb_substr((string)$row->excerpt,0,500),'confidence'=>(float)$row->confidence,'source'=>'validated scoring evidence'];}}
+        foreach(self::LABELS as $dimension=>$label){
+            $component=$components[$dimension]??null;
+            $reference=$component['evidence_reference']??null;
+            if(($component['status']??null)!=='POSITIVE'||(!is_array($reference)&&!is_string($reference)))continue;
+            $candidate=$this->validatedCandidate($tenantId,$companyId,$dimension,$label,$reference);
+            if($candidate!==null)$findings[]=$candidate;
+        }
         return array_slice($findings,0,12);
     }
 
@@ -135,21 +129,51 @@ final class OutreachDraftService
      * fields that name lead_evidence IDs are valid input to lead_evidence.id.
      * URLs, excerpts, page/source IDs, and other UUIDs are intentionally ignored.
      */
-    private function leadEvidenceIds(mixed $reference):array
+    private function validatedCandidate(string $tenantId,string $companyId,string $dimension,string $label,mixed $reference):?array
     {
-        $candidates=[];
-        if(is_string($reference)){
-            // Older scoring records store a lead_evidence ID directly.
-            $candidates[]=$reference;
-        }elseif(is_array($reference)){
-            if(($reference['source']??null)==='lead_evidence'&&isset($reference['id']))$candidates[]=$reference['id'];
+        $source=is_array($reference)?($reference['source']??null):(is_string($reference)?'lead_evidence':null);
+        $id=is_array($reference)?($reference['id']??null):$reference;
+        if(!is_string($id)||!Str::isUuid($id))return null;
+
+        if($source==='website_issue'){
+            $issue=DB::table('website_issues')->join('website_scans','website_scans.id','=','website_issues.website_scan_id')
+                ->join('company_websites','company_websites.id','=','website_scans.company_website_id')
+                ->where('website_issues.id',$id)->where('website_issues.tenant_id',$tenantId)->where('website_scans.tenant_id',$tenantId)
+                ->where('company_websites.tenant_id',$tenantId)->where('company_websites.company_id',$companyId)
+                ->where('website_scans.status','completed')
+                ->where('website_issues.type',$dimension)->where('website_issues.confidence','>=',0.7)
+                ->first(['website_issues.id','website_issues.summary','website_issues.evidence','website_issues.confidence']);
+            if(!$issue)return null;
+            $evidence=is_array($issue->evidence)?$issue->evidence:(json_decode((string)$issue->evidence,true)?:[]);
+            $summary=$this->safeEvidenceSummary($evidence);
+            if($summary==='')return null;
+            return ['id'=>(string)$issue->id,'key'=>$dimension,'type'=>$dimension,'label'=>$label,'summary'=>mb_substr((string)$issue->summary,0,400),
+                'evidence'=>$summary,'confidence'=>(float)$issue->confidence,'source'=>'website issue','evidence_reference'=>['source'=>'website_issue','id'=>(string)$issue->id]];
         }
 
-        $ids=[];
-        foreach($candidates as $candidate){
-            if(is_string($candidate)&&Str::isUuid($candidate))$ids[]=$candidate;
+        if($source==='business_insight'&&$dimension==='strong_business_fit'){
+            $insight=DB::table('lead_insights')->where('tenant_id',$tenantId)->where('company_id',$companyId)->where('id',$id)
+                ->whereIn('kind',['business_fit','opportunity'])->where('confidence','>=',0.7)->first(['id','statement','confidence']);
+            if(!$insight)return null;
+            $evidence=DB::table('lead_evidence')->where('tenant_id',$tenantId)->where('lead_insight_id',$insight->id)
+                ->where('confidence','>=',0.7)->whereNotNull('excerpt')->where('excerpt','!=','')->orderByDesc('observed_at')
+                ->first(['id','excerpt','confidence','source_url']);
+            if(!$evidence)return null;
+            return ['id'=>(string)$insight->id,'key'=>$dimension,'type'=>$dimension,'label'=>$label,'summary'=>mb_substr((string)$insight->statement,0,400),
+                'evidence'=>mb_substr((string)$evidence->excerpt,0,500),'confidence'=>min((float)$insight->confidence,(float)$evidence->confidence),
+                'source'=>'business insight','evidence_reference'=>['source'=>'business_insight','id'=>(string)$insight->id,'supporting_evidence_ids'=>[(string)$evidence->id]]];
         }
-        return array_values(array_unique($ids));
+
+        // Direct IDs and explicitly typed lead_evidence references are supported;
+        // all other polymorphic source IDs are rejected rather than guessed.
+        if($source!=='lead_evidence')return null;
+        $row=DB::table('lead_evidence')->join('lead_insights',function($join):void{$join->on('lead_insights.id','=','lead_evidence.lead_insight_id')->on('lead_insights.tenant_id','=','lead_evidence.tenant_id');})
+            ->where('lead_evidence.id',$id)->where('lead_evidence.tenant_id',$tenantId)->where('lead_insights.tenant_id',$tenantId)
+            ->where('lead_insights.company_id',$companyId)->where('lead_evidence.confidence','>=',0.7)->whereNotNull('lead_evidence.excerpt')->where('lead_evidence.excerpt','!=','')
+            ->first(['lead_evidence.id','lead_evidence.excerpt','lead_evidence.confidence','lead_insights.statement']);
+        if(!$row)return null;
+        return ['id'=>(string)$row->id,'key'=>$dimension,'type'=>$dimension,'label'=>$label,'summary'=>mb_substr((string)$row->statement,0,400),
+            'evidence'=>mb_substr((string)$row->excerpt,0,500),'confidence'=>(float)$row->confidence,'source'=>'lead evidence','evidence_reference'=>['source'=>'lead_evidence','id'=>(string)$row->id]];
     }
 
     private function company(string $tenantId,string $id):object{$row=DB::table('companies')->where('tenant_id',$tenantId)->where('id',$id)->where('status','!=','discovery_candidate')->first();abort_unless($row,404);return $row;}
