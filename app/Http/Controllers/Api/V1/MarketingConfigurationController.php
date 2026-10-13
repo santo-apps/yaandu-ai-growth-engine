@@ -10,10 +10,10 @@ use Illuminate\Validation\Rule;
 
 final class MarketingConfigurationController extends Controller
 {
-    public function prompts(){return DB::table('prompt_templates')->where('tenant_id',app('tenant.id'))->whereIn('agent_key',['MarketingAgent','FollowUpAgent','SalesAgent','ProposalAgent','WebsiteIntelligenceAgent'])->orderBy('agent_key')->orderByDesc('version')->get();}
+    public function prompts(){return DB::table('prompt_templates')->where('tenant_id',app('tenant.id'))->whereIn('agent_key',['MarketingAgent','OutreachDraftAgent','FollowUpAgent','SalesAgent','ProposalAgent','WebsiteIntelligenceAgent'])->orderBy('agent_key')->orderByDesc('version')->get();}
     public function createPrompt(Request $request)
     {
-        $this->authorizeManager($request);$data=$request->validate(['agent_key'=>['required',Rule::in(['MarketingAgent','FollowUpAgent','SalesAgent','ProposalAgent','WebsiteIntelligenceAgent'])],
+        $this->authorizeManager($request);$data=$request->validate(['agent_key'=>['required',Rule::in(['MarketingAgent','OutreachDraftAgent','FollowUpAgent','SalesAgent','ProposalAgent','WebsiteIntelligenceAgent'])],
             'system_instruction'=>['required','string','max:8000'],'template'=>['required','string','max:12000'],'schema_version'=>['required','string','max:64']]);
         $tenantId=app('tenant.id');$version=(int)DB::table('prompt_templates')->where('tenant_id',$tenantId)->where('agent_key',$data['agent_key'])->max('version')+1;$id=(string)Str::uuid();
         DB::table('prompt_templates')->insert(['id'=>$id,'tenant_id'=>$tenantId,'agent_key'=>$data['agent_key'],'version'=>$version,

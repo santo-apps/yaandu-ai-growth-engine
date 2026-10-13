@@ -2,9 +2,10 @@ export function csrfToken(): string {
   return decodeURIComponent(document.cookie.split('; ').find((part) => part.startsWith('XSRF-TOKEN='))?.split('=')[1] ?? '')
 }
 
-export async function salesRequest(path: string, tenantId: string, method = 'GET', body?: unknown) {
+export async function salesRequest(path: string, tenantId: string, method = 'GET', body?: unknown, idempotencyKey?: string) {
   const headers: Record<string, string> = { Accept: 'application/json', 'X-Tenant-ID': tenantId }
   if (method !== 'GET') headers['X-XSRF-TOKEN'] = csrfToken()
+  if (idempotencyKey) headers['Idempotency-Key'] = idempotencyKey
   if (body !== undefined) headers['Content-Type'] = 'application/json'
   const response = await fetch(`/api/v1${path}`, {
     method, credentials: 'include', headers,

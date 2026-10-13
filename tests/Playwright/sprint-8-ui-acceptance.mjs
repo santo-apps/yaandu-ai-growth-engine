@@ -54,8 +54,10 @@ for (const [index, page] of fixturePages.entries()) {
 }
 const deterministicIssues = []
 let fixtureReview = null
+let fixtureOutreachDraft = null
+const draftMutationRequests = []
 let fixtureMode = 'full'
-const fixtureServices = [{ id: '40000000-0000-4000-8000-000000000001', name: 'Website Revamp', active: true }]
+const fixtureServices = [{ id: '40000000-0000-4000-8000-000000000001', sku: 'YND-WEB-REVAMP', canonical_service_key: 'website_modernization', name: 'Website Revamp', description: 'Website modernization', unit_price: null, currency: 'INR', unit: 'project', commercial_model: 'custom_quote', active: true, capabilities: ['website_modernization'], standard_deliverables: [] }]
 for (const [index, page] of fixturePages.entries()) {
   const issue = (type, summary, severity, confidence = 0.98) => ({
     id: `issue-${type}-${index}`, type, summary, severity, confidence, detector_version: 'deterministic-v1', website_page_id: page.id,
@@ -88,16 +90,32 @@ try {
 
   browser = await chromium.launch({ headless: true, args: ['--no-sandbox'] })
   const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } })
+  await page.context().grantPermissions(['clipboard-read', 'clipboard-write'], { origin: baseUrl })
   const mutatingRequests = []
   const salesReviewRequests = []
   await page.addInitScript((id) => localStorage.setItem('tenant_id', id), tenantId)
   await page.route('**/api/v1/**', async (route) => {
     const path = new URL(route.request().url()).pathname.replace('/api/v1', '')
+    const method = route.request().method()
     let body = { data: [] }
     const responseStatus = path === `/companies/${companyId}/sales-review` && route.request().method() === 'GET' && fixtureMode === 'review_error' ? 503 : 200
     if (path === '/me') body = { id: 1, name: 'Synthetic Reviewer', email: 'reviewer@example.test' }
     else if (path === '/tenants') body = [{ id: tenantId, name: 'Synthetic Pilot Workspace', role: 'owner', status: 'active' }]
     else if (path === '/companies' || path.startsWith('/companies?')) body = { data: [fixtureCompany] }
+    else if (path === `/companies/${companyId}/outreach-drafts` && method === 'GET') body = { eligible: fixtureReview?.decision === 'pursue' && Boolean(fixtureReview?.selected_service_id), review: fixtureReview, findings: [{ id: '50000000-0000-4000-8000-000000000001', type: 'poor_mobile_ux', label: 'Poor mobile experience', summary: 'Viewport metadata disables user zoom on the inspected page.', confidence: .99, source: 'deterministic website finding' }], drafts: fixtureOutreachDraft ? [fixtureOutreachDraft] : [] }
+    else if (path === `/companies/${companyId}/outreach-drafts` && method === 'POST') {
+      draftMutationRequests.push(route.request().postDataJSON())
+      fixtureOutreachDraft = { id: '60000000-0000-4000-8000-000000000001', version: fixtureOutreachDraft ? fixtureOutreachDraft.version + 1 : 1,
+        provider: 'synthetic', model: 'synthetic-test', prompt_version: 1, validated_findings: [{ id: '50000000-0000-4000-8000-000000000001', label: 'Poor mobile experience' }],
+        draft_payload: { pitch_summary: 'A measured improvement opportunity.', recommended_channel: 'contact_page', recommended_channel_reason: 'No verified decision maker is available.',
+          email: { subject: 'A thought on mobile usability', body: 'We noticed a mobile usability detail that may be worth reviewing.' }, whatsapp: '', linkedin: '', follow_up_email: '', follow_up_short: '', evidence_used: [{ finding_id: '50000000-0000-4000-8000-000000000001', summary: 'Viewport metadata disables user zoom.' }] } }
+      body = fixtureOutreachDraft
+    }
+    else if (path.startsWith('/outreach-drafts/') && path.endsWith('/regenerate') && method === 'POST') {
+      draftMutationRequests.push(route.request().postDataJSON())
+      fixtureOutreachDraft = { ...fixtureOutreachDraft, id: '60000000-0000-4000-8000-000000000002', version: fixtureOutreachDraft.version + 1 }
+      body = fixtureOutreachDraft
+    }
     else if (path === `/companies/${companyId}`) body = fixtureCompany
     else if (path === `/companies/${companyId}/sales-review` && route.request().method() === 'PUT') {
       const input = route.request().postDataJSON()
@@ -106,7 +124,7 @@ try {
       body = { review: fixtureReview }
     }
     else if (path === `/companies/${companyId}/sales-review`) body = { review: fixtureReview }
-    else if (path === '/tenant-services') body = { data: fixtureServices }
+    else if (path === '/tenant-services') body = fixtureServices
     else if (path === `/companies/${companyId}/intelligence`) body = {
       latest_scan: { status: 'completed', created_at: '2026-01-01T00:00:00Z' },
       issues: [...deterministicIssues, { id: 'ai-issue-1', type: 'ai_observation', severity: 'low', summary: 'AI-only advisory observation.', confidence: 0.8, evidence: JSON.stringify({ source_url: 'https://synthetic-pilot.example.test', excerpt: 'Synthetic fixture evidence excerpt.' }) }],
@@ -119,7 +137,10 @@ try {
     else if (path === '/pilot/cohorts') body = { data: [] }
     else if (path.startsWith('/pilot/dashboard')) body = { cohort: null, simulated: true, sales_intelligence_mode: 'human_assisted', metrics: {}, funnel: {}, rates_percent: {} }
     else if (path === '/pilot/sales-intelligence-mode') body = { sales_intelligence_mode: 'human_assisted' }
+    else if (path === '/ai-configurations') body = ['website_reasoning','outreach_drafting'].map((task_key) => ({ id: null, task_key, provider: 'openai', model: 'synthetic-test', enabled: true,
+      parameters: {}, version: 1, is_tenant_override: false, available_providers: ['openai','anthropic','gemini'] }))
     else if (path === '/local-acceptance/status') body = { mode: 'disabled', providers: { ai: 'Synthetic AI', outbound: 'Disabled', scheduling: 'Disabled' }, queue: 'isolated', company_id: null, campaign_id: null, campaign_status: 'disabled', message: null, inbound_count: 0, conversation_id: null, opportunity_id: null, meeting_id: null, proposal_id: null, proposal_delivery_count: 0 }
+    else if (path === '/marketing-configuration/knowledge') body = []
     if (path === `/companies/${companyId}/intelligence` && ['blocked', 'danube', 'homecentre'].includes(fixtureMode)) body = {
       latest_scan: { status: 'failed', failure_category: fixtureMode === 'homecentre' ? 'HTTP_4XX' : 'ROBOTS', created_at: '2026-10-12T00:00:00Z' },
       issues: [], technologies: [], pages: [], scores: [], intelligence_results: [], screenshots: [],
@@ -141,9 +162,13 @@ try {
   })
 
   const pageErrors = []
+  const consoleErrors = []
   page.on('pageerror', (error) => pageErrors.push(`${error.message} ${error.stack ?? ''}`))
+  page.on('console', (message) => {
+    if (message.type() === 'error' && !(message.text().includes('503 (Service Unavailable)') && message.location().url.includes('/sales-review'))) consoleErrors.push(message.text())
+  })
   page.on('request', (request) => {
-    if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(request.method()) && /intelligence|score|campaign|message|outreach/i.test(request.url())) mutatingRequests.push(`${request.method()} ${request.url()}`)
+    if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(request.method()) && /intelligence|score|campaign|message|outreach/i.test(request.url()) && !/outreach-drafts/i.test(request.url())) mutatingRequests.push(`${request.method()} ${request.url()}`)
     if (request.method() === 'PUT' && request.url().includes('/sales-review')) salesReviewRequests.push(request.url())
   })
   await page.goto(baseUrl, { waitUntil: 'networkidle' })
@@ -160,6 +185,7 @@ try {
     const heading = await page.locator('h1').first().innerText()
     assert.ok(heading.length > 0, `${label} page heading is visible`)
     if (label === 'Prospects') {
+      results.push(await inspect(page, 'Prospects', outputDirectory))
       await page.getByText('Synthetic Pilot Company', { exact: true }).first().click()
       await page.locator('h1').getByText('Synthetic Pilot Company').waitFor()
       assert.equal(await page.locator('.local-acceptance').count(), 0, 'Local acceptance tooling is not displayed in the sales workspace')
@@ -206,6 +232,25 @@ try {
       await page.getByRole('heading', { name: 'What should happen with this prospect?' }).waitFor()
       assert.equal(await page.getByLabel('Sales decision').inputValue(), 'pursue', 'Saved review reloads correctly')
       assert.equal(await page.getByLabel(/Relevant service/).inputValue(), fixtureServices[0].id)
+      await page.getByRole('button', { name: 'Outreach', exact: true }).click()
+      await page.getByRole('heading', { name: 'Outreach draft' }).waitFor()
+      assert.equal(await page.locator('.finding-option input').first().isChecked(), false, 'Evidence findings are never preselected')
+      await page.locator('.finding-option input').first().check()
+      await page.getByRole('button', { name: 'Generate outreach draft' }).click()
+      await page.getByText('Draft saved for your review. Nothing was sent.').waitFor()
+      await page.getByText('A thought on mobile usability', { exact: true }).waitFor()
+      await page.getByRole('button', { name: 'Copy email' }).click()
+      await page.getByText('Copied to clipboard.', { exact: true }).waitFor()
+      assert.match(await page.evaluate(() => navigator.clipboard.readText()), /A thought on mobile usability[\s\S]*We noticed a mobile usability detail/)
+      assert.equal(await page.getByRole('button', { name: /Send/i }).count(), 0, 'Draft workspace has no send action')
+      assert.equal(draftMutationRequests.length, 1, 'One explicit reviewer action creates the draft')
+      assert.deepEqual(draftMutationRequests[0].finding_ids, ['50000000-0000-4000-8000-000000000001'])
+      await page.reload({ waitUntil: 'networkidle' })
+      await page.getByRole('button', { name: /Prospects/ }).first().click()
+      await page.getByText('Synthetic Pilot Company', { exact: true }).first().click()
+      await page.getByRole('button', { name: 'Outreach', exact: true }).click()
+      await page.getByRole('heading', { name: 'Outreach draft' }).waitFor()
+      await page.getByText('Draft 1').waitFor()
       await page.setViewportSize({ width: 390, height: 740 })
       const nav = page.locator('.sidebar-navigation')
       assert.ok(await nav.getByRole('button', { name: /AI Configuration/ }).count(), 'Lower management navigation remains available on mobile')
@@ -254,11 +299,15 @@ try {
       assert.ok(!/gap|missing|poor|problem/i.test(await whatsappCard.innerText()), 'WhatsApp presence is not labeled as a gap')
       assert.deepEqual(mutatingRequests, [], 'Viewing website evidence has no scoring or workflow side effects')
       results.push(await inspect(page, 'Website Intelligence', outputDirectory))
+      await page.getByRole('button', { name: 'Contacts', exact: false }).click()
+      results.push(await inspect(page, 'Contacts', outputDirectory))
+      await page.getByRole('button', { name: /^Activity/ }).click()
+      results.push(await inspect(page, 'Activity', outputDirectory))
     }
-    results.push(await inspect(page, label, outputDirectory))
+    if (label !== 'Prospects') results.push(await inspect(page, label, outputDirectory))
   }
 
-  for (const label of ['Inbox', 'Pipeline', 'Meetings']) {
+  for (const label of ['Outreach', 'Inbox', 'Pipeline', 'Meetings', 'Proposals', 'Approvals', 'Automation', 'Agent Runs', 'Services & Pricing', 'AI Configuration', 'Setup']) {
     await page.getByRole('button', { name: new RegExp(label) }).first().click()
     await page.locator('h1').first().waitFor()
     results.push(await inspect(page, label, outputDirectory))
@@ -325,7 +374,13 @@ try {
   assert.equal(await page.getByRole('button', { name: 'Save sales decision' }).isDisabled(), true, 'A failed review read cannot be overwritten as if no decision existed')
 
   assert.deepEqual(pageErrors, [], `No browser runtime exceptions: ${pageErrors.join('; ')}`)
+  assert.deepEqual(consoleErrors, [], `No browser console errors: ${consoleErrors.join('; ')}`)
   assert.deepEqual(mutatingRequests, [], 'Acceptance did not trigger scoring, campaign, or outbound mutations')
+  await page.locator('.sidebar-bottom').getByRole('button', { name: 'Sign out' }).click()
+  await page.locator('.tenant-card').getByText('Sign in to your workspace', { exact: true }).waitFor()
+  results.push(await inspect(page, 'Sign in', outputDirectory))
+  await page.emulateMedia({ reducedMotion: 'reduce' })
+  assert.match(await page.locator('.content').evaluate((element) => getComputedStyle(element).animationDuration), /0\.00001s|1e-05s/, 'Reduced-motion mode disables non-essential transitions')
   console.log(JSON.stringify({ browser: 'Chromium', data: 'synthetic only', screens: results }, null, 2))
 } finally {
   await browser?.close()
@@ -334,7 +389,7 @@ try {
 }
 
 async function inspect(page, label, directory) {
-  const widths = [1440, 1280, 768, 390]
+  const widths = [1440, 1280, 1024, 768, 390]
   const row = { screen: label, widths: {} }
   for (const width of widths) {
     await page.setViewportSize({ width, height: 1000 })

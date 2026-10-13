@@ -12,6 +12,7 @@ use App\Agents\AgentInterface;
 use App\Agents\DiscoveryAgent;
 use App\Agents\LeadScoringAgent;
 use App\Agents\MarketingAgent;
+use App\Agents\OutreachDraftAgent;
 use App\Agents\FollowUpAgent;
 use App\Agents\SalesAgent;
 use App\Agents\ProposalAgent;
@@ -55,7 +56,7 @@ class AppServiceProvider extends ServiceProvider
         $this->app->singleton(AIModelRouter::class, fn ($app) => new AIModelRouter(
             $app->tagged('ai.providers'), config('ai.tasks', []),
         ));
-        $this->app->tag([DiscoveryAgent::class, WebsiteIntelligenceAgent::class, LeadScoringAgent::class, MarketingAgent::class, FollowUpAgent::class, SalesAgent::class, ProposalAgent::class], 'agents.enabled');
+        $this->app->tag([DiscoveryAgent::class, WebsiteIntelligenceAgent::class, LeadScoringAgent::class, MarketingAgent::class, OutreachDraftAgent::class, FollowUpAgent::class, SalesAgent::class, ProposalAgent::class], 'agents.enabled');
         $this->app->singleton(\App\Agents\AgentOrchestrator::class, fn ($app) => new \App\Agents\AgentOrchestrator($app->tagged('agents.enabled')));
         $this->app->tag([FakeOutboundMessagingProvider::class], 'outbound.messaging.providers');
         $this->app->singleton(OutboundMessagingProviderRouter::class, fn ($app) => new OutboundMessagingProviderRouter(
