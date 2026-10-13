@@ -27,6 +27,7 @@ use App\Http\Controllers\Api\V1\WebIndexOperationsController;
 use App\Http\Controllers\Api\V1\PilotController;
 use App\Http\Controllers\Api\V1\WebsiteIntelligenceReadinessController;
 use App\Http\Controllers\Api\V1\IcpConfigurationController;
+use App\Http\Controllers\Api\V1\OutreachDraftController;
 use App\Http\Middleware\ResolveTenant;
 use Illuminate\Support\Facades\Route;
 
@@ -65,6 +66,9 @@ Route::prefix('v1')->group(function (): void {
     Route::get('/companies/{company}/intelligence', [CompanyController::class, 'intelligence']);
     Route::get('/companies/{company}/sales-review', [CompanyHumanSalesReviewController::class, 'show']);
     Route::put('/companies/{company}/sales-review', [CompanyHumanSalesReviewController::class, 'update'])->middleware('throttle:30,1');
+    Route::get('/companies/{company}/outreach-drafts', [OutreachDraftController::class, 'index']);
+    Route::post('/companies/{company}/outreach-drafts', [OutreachDraftController::class, 'store'])->middleware('throttle:10,1');
+    Route::post('/outreach-drafts/{id}/regenerate', [OutreachDraftController::class, 'regenerate'])->middleware('throttle:10,1');
     Route::get('/companies/{company}/website-discovery', [CompanyController::class, 'websiteDiscovery']);
     Route::post('/companies/{company}/website-discovery', [CompanyController::class, 'findWebsite'])->middleware('throttle:10,1');
     Route::post('/websites/{website}/scan', [CompanyController::class, 'scan']);

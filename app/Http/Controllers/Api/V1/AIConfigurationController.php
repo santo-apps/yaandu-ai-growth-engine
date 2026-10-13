@@ -9,7 +9,7 @@ use Illuminate\Support\Str;
 
 class AIConfigurationController extends Controller
 {
-    private const TASKS = ['website_visual_analysis', 'website_reasoning', 'lead_classification', 'sales_reasoning', 'content_generation', 'structured_extraction', 'proposal_generation'];
+    private const TASKS = ['website_visual_analysis', 'website_reasoning', 'lead_classification', 'sales_reasoning', 'content_generation', 'outreach_drafting', 'structured_extraction', 'proposal_generation'];
     private const PROVIDERS = ['openai', 'anthropic', 'gemini'];
 
     public function index()

@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { onMounted, ref } from 'vue'
+import { safeRequestError } from '../salesApi'
 
 const props = defineProps<{ tenantId: string }>()
 const emit = defineEmits<{ navigate: [page: string] }>()
@@ -16,7 +17,7 @@ const readiness = ref<any>(null)
 function csrf() { return decodeURIComponent(document.cookie.split('; ').find((row) => row.startsWith('XSRF-TOKEN='))?.split('=')[1] ?? '') }
 async function api(path: string, method = 'GET', body?: unknown) {
   const response = await fetch('/api/v1' + path, { method, credentials: 'include', headers: { Accept: 'application/json', 'X-Tenant-ID': props.tenantId, ...(body === undefined ? {} : { 'Content-Type': 'application/json', 'X-XSRF-TOKEN': csrf() }) }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) })
-  const data = await response.json().catch(() => ({})); if (!response.ok) throw new Error(data.message ?? `Request failed (${response.status}).`); return data
+  const data = await response.json().catch(() => ({})); if (!response.ok) throw new Error(safeRequestError(response, data, 'Unable to complete this setup request.')); return data
 }
 async function load() {
   error.value = ''
@@ -29,8 +30,8 @@ onMounted(() => void load())
 
 <template>
   <div class="setup-workspace">
-    <div v-if="error" class="notice">{{ error }} <button class="quiet" @click="load">Retry</button></div>
-    <div v-if="notice" class="notice success-notice">{{ notice }}</div>
+    <div v-if="error" class="notice" role="alert">{{ error }} <button class="quiet" @click="load">Retry</button></div>
+    <div v-if="notice" class="notice success-notice" role="status">{{ notice }}</div>
     <section class="panel readiness-panel" aria-live="polite"><div class="readiness-heading"><div><div class="eyebrow">PILOT PREREQUISITES</div><h3>{{ readiness?.status === 'ready' ? 'Ready for a controlled pilot' : 'Complete these prerequisites before running a pilot' }}</h3><p>Checks tenant AI routes, active approved prompts, fake providers, Redis and Horizon. No provider call is made.</p></div><span class="pill" :class="readiness?.status === 'ready' ? 'ready' : 'muted'">{{ readiness?.status === 'ready' ? 'Ready' : readiness ? 'Needs attention' : 'Checking…' }}</span></div><ul v-if="readiness?.missing_prerequisites?.length"><li v-for="item in readiness.missing_prerequisites" :key="item">{{ item }}</li></ul><p v-else-if="readiness?.status === 'ready'" class="readiness-clear">All required local pilot prerequisites are available.</p><div class="readiness-actions"><button class="quiet" @click="emit('navigate', 'AI Configuration')">Review AI routes →</button><button class="quiet" @click="emit('navigate', 'Approved knowledge and prompts')">Review prompts →</button><button class="quiet" @click="emit('navigate', 'Outreach')">Review fake messaging →</button></div></section>
     <section class="setup-intro panel"><div><div class="eyebrow">TENANT READINESS</div><h2>Get your workspace ready to operate</h2><p>Configuration reflects saved tenant settings. Provider labels describe configured mode; they do not verify external connectivity.</p></div><button class="quiet" @click="load">↻ Refresh status</button></section>
     <div class="setup-grid">

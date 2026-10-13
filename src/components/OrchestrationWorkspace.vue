@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
+import { safeRequestError } from '../salesApi'
 
 type View = 'workflows' | 'approvals' | 'policies' | 'summary'
 const props = defineProps<{ tenantId: string; view: View }>()
@@ -30,7 +31,7 @@ function xsrf() { return decodeURIComponent(document.cookie.split('; ').find((ro
 async function api(path: string, method = 'GET', body?: unknown) {
   const response = await fetch(`/api/v1${path}`, { method, credentials: 'include', headers: { Accept: 'application/json', 'X-Tenant-ID': props.tenantId, ...(body ? { 'Content-Type': 'application/json', 'X-XSRF-TOKEN': xsrf() } : {}) }, ...(body ? { body: JSON.stringify(body) } : {}) })
   const data = await response.json().catch(() => ({}))
-  if (!response.ok) throw new Error(data.message ?? `Request failed (${response.status}).`)
+  if (!response.ok) throw new Error(safeRequestError(response, data, 'Unable to complete this workflow request.'))
   return data
 }
 async function load() {
@@ -72,8 +73,8 @@ onMounted(() => void load())
 
 <template>
   <div class="orchestration-workspace">
-    <div v-if="error" class="notice">{{ error }} <button class="quiet" @click="load">Retry</button></div>
-    <div v-if="notice" class="notice success-notice">{{ notice }}</div>
+    <div v-if="error" class="notice" role="alert">{{ error }} <button class="quiet" @click="load">Retry</button></div>
+    <div v-if="notice" class="notice success-notice" role="status">{{ notice }}</div>
     <template v-if="view === 'summary'">
       <section class="orchestration-stats">
         <article v-for="item in [['Active Workflows','active_workflows'],['Waiting Approval','waiting_approval'],['Human Handoffs','human_handoffs'],['Failed / Paused','failed_or_paused'],['AI Runs Today','ai_runs_today'],['Approvals Pending','approvals_pending']]" :key="item[1]" class="stat-card"><div class="stat-top"><span>{{ item[0] }}</span><span class="stat-icon violet">◈</span></div><strong>{{ summary[item[1]] ?? 0 }}</strong><small>Current tenant telemetry</small></article>

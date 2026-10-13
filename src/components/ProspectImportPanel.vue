@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
-import { csrfToken, salesRequest } from '../salesApi'
+import { csrfToken, safeRequestError, salesRequest } from '../salesApi'
 
 const props = defineProps<{ tenantId: string; manager: boolean }>()
 const emit = defineEmits<{ importCompleted: [importedCount: number] }>()
@@ -28,7 +28,7 @@ async function previewFile() {
   try {
     const form = new FormData(); form.append('csv', file.value); if (cohortId.value) form.append('cohort_id', cohortId.value)
     const response = await fetch('/api/v1/pilot/import-batches/preview', { method: 'POST', credentials: 'include', headers: { Accept: 'application/json', 'X-Tenant-ID': props.tenantId, 'X-XSRF-TOKEN': csrfToken() }, body: form })
-    const result = await response.json(); if (!response.ok) throw new Error(result.message ?? 'Unable to read this CSV.')
+    const result = await response.json().catch(() => ({})); if (!response.ok) throw new Error(safeRequestError(response, result, 'Unable to read this CSV.'))
     preview.value = result; notice.value = `${result.counts.valid} valid row(s), ${result.counts.invalid} skipped row(s). Review the row results before importing.`
   } catch (e) { error.value = e instanceof Error ? e.message : 'Unable to preview CSV.' }
   finally { busy.value = false }

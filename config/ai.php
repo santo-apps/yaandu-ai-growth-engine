@@ -8,6 +8,7 @@ return [
         'lead_classification' => ['provider' => env('AI_CLASSIFICATION_PROVIDER', 'gemini'), 'model' => env('AI_CLASSIFICATION_MODEL', 'gemini-2.5-flash')],
         'sales_reasoning' => ['provider' => env('AI_SALES_PROVIDER', 'anthropic'), 'model' => env('AI_SALES_MODEL', 'claude-3-7-sonnet-latest')],
         'content_generation' => ['provider' => env('AI_CONTENT_PROVIDER', 'openai'), 'model' => env('AI_CONTENT_MODEL', 'gpt-4.1-mini')],
+        'outreach_drafting' => ['provider' => env('AI_OUTREACH_PROVIDER', 'openai'), 'model' => env('AI_OUTREACH_MODEL', 'gpt-4.1-mini'), 'parameters' => ['max_output_tokens' => 2400, 'temperature' => 0.3]],
         'structured_extraction' => ['provider' => env('AI_EXTRACTION_PROVIDER', 'gemini'), 'model' => env('AI_EXTRACTION_MODEL', 'gemini-2.5-flash')],
         'proposal_generation' => ['provider' => env('AI_PROPOSAL_PROVIDER', 'anthropic'), 'model' => env('AI_PROPOSAL_MODEL', 'claude-3-7-sonnet-latest'), 'parameters' => ['max_output_tokens' => 3000, 'temperature' => 0.15]],
     ],

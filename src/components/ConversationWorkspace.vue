@@ -1,5 +1,8 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
+import EmptyState from './ui/EmptyState.vue'
+import LoadingState from './ui/LoadingState.vue'
+import { safeRequestError } from '../salesApi'
 
 type Conversation = {
   id: string; status: string; channel: string; intent: string | null; intent_confidence: number | null
@@ -59,7 +62,7 @@ async function request(path: string, method = 'GET', body?: unknown, idempotency
   if (idempotencyKey) headers['Idempotency-Key'] = idempotencyKey
   const response = await fetch(`/api/v1${path}`, { method, credentials: 'include', headers, ...(body === undefined ? {} : { body: JSON.stringify(body) }) })
   const result = await response.json()
-  if (!response.ok) throw new Error(result.message ?? `Request failed (${response.status}).`)
+  if (!response.ok) throw new Error(safeRequestError(response, result, 'Unable to complete this conversation request.'))
   return result
 }
 
@@ -288,8 +291,8 @@ onMounted(() => { void loadList(); void loadSchedulingConfiguration(); void load
 
 <template>
   <div class="conversation-workspace">
-    <div v-if="error" class="notice">{{ error }} <button class="quiet" @click="loadList">Retry</button></div>
-    <div v-if="notice" class="notice success-notice">{{ notice }}</div>
+    <div v-if="error" class="notice" role="alert">{{ error }} <button class="quiet" @click="loadList">Retry</button></div>
+    <div v-if="notice" class="notice success-notice" role="status">{{ notice }}</div>
     <div class="conversation-layout">
       <section class="panel conversation-inbox">
         <div class="panel-heading"><div><h2>{{ handoffMode ? 'Human handoff queue' : 'Sales inbox' }}</h2><p>Customer replies and sales conversations, scoped to this tenant. Unread state is not currently provided.</p></div><div class="conversation-actions"><button class="quiet" @click="toggleHandoffQueue">{{ handoffMode ? 'All conversations' : 'Needs human review' }}</button><button class="quiet" @click="loadList">↻ Refresh</button></div></div>
@@ -298,7 +301,7 @@ onMounted(() => { void loadList(); void loadSchedulingConfiguration(); void load
           <small>{{ item.company?.name }} · {{ item.intent?.replaceAll('_', ' ') || item.channel }}</small>
           <span class="conversation-preview">{{ item.ai_summary || 'No AI summary yet.' }}</span>
         </button>
-        <div v-if="!conversations.length" class="empty-table">{{ loading ? 'Loading conversations…' : 'No conversations yet. Accepted campaign messages will appear here.' }}</div>
+        <LoadingState v-if="loading && !conversations.length" label="Loading conversations…"/><EmptyState v-else-if="!conversations.length" title="No conversations yet" description="New prospect replies and conversations will appear here when available." icon="✉" />
       </section>
 
       <template v-if="selected">
@@ -338,7 +341,7 @@ onMounted(() => { void loadList(); void loadSchedulingConfiguration(); void load
           <div v-else class="empty-table">No evidence is available for this company yet.</div>
         </section>
       </template>
-      <section v-else class="panel conversation-detail empty-table">Select a conversation to inspect its messages and lead context.</section>
+      <section v-else class="panel conversation-detail conversation-detail--empty"><EmptyState title="Choose a conversation" description="Select a person or company from the inbox to review the message history, lead context, and next action." icon="◌" /></section>
     </div>
   </div>
 </template>

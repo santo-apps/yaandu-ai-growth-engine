@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
+import { safeRequestError } from '../salesApi'
 
 type IcpVersion = { id: string; version: number; status: string; configuration: string | Record<string, any>; activated_at?: string | null }
 type ConfigurationResponse = { active: IcpVersion | null; versions: IcpVersion[]; available_service_keys: string[]; available_service_capabilities: Array<{ key: string; label: string }> }
@@ -25,7 +26,7 @@ function configuration() {
 async function request(path: string, method = 'GET', body?: unknown) {
   const response = await fetch(`/api/v1${path}`, { method, credentials: 'include', headers: { Accept: 'application/json', 'Content-Type': 'application/json', 'X-Tenant-ID': tenantId, 'X-XSRF-TOKEN': xsrfToken() }, body: body ? JSON.stringify(body) : undefined })
   const result = await response.json()
-  if (!response.ok) throw new Error(result.message ?? `Request failed (${response.status}).`)
+  if (!response.ok) throw new Error(safeRequestError(response, result, 'Unable to complete this ICP request.'))
   return result
 }
 async function load() {
