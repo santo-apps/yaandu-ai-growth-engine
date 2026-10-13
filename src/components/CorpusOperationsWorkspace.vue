@@ -55,8 +55,8 @@ onMounted(load)
 
 <template>
   <section class="corpus-ops">
-    <div v-if="error" class="notice">{{ error }} <button class="quiet" @click="load">Retry</button></div>
-    <div v-if="notice" class="notice success-notice">{{ notice }}</div>
+    <div v-if="error" class="notice" role="alert">{{ error }} <button class="quiet" @click="load">Retry</button></div>
+    <div v-if="notice" class="notice success-notice" role="status">{{ notice }}</div>
     <div v-if="loading && !overview" class="panel empty-table">Loading corpus status…</div>
     <template v-else-if="overview">
       <section class="corpus-metrics">

@@ -98,8 +98,10 @@ try {
     const path = new URL(route.request().url()).pathname.replace('/api/v1', '')
     const method = route.request().method()
     let body = { data: [] }
-    const responseStatus = path === `/companies/${companyId}/sales-review` && route.request().method() === 'GET' && fixtureMode === 'review_error' ? 503 : 200
-    if (path === '/me') body = { id: 1, name: 'Synthetic Reviewer', email: 'reviewer@example.test' }
+    const injectedServerFailure = fixtureMode === 'server_error' && (path === '/companies' || path.startsWith('/companies?'))
+    const responseStatus = injectedServerFailure ? 500 : path === `/companies/${companyId}/sales-review` && route.request().method() === 'GET' && fixtureMode === 'review_error' ? 503 : 200
+    if (injectedServerFailure) body = { message: 'SQLSTATE[HY000]: secret database detail at vendor/framework/Connection.php:42' }
+    else if (path === '/me') body = { id: 1, name: 'Synthetic Reviewer', email: 'reviewer@example.test' }
     else if (path === '/tenants') body = [{ id: tenantId, name: 'Synthetic Pilot Workspace', role: 'owner', status: 'active' }]
     else if (path === '/companies' || path.startsWith('/companies?')) body = { data: [fixtureCompany] }
     else if (path === `/companies/${companyId}/outreach-drafts` && method === 'GET') body = { eligible: fixtureReview?.decision === 'pursue' && Boolean(fixtureReview?.selected_service_id), generation_ready: true, readiness: { checks: [
@@ -172,7 +174,7 @@ try {
   const consoleErrors = []
   page.on('pageerror', (error) => pageErrors.push(`${error.message} ${error.stack ?? ''}`))
   page.on('console', (message) => {
-    if (message.type() === 'error' && !(message.text().includes('503 (Service Unavailable)') && message.location().url.includes('/sales-review'))) consoleErrors.push(message.text())
+    if (message.type() === 'error' && !(message.text().includes('503 (Service Unavailable)') && message.location().url.includes('/sales-review')) && !(message.text().includes('500 (Internal Server Error)') && fixtureMode === 'server_error')) consoleErrors.push(message.text())
   })
   page.on('request', (request) => {
     if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(request.method()) && /intelligence|score|campaign|message|outreach/i.test(request.url()) && !/outreach-drafts/i.test(request.url())) mutatingRequests.push(`${request.method()} ${request.url()}`)
@@ -403,6 +405,12 @@ try {
   await page.getByText('Saved sales review could not be loaded.', { exact: true }).waitFor()
   await page.getByLabel('Sales decision').selectOption('hold')
   assert.equal(await page.getByRole('button', { name: 'Save sales decision' }).isDisabled(), true, 'A failed review read cannot be overwritten as if no decision existed')
+
+  fixtureMode = 'server_error'
+  await page.reload({ waitUntil: 'networkidle' })
+  const safeServerError = page.getByRole('alert').filter({ hasText: 'Something went wrong. Please try again or contact your workspace administrator.' })
+  await safeServerError.waitFor()
+  assert.ok(!(await page.locator('body').innerText()).includes('SQLSTATE'), 'Server diagnostics are not rendered in the sales UI')
 
   assert.deepEqual(pageErrors, [], `No browser runtime exceptions: ${pageErrors.join('; ')}`)
   assert.deepEqual(consoleErrors, [], `No browser console errors: ${consoleErrors.join('; ')}`)

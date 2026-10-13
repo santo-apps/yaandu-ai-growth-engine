@@ -2,6 +2,13 @@ export function csrfToken(): string {
   return decodeURIComponent(document.cookie.split('; ').find((part) => part.startsWith('XSRF-TOKEN='))?.split('=')[1] ?? '')
 }
 
+export function safeRequestError(response: Response, payload: any, fallback = 'The request could not be completed. Please try again.'): string {
+  if (response.status >= 500) return 'Something went wrong. Please try again or contact your workspace administrator.'
+  const message = typeof payload?.message === 'string' ? payload.message.trim() : ''
+  if (!message || /SQLSTATE|Illuminate\\|Symfony\\|stack trace|vendor\/|exception| at [^\n]+:\d+/i.test(message)) return fallback
+  return message.slice(0, 400)
+}
+
 export async function salesRequest(path: string, tenantId: string, method = 'GET', body?: unknown, idempotencyKey?: string) {
   const headers: Record<string, string> = { Accept: 'application/json', 'X-Tenant-ID': tenantId }
   if (method !== 'GET') headers['X-XSRF-TOKEN'] = csrfToken()
@@ -12,7 +19,7 @@ export async function salesRequest(path: string, tenantId: string, method = 'GET
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
   })
   const result = response.status === 204 ? null : await response.json().catch(() => ({}))
-  if (!response.ok) throw new Error(result?.message ?? `Request failed (${response.status}).`)
+  if (!response.ok) throw new Error(safeRequestError(response, result))
   return result
 }
 

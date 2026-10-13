@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
+import { safeRequestError } from '../salesApi'
 
 type Campaign = {
   id: string
@@ -67,7 +68,7 @@ async function request(path: string, method = 'GET', body?: unknown) {
   const result = response.status === 204 ? null : await response.json()
   if (!response.ok) {
     const firstValidation = result?.errors ? Object.values(result.errors as Record<string, string[]>)[0]?.[0] : null
-    throw new Error(firstValidation ?? result?.message ?? `Request failed (${response.status}).`)
+    throw new Error(response.status >= 500 ? safeRequestError(response, result) : firstValidation ?? result?.message ?? `Request failed (${response.status}).`)
   }
   return result
 }
@@ -284,8 +285,8 @@ onMounted(() => { void loadCampaigns(); void loadContacts(); if (props.manager) 
 
 <template>
   <div class="campaign-workspace">
-    <div v-if="error" class="notice">{{ error }} <button class="quiet" @click="loadCampaigns">Retry</button></div>
-    <div v-if="notice" class="notice success-notice">{{ notice }}</div>
+    <div v-if="error" class="notice" role="alert">{{ error }} <button class="quiet" @click="loadCampaigns">Retry</button></div>
+    <div v-if="notice" class="notice success-notice" role="status">{{ notice }}</div>
     <div class="test-mode-banner"><b>TEST MODE</b><span>Outbound messages use the fake provider. No external email is delivered.</span></div>
     <section class="panel companies-panel">
       <div class="panel-heading"><div><h2>Campaigns</h2><p>Create audience-scoped drafts and prepare an approved email sequence.</p></div><button class="quiet" @click="loadCampaigns">↻ Refresh</button></div>

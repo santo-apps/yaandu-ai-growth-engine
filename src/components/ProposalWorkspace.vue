@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
+import { safeRequestError } from '../salesApi'
 
 type ScopeLine = { service_id: string; description: string; deliverables: string[] }
 type Version = { id: string; version: number; status: string; provider: string | null; model: string | null; draft_content: Record<string, any>; recommended_scope: ScopeLine[]; approved_scope: ScopeLine[]; document_key: string | null; document_sha256: string | null; document_generated_at?: string | null; commercial_snapshot?: { discount_percent?: number } }
@@ -36,7 +37,7 @@ async function api(path: string, method = 'GET', body?: unknown, key?: string) {
   if (key) headers['Idempotency-Key'] = key
   const response = await fetch('/api/v1' + path, { method, credentials: 'include', headers, ...(body === undefined ? {} : { body: JSON.stringify(body) }) })
   const value = response.status === 204 ? null : await response.json()
-  if (!response.ok) throw new Error(value?.message ?? 'Request failed (' + response.status + ').')
+  if (!response.ok) throw new Error(safeRequestError(response, value, 'Unable to complete this proposal request.'))
   return value
 }
 async function load() {
@@ -125,8 +126,8 @@ onMounted(() => { void load() })
 
 <template>
   <div class="proposal-workspace">
-    <div v-if="error" class="notice">{{ error }} <button class="quiet" @click="load">Retry</button></div>
-    <div v-if="notice" class="notice success-notice">{{ notice }}</div>
+    <div v-if="error" class="notice" role="alert">{{ error }} <button class="quiet" @click="load">Retry</button></div>
+    <div v-if="notice" class="notice success-notice" role="status">{{ notice }}</div>
     <div class="proposal-columns" :class="{'setup-only-layout':setupOnly}">
       <section v-if="!setupOnly" class="panel companies-panel">
         <div class="panel-heading"><div><h2>Proposals</h2><p>Grounded drafts and human-controlled approvals.</p></div><button class="quiet" @click="load">↻ Refresh</button></div>
