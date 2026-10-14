@@ -32,11 +32,12 @@ final class OutreachDraftService
             ['key'=>'sales_decision','label'=>'Prospect marked Pursue','ready'=>(bool)$eligible,'detail'=>$eligible?'Approved sales decision is in place.':'A current Pursue decision and active selected service are required.'],
             ['key'=>'service','label'=>'Active service selected','ready'=>(bool)($eligible && $review?->selected_service_id),'detail'=>$eligible?'The selected service is active and approved.':'Select an active approved service in Human Sales Review.'],
             ['key'=>'findings','label'=>'Validated findings available','ready'=>count($findings)>0,'detail'=>count($findings).' finding'.(count($findings)===1?'':'s').' available for human selection.'],
-            ['key'=>'route','label'=>'AI writing route configured','ready'=>(bool)($route && $route->enabled),'detail'=>$route && $route->enabled?'A tenant-specific route is enabled.':'An enabled tenant outreach_drafting route is required.'],
-            ['key'=>'credential','label'=>'AI provider available','ready'=>$credentialConfigured,'detail'=>$credentialConfigured?'Provider credentials are configured.':'The selected provider credential is not available in this runtime.'],
+            ['key'=>'route','label'=>'Optional AI style-plan route','ready'=>(bool)($route && $route->enabled),'optional'=>true,'detail'=>$route && $route->enabled?'An optional tenant-specific style route is enabled.':'AI styling is unavailable; deterministic draft composition remains available.'],
+            ['key'=>'credential','label'=>'Optional AI style provider','ready'=>$credentialConfigured,'optional'=>true,'detail'=>$credentialConfigured?'Optional style-planning credentials are configured.':'No style provider credential is available; deterministic draft composition remains available.'],
             ['key'=>'prompt','label'=>'Approved outreach prompt','ready'=>$promptReady,'detail'=>$promptReady?'An approved active prompt is available.':'An owner must approve and activate an OutreachDraftAgent prompt.'],
         ];
-        return ['eligible'=>(bool)$eligible,'generation_ready'=>collect($checks)->every(fn(array $check):bool=>$check['ready']),
+        $generationReady = (bool) $eligible && count($findings) > 0 && $promptReady;
+        return ['eligible'=>(bool)$eligible,'generation_ready'=>$generationReady,
             'readiness'=>['checks'=>$checks,'route'=>$route?['provider'=>$route->provider,'model'=>$route->model,'enabled'=>(bool)$route->enabled]:null,
                 'prompt'=>['approved_active'=>$promptReady]],
             'review'=>$review ? ['decision'=>$review->decision,'selected_service_id'=>$review->selected_service_id,'service_name'=>$review->service_name,'notes'=>$review->notes] : null,

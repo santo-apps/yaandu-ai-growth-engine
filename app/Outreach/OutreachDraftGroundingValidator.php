@@ -2,170 +2,130 @@
 
 namespace App\Outreach;
 
-/** Rejects ungrounded prospect claims before an outreach draft is persisted. */
+use RuntimeException;
+
+/** Validates composer provenance and deterministic channel invariants. */
 final class OutreachDraftGroundingValidator
 {
-    private const MAX_VIOLATIONS = 23;
-
     public function __construct(private readonly OutreachChannelResolver $channels) {}
 
-    /** @var array<string, string> */
-    private const UNSUPPORTED_STRENGTH = [
-        'significant' => '/\bsignificant(?:ly)?\b/i',
-        'major' => '/\bmajor\b/i',
-        'substantial' => '/\bsubstantial(?:ly)?\b/i',
-        'poor' => '/\bpoor\b/i',
-        'slow' => '/\bslow(?:ly)?\b/i',
-        'weak' => '/\bweak(?:ly)?\b/i',
-        'broken' => '/\bbroken\b/i',
-        'lacking' => '/\black(?:s|ing)?\b/i',
-    ];
-
-    /** @var array<string, string> */
-    private const TECHNICAL_TOPICS = [
-        'mobile usability' => '/\b(?:mobile|smartphone|phone|viewport)\b/i',
-        'responsive behavior' => '/\bresponsiv(?:e|ity|eness)\b/i',
-        'website speed' => '/\b(?:speed|slow|fast|load(?:ing)? time|page speed|latency)\b/i',
-        'website performance' => '/\bperformance\b/i',
-        'technical weaknesses' => '/\btechnical (?:performance|weakness(?:es)?|problem(?:s)?|issue(?:s)?)\b/i',
-        'lead capture' => '/\b(?:lead capture|contact form|conversion rate|cro)\b/i',
-        'search optimization' => '/\b(?:seo|search engine optimization|meta description|h1|headings?)\b/i',
-        'messaging capability' => '/\b(?:whatsapp|crm)\b/i',
-        'commerce capability' => '/\b(?:e-?commerce|online store|checkout)\b/i',
-        'software capability' => '/\b(?:erp|custom software|mobile app|ai agent|cloud devops)\b/i',
-    ];
-
-    /** @param array<string, mixed> $draft @param list<array<string, mixed>> $findings @param list<array<string, mixed>> $publicContactContext */
-    public function assertGrounded(array $draft, array $findings, object $service, string $companyName = '', array $publicContactContext = []): void
+    /** @param list<array<string, mixed>> $selectedFindings @param list<array<string, mixed>> $publicContactContext */
+    public function assertComposition(OutreachDraftComposition $composition, array $selectedFindings, object $service, array $publicContactContext): void
     {
-        $result = $this->validate($draft, $findings, $service, $companyName, $publicContactContext);
-        if (! $result->valid) {
-            $first = $result->violations[0];
-            throw new OutreachDraftGroundingException($first['reason_code'], $first['field'], $result->violations);
+        $selected = array_values(array_unique(array_map('strval', array_column($selectedFindings, 'id'))));
+        if ($selected === [] || count($selected) !== count($selectedFindings)
+            || count($composition->findingIds) !== count($selected)
+            || count(array_unique($composition->findingIds)) !== count($selected)
+            || array_diff($composition->findingIds, $selected) !== []
+            || array_diff($selected, $composition->findingIds) !== []) {
+            throw new RuntimeException('The composed draft did not preserve the reviewer-selected finding set.');
         }
-    }
 
-    /** @param array<string, mixed> $draft @param list<array<string, mixed>> $findings @param list<array<string, mixed>> $publicContactContext */
-    public function validate(array $draft, array $findings, object $service, string $companyName = '', array $publicContactContext = []): OutreachDraftGroundingResult
-    {
-        /** @var array<string, array{reason_code: string, field: string}> $violations */
-        $violations = [];
-        $record = function (string $reasonCode, string $field) use (&$violations): void {
-            $key = $reasonCode.'|'.$field;
-            if (count($violations) < self::MAX_VIOLATIONS) {
-                $violations[$key] = ['reason_code' => $reasonCode, 'field' => $field];
+        if ((string) ($service->id ?? '') !== $composition->serviceId) {
+            throw new RuntimeException('The composed draft service does not match the approved selected service.');
+        }
+
+        $contact = $this->channels->resolve($publicContactContext);
+        if (($composition->draft['recommended_channel'] ?? null) !== $contact['recommended_channel']
+            || ($composition->draft['recommended_channel_reason'] ?? null) !== $contact['recommended_channel_reason']) {
+            throw new RuntimeException('The composed draft channel does not match verified public contact context.');
+        }
+        if (! $this->channels->isAvailable('whatsapp', $publicContactContext) && ($composition->draft['whatsapp'] ?? null) !== '') {
+            throw new RuntimeException('A WhatsApp draft was composed without a verified or publicly listed channel.');
+        }
+        if (! $this->channels->isAvailable('linkedin', $publicContactContext) && ($composition->draft['linkedin'] ?? null) !== '') {
+            throw new RuntimeException('A LinkedIn draft was composed without a verified or publicly listed channel.');
+        }
+
+        $draft = $composition->draft;
+        $expectedKeys = ['pitch_summary', 'recommended_channel', 'recommended_channel_reason', 'email', 'whatsapp', 'linkedin',
+            'follow_up_email', 'follow_up_short', 'evidence_used'];
+        if (array_diff($expectedKeys, array_keys($draft)) !== [] || array_diff(array_keys($draft), $expectedKeys) !== []
+            || ! is_array($draft['email'] ?? null) || array_keys($draft['email']) !== ['subject', 'body']) {
+            throw new RuntimeException('The deterministic outreach composer produced an unexpected draft shape.');
+        }
+        foreach (['pitch_summary', 'recommended_channel_reason', 'email.subject', 'email.body', 'whatsapp', 'linkedin', 'follow_up_email', 'follow_up_short'] as $field) {
+            $value = match ($field) {
+                'email.subject' => $draft['email']['subject'] ?? null,
+                'email.body' => $draft['email']['body'] ?? null,
+                default => $draft[$field] ?? null,
+            };
+            if (is_string($value) && in_array($field, ['whatsapp', 'linkedin'], true) && $value === '') continue;
+            if (! is_string($value) || trim($value) === '') {
+                throw new RuntimeException('The deterministic outreach composer produced an incomplete draft.');
             }
-        };
-
-        $evidence = mb_strtolower(implode(' ', array_map(fn (array $finding): string => implode(' ', [
-            (string) ($finding['key'] ?? ''), (string) ($finding['label'] ?? ''),
-            (string) ($finding['summary'] ?? ''), (string) ($finding['evidence'] ?? ''),
-        ]), $findings)));
-        $serviceName = mb_strtolower((string) ($service->name ?? ''));
-        $companyName = mb_strtolower($companyName);
-        foreach ($this->channelViolations($draft, $publicContactContext) as $violation) {
-            $record($violation['reason_code'], $violation['field']);
         }
-        $assertedFields = [
-            'pitch_summary' => $draft['pitch_summary'] ?? '',
-            'email.subject' => $draft['email']['subject'] ?? '',
-            'email.body' => $draft['email']['body'] ?? '',
-            'whatsapp' => $draft['whatsapp'] ?? '',
-            'linkedin' => $draft['linkedin'] ?? '',
-            'follow_up_email' => $draft['follow_up_email'] ?? '',
-            'follow_up_short' => $draft['follow_up_short'] ?? '',
+
+        $findingsById = collect($selectedFindings)->keyBy('id');
+        $fieldText = [
+            'pitch_summary' => $draft['pitch_summary'], 'email.subject' => $draft['email']['subject'],
+            'email.body' => $draft['email']['body'], 'whatsapp' => $draft['whatsapp'], 'linkedin' => $draft['linkedin'],
+            'follow_up_email' => $draft['follow_up_email'], 'follow_up_short' => $draft['follow_up_short'],
         ];
-
-        foreach ($assertedFields as $field => $value) {
-            if (! is_string($value) || trim($value) === '') continue;
-            foreach ($this->sentences($value) as $sentence) {
-                $sentenceLower = mb_strtolower($sentence);
-                foreach (self::UNSUPPORTED_STRENGTH as $pattern) {
-                    if (preg_match($pattern, $sentence) && ! preg_match($pattern, $evidence)) {
-                        $record('OUTREACH_GROUNDING_STRENGTH', $field);
-                    }
+        $seenAtoms = [];
+        $rendered = [];
+        foreach ($composition->segments as $segment) {
+            $field = $segment['field'] ?? null;
+            $type = $segment['type'] ?? null;
+            $text = $segment['text'] ?? null;
+            if (! is_string($field) || ! isset($fieldText[$field]) || ! is_string($text) || trim($text) === '') {
+                throw new RuntimeException('The deterministic outreach composer produced an invalid provenance segment.');
+            }
+            $rendered[$field] = ($rendered[$field] ?? '').(string) ($segment['separator_before'] ?? '').$text;
+            if (in_array($type, ['observation', 'opportunity', 'finding_label'], true)) {
+                $id = $segment['finding_id'] ?? null;
+                $finding = is_string($id) ? $findingsById->get($id) : null;
+                if (! $finding || ! in_array($id, $selected, true)) {
+                    throw new RuntimeException('A provenance segment references a finding not selected by the reviewer.');
                 }
-
-                $capabilityOnly = $this->isGeneralCapabilityStatement($sentenceLower, $serviceName);
-                $prospectClaim = $this->isProspectClaim($sentenceLower, $companyName);
-                // The approved service name is context, not evidence. Exempt only that
-                // exact phrase, and only when the sentence is not asserting a fact
-                // about the prospect. Keep topic checks intact for all other wording.
-                $topicSentence = $prospectClaim || $serviceName === ''
-                    ? $sentence
-                    : str_ireplace($serviceName, '', $sentence);
-                foreach (self::TECHNICAL_TOPICS as $topicPattern) {
-                    if (preg_match($topicPattern, $topicSentence) && ! preg_match($topicPattern, $evidence) && ! $capabilityOnly) {
-                        $record('OUTREACH_GROUNDING_TOPIC', $field);
-                    }
+                $source = match ($type) {
+                    'observation' => 'We noticed: '.mb_substr(trim((string) ($finding['evidence'] ?? '')), 0, 120),
+                    'opportunity' => mb_substr(trim((string) ($finding['summary'] ?? '')), 0, 180),
+                    'finding_label' => mb_substr('A note about '.(string) ($finding['label'] ?? ''), 0, 180),
+                };
+                if ($text !== $source) {
+                    throw new RuntimeException('A provenance segment does not match its selected evidence atom.');
                 }
-
-                if ($prospectClaim && ! $this->hasEvidenceAnchor($sentenceLower, $evidence)
-                    && ! $capabilityOnly && ! $this->isGenericCallToAction($sentenceLower)) {
-                    $record('OUTREACH_GROUNDING_PROSPECT_CLAIM', $field);
+                if (in_array($type, ['observation', 'opportunity'], true)) $seenAtoms[$id][$type] = true;
+            } elseif ($type === 'service_capability') {
+                $expected = 'Our '.(string) ($service->name ?? '').' work can support this type of improvement where relevant.';
+                if ($text !== $expected) throw new RuntimeException('The service capability segment does not match the approved service template.');
+            } elseif ($type === 'template') {
+                if (! in_array($text, ['Hello,', 'Hello, I am reaching out from Yaandu with a note about a selected finding.',
+                    'Hello, we noticed a detail in the reviewed website evidence.', 'Best regards, Yaandu', 'Regards, Yaandu', 'Warm regards, Yaandu'], true)) {
+                    throw new RuntimeException('A deterministic template segment is not approved.');
                 }
+            } elseif ($type === 'cta') {
+                if (! in_array($text, ['Would a brief review of this finding be useful?', 'Would you be interested in discussing this?',
+                    'Would you be open to a brief conversation about this?'], true)) {
+                    throw new RuntimeException('A deterministic call-to-action segment is not approved.');
+                }
+            } elseif ($type !== 'cta') {
+                throw new RuntimeException('The deterministic outreach composer produced an unsupported segment type.');
             }
         }
 
-        $items = array_values($violations);
-
-        return new OutreachDraftGroundingResult($items === [], $items);
-    }
-
-    /** @param array<string, mixed> $draft @param list<array<string, mixed>> $context */
-    private function channelViolations(array $draft, array $context): array
-    {
-        $violations = [];
-        $resolved = $this->channels->resolve($context);
-        if (($draft['recommended_channel'] ?? null) !== $resolved['recommended_channel']) {
-            $violations[] = ['reason_code' => 'OUTREACH_GROUNDING_CHANNEL', 'field' => 'recommended_channel'];
-        }
-        if (($draft['recommended_channel_reason'] ?? null) !== $resolved['recommended_channel_reason']) {
-            $violations[] = ['reason_code' => 'OUTREACH_GROUNDING_CHANNEL', 'field' => 'recommended_channel_reason'];
+        foreach ($fieldText as $field => $value) {
+            if (($rendered[$field] ?? '') !== $value) {
+                throw new RuntimeException('A rendered draft field contains text outside its deterministic provenance segments.');
+            }
         }
 
-        return $violations;
-    }
-
-    /** @return list<string> */
-    private function sentences(string $text): array
-    {
-        return array_values(array_filter(array_map('trim', preg_split('/(?<=[.!?])\s+|[\r\n]+/u', $text) ?: []),
-            fn (string $sentence): bool => $sentence !== ''));
-    }
-
-    private function isGeneralCapabilityStatement(string $sentence, string $serviceName): bool
-    {
-        if ($serviceName === '' || ! str_contains($sentence, $serviceName)) return false;
-        if (preg_match('/\b(?:your|you|we noticed|we found|we observed|currently|needs?|lacks?|suffers?)\b/i', $sentence)) return false;
-
-        return preg_match('/\b(?:our|the selected)\b.*\b(?:service|work|offering)\b.*\b(?:can|could|may)\s+(?:include|help|support|address|cover|provide|improve|optimi[sz]e)\b.*\b(?:where relevant|when relevant|if needed|as appropriate)\b/i', $sentence) === 1;
-    }
-
-    private function isProspectClaim(string $sentence, string $companyName): bool
-    {
-        if (preg_match('/\b(?:we noticed|we found|we observed|we reviewed|we saw|your (?:company|business|website|site|team|current)|you (?:have|are|need|lack)|your\s+\w+\s+(?:is|are|has|have|needs?|lacks?|shows?|contains?))\b/i', $sentence)) return true;
-        if ($companyName !== '' && str_contains($sentence, $companyName)
-            && preg_match('/\b(?:has|have|is|are|needs?|lacks?|shows?|contains?|could|may|might)\b/i', $sentence)) return true;
-
-        return false;
-    }
-
-    private function hasEvidenceAnchor(string $sentence, string $evidence): bool
-    {
-        preg_match_all('/\b(?:[a-z][a-z0-9-]{4,}|h1|seo|cro|crm)\b/i', $evidence, $matches);
-        $stop = ['could', 'would', 'should', 'might', 'their', 'there', 'these', 'those', 'which', 'where', 'while', 'about', 'after',
-            'before', 'pages', 'page', 'presence', 'content', 'improving', 'enhance', 'improve', 'opportunity', 'finding', 'business'];
-        foreach (array_unique(array_map('mb_strtolower', $matches[0] ?? [])) as $anchor) {
-            if (in_array($anchor, $stop, true)) continue;
-            if (preg_match('/\b'.preg_quote($anchor, '/').'\b/i', $sentence)) return true;
+        foreach ($selected as $id) {
+            if (empty($seenAtoms[$id]['observation']) || empty($seenAtoms[$id]['opportunity'])) {
+                throw new RuntimeException('The composed draft is missing provenance for a selected finding.');
+            }
         }
 
-        return false;
-    }
-
-    private function isGenericCallToAction(string $sentence): bool
-    {
-        return preg_match('/\b(?:would you be open|would it be useful|shall we|could we|let me know|happy to discuss|available for a call)\b/i', $sentence) === 1;
+        $evidenceUsed = array_values(array_map('strval', array_column((array) ($draft['evidence_used'] ?? []), 'finding_id')));
+        if ($evidenceUsed !== $composition->findingIds) {
+            throw new RuntimeException('The composed evidence references do not match the selected finding order.');
+        }
+        foreach ((array) ($draft['evidence_used'] ?? []) as $index => $item) {
+            $finding = $findingsById->get($item['finding_id'] ?? null);
+            if (! $finding || ($item['summary'] ?? null) !== mb_substr((string) $finding['summary'], 0, 300)) {
+                throw new RuntimeException('A public evidence summary does not match its selected finding.');
+            }
+        }
     }
 }
