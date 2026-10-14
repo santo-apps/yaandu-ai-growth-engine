@@ -5,6 +5,8 @@ namespace App\Outreach;
 /** Rejects ungrounded prospect claims before an outreach draft is persisted. */
 final class OutreachDraftGroundingValidator
 {
+    private const MAX_VIOLATIONS = 23;
+
     public function __construct(private readonly OutreachChannelResolver $channels) {}
 
     /** @var array<string, string> */
@@ -36,13 +38,34 @@ final class OutreachDraftGroundingValidator
     /** @param array<string, mixed> $draft @param list<array<string, mixed>> $findings @param list<array<string, mixed>> $publicContactContext */
     public function assertGrounded(array $draft, array $findings, object $service, string $companyName = '', array $publicContactContext = []): void
     {
+        $result = $this->validate($draft, $findings, $service, $companyName, $publicContactContext);
+        if (! $result->valid) {
+            $first = $result->violations[0];
+            throw new OutreachDraftGroundingException($first['reason_code'], $first['field'], $result->violations);
+        }
+    }
+
+    /** @param array<string, mixed> $draft @param list<array<string, mixed>> $findings @param list<array<string, mixed>> $publicContactContext */
+    public function validate(array $draft, array $findings, object $service, string $companyName = '', array $publicContactContext = []): OutreachDraftGroundingResult
+    {
+        /** @var array<string, array{reason_code: string, field: string}> $violations */
+        $violations = [];
+        $record = function (string $reasonCode, string $field) use (&$violations): void {
+            $key = $reasonCode.'|'.$field;
+            if (count($violations) < self::MAX_VIOLATIONS) {
+                $violations[$key] = ['reason_code' => $reasonCode, 'field' => $field];
+            }
+        };
+
         $evidence = mb_strtolower(implode(' ', array_map(fn (array $finding): string => implode(' ', [
             (string) ($finding['key'] ?? ''), (string) ($finding['label'] ?? ''),
             (string) ($finding['summary'] ?? ''), (string) ($finding['evidence'] ?? ''),
         ]), $findings)));
         $serviceName = mb_strtolower((string) ($service->name ?? ''));
         $companyName = mb_strtolower($companyName);
-        $this->assertChannelGrounded($draft, $publicContactContext);
+        foreach ($this->channelViolations($draft, $publicContactContext) as $violation) {
+            $record($violation['reason_code'], $violation['field']);
+        }
         $assertedFields = [
             'pitch_summary' => $draft['pitch_summary'] ?? '',
             'email.subject' => $draft['email']['subject'] ?? '',
@@ -59,7 +82,7 @@ final class OutreachDraftGroundingValidator
                 $sentenceLower = mb_strtolower($sentence);
                 foreach (self::UNSUPPORTED_STRENGTH as $pattern) {
                     if (preg_match($pattern, $sentence) && ! preg_match($pattern, $evidence)) {
-                        throw new OutreachDraftGroundingException('OUTREACH_GROUNDING_STRENGTH', $field);
+                        $record('OUTREACH_GROUNDING_STRENGTH', $field);
                     }
                 }
 
@@ -73,28 +96,35 @@ final class OutreachDraftGroundingValidator
                     : str_ireplace($serviceName, '', $sentence);
                 foreach (self::TECHNICAL_TOPICS as $topicPattern) {
                     if (preg_match($topicPattern, $topicSentence) && ! preg_match($topicPattern, $evidence) && ! $capabilityOnly) {
-                        throw new OutreachDraftGroundingException('OUTREACH_GROUNDING_TOPIC', $field);
+                        $record('OUTREACH_GROUNDING_TOPIC', $field);
                     }
                 }
 
                 if ($prospectClaim && ! $this->hasEvidenceAnchor($sentenceLower, $evidence)
                     && ! $capabilityOnly && ! $this->isGenericCallToAction($sentenceLower)) {
-                    throw new OutreachDraftGroundingException('OUTREACH_GROUNDING_PROSPECT_CLAIM', $field);
+                    $record('OUTREACH_GROUNDING_PROSPECT_CLAIM', $field);
                 }
             }
         }
+
+        $items = array_values($violations);
+
+        return new OutreachDraftGroundingResult($items === [], $items);
     }
 
     /** @param array<string, mixed> $draft @param list<array<string, mixed>> $context */
-    private function assertChannelGrounded(array $draft, array $context): void
+    private function channelViolations(array $draft, array $context): array
     {
+        $violations = [];
         $resolved = $this->channels->resolve($context);
         if (($draft['recommended_channel'] ?? null) !== $resolved['recommended_channel']) {
-            throw new OutreachDraftGroundingException('OUTREACH_GROUNDING_CHANNEL', 'recommended_channel');
+            $violations[] = ['reason_code' => 'OUTREACH_GROUNDING_CHANNEL', 'field' => 'recommended_channel'];
         }
         if (($draft['recommended_channel_reason'] ?? null) !== $resolved['recommended_channel_reason']) {
-            throw new OutreachDraftGroundingException('OUTREACH_GROUNDING_CHANNEL', 'recommended_channel_reason');
+            $violations[] = ['reason_code' => 'OUTREACH_GROUNDING_CHANNEL', 'field' => 'recommended_channel_reason'];
         }
+
+        return $violations;
     }
 
     /** @return list<string> */

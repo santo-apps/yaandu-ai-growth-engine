@@ -163,6 +163,32 @@ final class OutreachDraftGenerationTest extends TestCase
         }
     }
 
+    public function test_grounding_validator_aggregates_deduplicated_reason_field_violations_without_text(): void
+    {
+        $validator=app(OutreachDraftGroundingValidator::class);
+        $finding=['id'=>(string)Str::uuid(),'key'=>'strong_business_fit','label'=>'Strong business fit',
+            'summary'=>'Improving the presence and content of H1 headings on pages could enhance SEO and user clarity.',
+            'evidence'=>'No non-empty H1 heading was found.'];
+        $service=(object)['name'=>'Website Performance Optimization','description'=>'General service capability.'];
+        $draft=['pitch_summary'=>'This could significantly enhance SEO.','recommended_channel'=>'contact_page',
+            'recommended_channel_reason'=>'No verified direct email, WhatsApp, or LinkedIn channel is available. A public contact page is available.',
+            'email'=>['subject'=>'H1 heading content','body'=>'Ebarza has an issue that needs attention.'],
+            'whatsapp'=>'','linkedin'=>'','follow_up_email'=>'','follow_up_short'=>'',
+            'evidence_used'=>[]];
+
+        $result=$validator->validate($draft,[$finding],$service,'Ebarza',[
+            ['channel'=>'contact_page','status'=>'publicly_listed','confidence'=>.95],
+        ]);
+
+        self::assertFalse($result->valid);
+        self::assertSame([
+            ['reason_code'=>'OUTREACH_GROUNDING_STRENGTH','field'=>'pitch_summary'],
+            ['reason_code'=>'OUTREACH_GROUNDING_PROSPECT_CLAIM','field'=>'email.body'],
+        ],$result->violations);
+        self::assertStringNotContainsString('Ebarza',json_encode($result->violations));
+        self::assertStringNotContainsString('significantly',json_encode($result->violations));
+    }
+
     public function test_channel_reason_is_grounded_only_in_verified_public_contact_context(): void
     {
         $validator=app(OutreachDraftGroundingValidator::class);
@@ -478,8 +504,9 @@ final class OutreachDraftGenerationTest extends TestCase
         [$tenant,$user,$company,,$finding]=$this->fixture('outreach-ebarza-repair');
         $finding=$this->makeEbarzaH1Finding($tenant->id,$company->id,$finding);
         $rejected='Ebarza has an issue that needs attention.';
+        $firstPitch='This could significantly enhance SEO.';
         $provider=new SequencedAIProvider([
-            $this->ebarzaDraft($finding,'A measured H1 opportunity.',emailBody:$rejected),
+            $this->ebarzaDraft($finding,$firstPitch,emailBody:$rejected),
             $this->ebarzaDraft($finding,'Ebarza could benefit from reviewing the H1 heading structure on pages where no non-empty H1 was found. Website Performance Optimization is the selected service for this opportunity.'),
         ]);
         $this->bindSequencedProvider($tenant->id,$provider);
@@ -495,9 +522,12 @@ final class OutreachDraftGenerationTest extends TestCase
         self::assertSame($provider->requests[0]->tenantId,$provider->requests[1]->tenantId);
         self::assertSame($provider->requests[0]->correlationId,$provider->requests[1]->correlationId,
             'Both independently accounted provider calls remain associated with the same workflow correlation.');
-        self::assertStringContainsString('OUTREACH_GROUNDING_PROSPECT_CLAIM',$provider->requests[1]->systemInstruction);
+        self::assertStringContainsString('OUTREACH_GROUNDING_STRENGTH: pitch_summary',$provider->requests[1]->systemInstruction);
+        self::assertStringContainsString('OUTREACH_GROUNDING_PROSPECT_CLAIM: email.body',$provider->requests[1]->systemInstruction);
         self::assertStringContainsString('email.body',$provider->requests[1]->systemInstruction);
         self::assertStringNotContainsString($rejected,$provider->requests[1]->systemInstruction,
+            'Rejected generated text must never be echoed into the repair request.');
+        self::assertStringNotContainsString($firstPitch,$provider->requests[1]->systemInstruction,
             'Rejected generated text must never be echoed into the repair request.');
         self::assertStringContainsString('significant, significantly, major, substantial, poor, slow, weak, broken, or lacking',$provider->requests[1]->systemInstruction);
         self::assertSame($provider->requests[0]->outputSchema,$provider->requests[1]->outputSchema);
@@ -520,7 +550,12 @@ final class OutreachDraftGenerationTest extends TestCase
         self::assertDatabaseCount('campaign_events',0);
         Log::shouldHaveReceived('notice')->once()->withArgs(function(string $message,array $context):bool {
             return $message==='Outreach draft grounding repair finished.'
-                && $context===['repair_attempted'=>true,'original_reason_code'=>'OUTREACH_GROUNDING_PROSPECT_CLAIM','original_field'=>'email.body','final_outcome'=>'accepted'];
+                && $context===['repair_attempted'=>true,
+                    'original_violations'=>[
+                        ['reason_code'=>'OUTREACH_GROUNDING_STRENGTH','field'=>'pitch_summary'],
+                        ['reason_code'=>'OUTREACH_GROUNDING_PROSPECT_CLAIM','field'=>'email.body'],
+                    ],
+                    'final_outcome'=>'accepted','remaining_violations'=>[]];
         });
         self::assertSame('Ebarza could benefit from reviewing the H1 heading structure on pages where no non-empty H1 was found. Website Performance Optimization is the selected service for this opportunity.',
             json_decode(DB::table('outreach_drafts')->where('tenant_id',$tenant->id)->value('draft_payload'),true)['pitch_summary']);
@@ -531,8 +566,9 @@ final class OutreachDraftGenerationTest extends TestCase
     {
         [$tenant,$user,$company,,$finding]=$this->fixture('outreach-ebarza-repair-fails');
         $finding=$this->makeEbarzaH1Finding($tenant->id,$company->id,$finding);
+        Log::spy();
         $provider=new SequencedAIProvider([
-            $this->ebarzaDraft($finding,'This could significantly enhance SEO.'),
+            $this->ebarzaDraft($finding,'This could significantly enhance SEO.',emailBody:'Ebarza has an issue that needs attention.'),
             $this->ebarzaDraft($finding,'This could substantially enhance SEO.'),
         ]);
         $this->bindSequencedProvider($tenant->id,$provider);
@@ -544,6 +580,20 @@ final class OutreachDraftGenerationTest extends TestCase
         self::assertCount(2,$provider->requests,'Grounding repair is bounded to one attempt.');
         self::assertDatabaseCount('outreach_drafts',0);
         self::assertSame(2,DB::table('ai_usage_records')->where('tenant_id',$tenant->id)->where('task_key','outreach_drafting')->where('status','COMPLETED')->count());
+        Log::shouldHaveReceived('warning')->withArgs(function(string $message,array $context):bool {
+            return $message==='Outreach draft grounding repair finished.'
+                && $context===['repair_attempted'=>true,
+                    'original_violations'=>[
+                        ['reason_code'=>'OUTREACH_GROUNDING_STRENGTH','field'=>'pitch_summary'],
+                        ['reason_code'=>'OUTREACH_GROUNDING_PROSPECT_CLAIM','field'=>'email.body'],
+                    ],
+                    'final_outcome'=>'rejected',
+                    'remaining_violations'=>[
+                        ['reason_code'=>'OUTREACH_GROUNDING_STRENGTH','field'=>'pitch_summary'],
+                    ]];
+        })->once();
+        self::assertStringContainsString('OUTREACH_GROUNDING_STRENGTH: pitch_summary',$provider->requests[1]->systemInstruction);
+        self::assertStringContainsString('OUTREACH_GROUNDING_PROSPECT_CLAIM: email.body',$provider->requests[1]->systemInstruction);
         $this->assertDatabaseCount('outbound_messages',0);
         $this->assertDatabaseCount('campaign_recipients',0);
         $this->assertDatabaseCount('campaign_events',0);

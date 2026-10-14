@@ -49,30 +49,43 @@ final class OutreachDraftAgent implements AgentInterface
         $systemInstruction = self::policy()."\n\n".$prompt->systemInstruction."\n\nApproved template:\n".$prompt->template."\n\n".self::policy();
         $response = $this->router->generate($this->request($context, $groundedContext, $systemInstruction));
         $data = $this->resolveChannel($response->data, $groundedContext);
-        try {
-            $usedIds = $this->assertCompleteAndGrounded($data, $selectedIds, $selectedFindings, $service, $groundedContext);
-        } catch (\App\Outreach\OutreachDraftGroundingException $firstFailure) {
-            $repairInstruction = $systemInstruction."\n\n".$this->repairInstruction($firstFailure);
+        $validation = $this->assertCompleteAndGrounded($data, $selectedIds, $selectedFindings, $service, $groundedContext);
+        $usedIds = $validation['used_ids'];
+        if ($validation['violations'] !== []) {
+            $originalViolations = $validation['violations'];
+            $repairInstruction = $systemInstruction."\n\n".$this->repairInstruction($originalViolations);
 
             try {
                 $response = $this->router->generate($this->request($context, $groundedContext, $repairInstruction));
                 $data = $this->resolveChannel($response->data, $groundedContext);
-                $usedIds = $this->assertCompleteAndGrounded($data, $selectedIds, $selectedFindings, $service, $groundedContext);
-                Log::notice('Outreach draft grounding repair finished.', [
-                    'repair_attempted' => true,
-                    'original_reason_code' => $firstFailure->reasonCode,
-                    'original_field' => $firstFailure->field,
-                    'final_outcome' => 'accepted',
-                ]);
+                $repairValidation = $this->assertCompleteAndGrounded($data, $selectedIds, $selectedFindings, $service, $groundedContext);
             } catch (\Throwable $repairFailure) {
                 Log::warning('Outreach draft grounding repair finished.', [
                     'repair_attempted' => true,
-                    'original_reason_code' => $firstFailure->reasonCode,
-                    'original_field' => $firstFailure->field,
-                    'final_outcome' => $repairFailure instanceof \App\Outreach\OutreachDraftGroundingException ? 'rejected' : 'failed',
+                    'original_violations' => $originalViolations,
+                    'final_outcome' => 'failed',
+                    'remaining_violations' => [],
                 ]);
                 throw $repairFailure;
             }
+            $usedIds = $repairValidation['used_ids'];
+            $remainingViolations = $repairValidation['violations'];
+            if ($remainingViolations !== []) {
+                Log::warning('Outreach draft grounding repair finished.', [
+                    'repair_attempted' => true,
+                    'original_violations' => $originalViolations,
+                    'final_outcome' => 'rejected',
+                    'remaining_violations' => $remainingViolations,
+                ]);
+                $first = $remainingViolations[0];
+                throw new \App\Outreach\OutreachDraftGroundingException($first['reason_code'], $first['field'], $remainingViolations);
+            }
+            Log::notice('Outreach draft grounding repair finished.', [
+                'repair_attempted' => true,
+                'original_violations' => $originalViolations,
+                'final_outcome' => 'accepted',
+                'remaining_violations' => [],
+            ]);
         }
         $selectedFindingMap = collect($selectedFindings)->keyBy('id');
         $data['evidence_used'] = array_map(fn (string $id): array => ['finding_id'=>$id,'summary'=>(string)$selectedFindingMap->get($id)['summary']], $usedIds);
@@ -124,14 +137,29 @@ final class OutreachDraftAgent implements AgentInterface
         );
     }
 
-    private function repairInstruction(\App\Outreach\OutreachDraftGroundingException $failure): string
+    /** @param list<array{reason_code: string, field: string}> $violations */
+    private function repairInstruction(array $violations): string
     {
-        return "The previous draft was rejected by deterministic grounding validation.\n"
-            .'Reason: '.$failure->reasonCode."\nField: ".$failure->field."\n\n"
-            .'Regenerate the complete draft as a replacement. Use neutral wording strictly supported by the same selected findings. '
-            .'Do not use unsupported strength terms including significant, significantly, major, substantial, poor, slow, weak, broken, or lacking. '
-            .'Do not introduce unselected technical topics or unsupported channel claims. Keep service capabilities general and conditional. '
-            .'Return only the required schema.';
+        $lines = array_map(fn (array $violation): string => '- '.$violation['reason_code'].': '.$violation['field'], $violations);
+        $reasonCodes = array_unique(array_column($violations, 'reason_code'));
+        $guidance = [];
+        if (in_array('OUTREACH_GROUNDING_STRENGTH', $reasonCodes, true)) {
+            $guidance[] = 'Do not use unsupported strength/severity terms: significant, significantly, major, substantial, poor, slow, weak, broken, or lacking.';
+        }
+        if (in_array('OUTREACH_GROUNDING_TOPIC', $reasonCodes, true)) {
+            $guidance[] = 'Do not introduce technical topics unless the selected evidence explicitly supports them.';
+        }
+        if (in_array('OUTREACH_GROUNDING_PROSPECT_CLAIM', $reasonCodes, true)) {
+            $guidance[] = 'Make prospect-specific claims only when directly anchored in the selected validated findings.';
+        }
+        if (in_array('OUTREACH_GROUNDING_CHANNEL', $reasonCodes, true)) {
+            $guidance[] = 'Channel and channel-reason fields are resolved deterministically from public contact context; do not make unsupported channel claims.';
+        }
+
+        return "The previous draft was rejected by deterministic grounding validation.\n\nViolations:\n"
+            .implode("\n", $lines)."\n\nRegenerate the complete draft and correct ALL listed violations.\n"
+            .'Use only the selected validated findings. Use neutral evidence-matched wording. Do not intensify findings or infer broader website problems. '
+            .implode(' ', $guidance).' Return only the required schema.';
     }
 
     private function resolveChannel(array $data, array $groundedContext): array
@@ -146,17 +174,17 @@ final class OutreachDraftAgent implements AgentInterface
         return $data;
     }
 
-    /** @return list<string> */
+    /** @return array{used_ids: list<string>, violations: list<array{reason_code: string, field: string}>} */
     private function assertCompleteAndGrounded(array $data, array $selectedIds, array $selectedFindings, object $service, array $groundedContext): array
     {
         $usedIds = array_values(array_unique(array_map('strval', array_column($data['evidence_used'], 'finding_id'))));
         if (array_diff($usedIds, $selectedIds) !== []) throw new RuntimeException('The generated draft referenced findings that were not selected by the reviewer.');
         if (trim($data['email']['subject']) === '' || trim($data['email']['body']) === '') throw new RuntimeException('The provider returned an incomplete draft.');
-        $this->groundingValidator->assertGrounded($data, $selectedFindings, $service,
+        $result = $this->groundingValidator->validate($data, $selectedFindings, $service,
             (string) ($groundedContext['prospect']['company']['name'] ?? ''),
             (array) ($groundedContext['prospect']['public_contact_context'] ?? []));
 
-        return $usedIds;
+        return ['used_ids' => $usedIds, 'violations' => $result->violations];
     }
 
     private function groundedContext(array $context, array $findings, object $service): array
