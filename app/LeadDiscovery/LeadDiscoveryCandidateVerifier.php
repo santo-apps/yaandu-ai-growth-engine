@@ -101,6 +101,8 @@ final class LeadDiscoveryCandidateVerifier
         $rows = DB::table('lead_discovery_candidates')->where('tenant_id', $tenantId)->where('run_id', $runId);
         $counts = (clone $rows)->selectRaw("count(*) as candidates_found, sum(case when official_domain_status = 'verified' then 1 else 0 end) as verified_candidates, sum(case when eligibility_status = 'eligible' then 1 else 0 end) as eligible_candidates, sum(case when promotion_status = 'promoted' then 1 else 0 end) as promoted_candidates, sum(case when eligibility_status = 'rejected' then 1 else 0 end) as rejected_candidates, sum(case when processing_status = 'failed' then 1 else 0 end) as processing_errors")->first();
         $pending = (clone $rows)->whereIn('processing_status', ['discovered', 'validating'])->exists();
+        $sourcePending = DB::table('lead_discovery_checkpoints')->where('tenant_id', $tenantId)->where('run_id', $runId)->whereIn('status', ['queued', 'running'])->exists();
+        $pending = $pending || $sourcePending;
         DB::table('lead_discovery_runs')->where('tenant_id', $tenantId)->where('id', $runId)->update([
             'candidates_found' => $counts->candidates_found ?? 0, 'verified_candidates' => $counts->verified_candidates ?? 0,
             'eligible_candidates' => $counts->eligible_candidates ?? 0, 'promoted_candidates' => $counts->promoted_candidates ?? 0,
@@ -108,6 +110,13 @@ final class LeadDiscoveryCandidateVerifier
             'run_status' => $pending ? 'running' : (($counts->processing_errors ?? 0) > 0 ? 'completed_with_errors' : 'completed'),
             'finished_at' => $pending ? null : now(), 'updated_at' => now(),
         ]);
+        if (! $pending) {
+            $campaignId = DB::table('lead_discovery_runs')->where('tenant_id', $tenantId)->where('id', $runId)->value('campaign_id');
+            $otherPending = DB::table('lead_discovery_runs')->where('tenant_id', $tenantId)->where('campaign_id', $campaignId)
+                ->whereIn('run_status', ['queued', 'running', 'paused'])->exists();
+            if (! $otherPending) DB::table('lead_discovery_campaigns')->where('tenant_id', $tenantId)->where('id', $campaignId)
+                ->whereNotIn('status', ['paused', 'cancelled'])->update(['status' => ($counts->processing_errors ?? 0) > 0 ? 'completed_with_errors' : 'completed', 'completed_at' => now(), 'updated_at' => now()]);
+        }
     }
 
     private function storeEvidence(string $tenantId, object $candidate, string $field, string $type, ?string $raw, ?string $normalized, float $confidence, array $attribution): void
