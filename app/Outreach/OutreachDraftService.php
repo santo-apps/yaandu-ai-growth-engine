@@ -44,7 +44,7 @@ final class OutreachDraftService
             'findings'=>$findings,'drafts'=>$drafts->map(fn($draft)=>$this->present($draft))->all()];
     }
 
-    public function generate(string $tenantId,string $companyId,string $actorId,array $findingIds,string $idempotencyKey,?string $previousDraftId=null,string $tone='consultative'): object
+    public function generate(string $tenantId,string $companyId,string $actorId,array $findingIds,string $idempotencyKey,?string $previousDraftId=null,string $writingStyle='consultative'): object
     {
         if($findingIds===[] || count($findingIds)>8) throw ValidationException::withMessages(['finding_ids'=>'Select one or more validated findings.']);
         $company=$this->company($tenantId,$companyId); $review=$this->review($tenantId,$companyId);
@@ -57,9 +57,9 @@ final class OutreachDraftService
         $prior=$previousDraftId?DB::table('outreach_drafts')->where('tenant_id',$tenantId)->where('company_id',$companyId)->where('id',$previousDraftId)->first():null;
         if($previousDraftId && !$prior) abort(404);
         $runId=(string)Str::uuid();$correlation=(string)Str::uuid();$now=now();$draftId=(string)Str::uuid();
-        $context=$this->context($tenantId,$company,$review,$selected->all(),$tone);
+        $context=$this->context($tenantId,$company,$review,$selected->all(),$writingStyle);
         DB::table('agent_runs')->insert(['id'=>$runId,'tenant_id'=>$tenantId,'agent_key'=>'OutreachDraftAgent','status'=>'running','requested_by'=>$actorId,
-            'input_hash'=>hash('sha256',json_encode(['company_id'=>$companyId,'service_id'=>$review->selected_service_id,'finding_ids'=>$findingIds,'tone'=>$tone],JSON_THROW_ON_ERROR)),
+            'input_hash'=>hash('sha256',json_encode(['company_id'=>$companyId,'service_id'=>$review->selected_service_id,'finding_ids'=>$findingIds,'writing_style'=>$writingStyle],JSON_THROW_ON_ERROR)),
             'idempotency_key'=>'outreach-draft:'.$idempotencyKey,'started_at'=>$now,'created_at'=>$now,'updated_at'=>$now]);
         DB::table('agent_events')->insert(['id'=>(string)Str::uuid(),'tenant_id'=>$tenantId,'agent_run_id'=>$runId,'sequence'=>1,'event_key'=>'started','payload'=>json_encode(['correlation_id'=>$correlation,'finding_count'=>$selected->count()]),'created_at'=>$now]);
         try {
@@ -74,7 +74,7 @@ final class OutreachDraftService
             throw $error;
         }
         $data=$result->data;
-        return DB::transaction(function()use($tenantId,$companyId,$actorId,$review,$selected,$tone,$idempotencyKey,$prior,$runId,$correlation,$data,$draftId):object {
+        return DB::transaction(function()use($tenantId,$companyId,$actorId,$review,$selected,$writingStyle,$idempotencyKey,$prior,$runId,$correlation,$data,$draftId):object {
             DB::table('companies')->where('tenant_id',$tenantId)->where('id',$companyId)->lockForUpdate()->first();
             $locked=DB::table('company_human_sales_reviews')->where('tenant_id',$tenantId)->where('company_id',$companyId)->lockForUpdate()->first();
             abort_unless($locked && $locked->decision==='pursue' && $locked->selected_service_id===$review->selected_service_id,409,'Sales review changed during draft generation.');
@@ -92,12 +92,12 @@ final class OutreachDraftService
             DB::table('agent_runs')->where('tenant_id',$tenantId)->where('id',$runId)->update(['status'=>'succeeded','output_hash'=>hash('sha256',json_encode($data)),'summary'=>'Draft outreach prepared for human review.','finished_at'=>now(),'updated_at'=>now()]);
             DB::table('agent_events')->insert(['id'=>(string)Str::uuid(),'tenant_id'=>$tenantId,'agent_run_id'=>$runId,'sequence'=>2,'event_key'=>'completed','payload'=>json_encode(['correlation_id'=>$correlation,'outreach_draft_id'=>$draftId]),'created_at'=>now()]);
             DB::table('audit_logs')->insert(['id'=>(string)Str::uuid(),'tenant_id'=>$tenantId,'actor_user_id'=>$actorId,'action'=>'outreach_draft.generated','subject_type'=>'outreach_draft','subject_id'=>$draftId,
-                'metadata'=>json_encode(['company_id'=>$companyId,'service_id'=>$review->selected_service_id,'finding_count'=>$selected->count(),'version'=>$version,'provider'=>$data['provider'],'model'=>$data['model'],'tone'=>$tone]),'created_at'=>now()]);
+                'metadata'=>json_encode(['company_id'=>$companyId,'service_id'=>$review->selected_service_id,'finding_count'=>$selected->count(),'version'=>$version,'provider'=>$data['provider'],'model'=>$data['model'],'requested_writing_style'=>$writingStyle]),'created_at'=>now()]);
             return $this->present(DB::table('outreach_drafts')->where('tenant_id',$tenantId)->where('id',$draftId)->first());
         });
     }
 
-    private function context(string $tenantId,object $company,object $review,array $findings,string $tone):array
+    private function context(string $tenantId,object $company,object $review,array $findings,string $writingStyle):array
     {
         $channels=DB::table('contacts')->join('contact_methods',function($join):void{$join->on('contact_methods.contact_id','=','contacts.id')->on('contact_methods.tenant_id','=','contacts.tenant_id');})
             ->where('contacts.tenant_id',$tenantId)->where('contacts.company_id',$company->id)->whereIn('contact_methods.verification_status',['verified','publicly_listed'])
@@ -109,7 +109,7 @@ final class OutreachDraftService
                 'boundary'=>'General service capability only; not evidence about this prospect.'],
             'selected_validated_findings'=>$findings,
             'public_contact_context'=>$channels->map(fn($row)=>['channel'=>$row->type,'status'=>$row->verification_status,'confidence'=>(float)$row->confidence])->all(),
-            'requested_tone'=>$tone],
+            'requested_writing_style'=>$writingStyle],
             'data_boundary'=>'Only selected validated findings support claims about this prospect. Service information describes general capability only. Contact context may be used only to recommend a channel.'];
     }
 
