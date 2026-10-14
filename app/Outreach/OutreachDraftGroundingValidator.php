@@ -64,13 +64,20 @@ final class OutreachDraftGroundingValidator
                 }
 
                 $capabilityOnly = $this->isGeneralCapabilityStatement($sentenceLower, $serviceName);
+                $prospectClaim = $this->isProspectClaim($sentenceLower, $companyName);
+                // The approved service name is context, not evidence. Exempt only that
+                // exact phrase, and only when the sentence is not asserting a fact
+                // about the prospect. Keep topic checks intact for all other wording.
+                $topicSentence = $prospectClaim || $serviceName === ''
+                    ? $sentence
+                    : str_ireplace($serviceName, '', $sentence);
                 foreach (self::TECHNICAL_TOPICS as $topicPattern) {
-                    if (preg_match($topicPattern, $sentence) && ! preg_match($topicPattern, $evidence) && ! $capabilityOnly) {
+                    if (preg_match($topicPattern, $topicSentence) && ! preg_match($topicPattern, $evidence) && ! $capabilityOnly) {
                         throw new RuntimeException('The generated draft included a prospect claim outside its selected evidence.');
                     }
                 }
 
-                if ($this->isProspectClaim($sentenceLower, $companyName) && ! $this->hasEvidenceAnchor($sentenceLower, $evidence)
+                if ($prospectClaim && ! $this->hasEvidenceAnchor($sentenceLower, $evidence)
                     && ! $capabilityOnly && ! $this->isGenericCallToAction($sentenceLower)) {
                     throw new RuntimeException('The generated draft included a prospect claim outside its selected evidence.');
                 }

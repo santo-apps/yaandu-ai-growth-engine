@@ -133,9 +133,14 @@ final class OutreachDraftGenerationTest extends TestCase
         $capability='Our Website Performance Optimization service can include performance and technical improvements where relevant.';
         $base['linkedin']=$capability;
         $validator->assertGrounded($base,[$finding],$service,'Ebarza');
+        $base['linkedin']='Website Performance Optimization is the selected service for this opportunity.';
+        $validator->assertGrounded($base,[$finding],$service,'Ebarza');
 
         $claims=['We noticed poor mobile UX.','Your website has a responsiveness problem.','Your website is slow.',
-            'We found a website speed problem.','We found a technical performance problem.','This could significantly enhance SEO.'];
+            'We found a website speed problem.','We found a technical performance problem.','This could significantly enhance SEO.',
+            'Ebarza has website performance problems.','Your website needs performance improvements.',
+            'Improving speed and responsiveness would help.','Website Performance Optimization shows that Ebarza has poor performance.',
+            'Our service description says Ebarza has website usability and performance problems.'];
         $fields=['pitch_summary','email.subject','email.body','whatsapp','linkedin','follow_up_email','follow_up_short'];
         foreach($fields as $field){
             foreach($claims as $claim){
