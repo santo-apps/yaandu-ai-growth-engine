@@ -2,10 +2,11 @@
 
 namespace App\Http\Controllers\Api\V1;
 
-use App\Crawling\PublicSuffixDomainMatcher;
 use App\Discovery\DomainNormalizer;
 use App\Http\Controllers\Controller;
 use App\Jobs\ScanWebsiteJob;
+use App\Jobs\StartLeadDiscoveryCampaignJob;
+use App\Jobs\DiscoverLeadSourcePageJob;
 use App\Jobs\VerifyLeadDiscoveryCandidateJob;
 use App\LeadDiscovery\DiscoveryEligibilityService;
 use App\LeadDiscovery\LeadSourceAdapterRegistry;
@@ -32,25 +33,71 @@ final class LeadDiscoveryController extends Controller
             ->through(fn ($row) => $this->sourcePayload($row));
     }
 
+    public function sourceHealth()
+    {
+        $rows = DB::table('lead_discovery_sources')->where('tenant_id', app('tenant.id'))->where('source_key', 'brave_search')->get();
+        $credentialDetected = filled(config('services.brave_search.key'));
+        $fullyApproved = $rows->contains(fn ($source) => $this->sourceExecutionReady($source));
+        $storageConfirmed = $rows->contains(fn ($source) => $source->storage_rights_status === 'confirmed');
+        $authorizationApproved = $rows->contains(fn ($source) => $source->authorization_status === 'authorized');
+        $status = ! $storageConfirmed ? 'STORAGE_RIGHTS_NOT_CONFIRMED'
+            : (! $credentialDetected ? 'SOURCE_CREDENTIAL_MISSING'
+                : (! $authorizationApproved ? 'SOURCE_NOT_AUTHORIZED'
+                    : (! config('lead_discovery.live_enabled') ? 'SOURCE_DISABLED'
+                        : ($fullyApproved ? 'ready' : 'SOURCE_DISABLED'))));
+
+        return response()->json([
+            'live_enabled' => (bool) config('lead_discovery.live_enabled'),
+            'credential_status' => $credentialDetected ? 'available' : 'missing',
+            'credential_detected' => $credentialDetected,
+            'authorization_status' => $authorizationApproved ? 'approved' : 'not_approved',
+            'storage_rights_status' => $storageConfirmed ? 'confirmed' : 'not_confirmed',
+            'health_status' => $fullyApproved && config('lead_discovery.live_enabled') ? 'ready' : 'blocked',
+            'storage_rights_required' => true,
+            'status' => $status,
+            'sources' => $rows->map(fn ($row) => $this->sourcePayload($row))->values(),
+        ]);
+    }
+
     public function createSource(Request $request, LeadSourceAdapterRegistry $registry)
     {
         $this->requireManager($request, ['owner', 'admin']);
         $data = $request->validate([
-            'source_key' => ['required', 'in:csv_upload'], 'provider_name' => ['required', 'string', 'max:160'],
+            'source_key' => ['required', 'in:csv_upload,brave_search'], 'provider_name' => ['required', 'string', 'max:160'],
             'license_or_authorization' => ['required', 'string', 'max:500'], 'allowed_collection_method' => ['required', 'string', 'max:80'],
             'retention_policy' => ['nullable', 'string', 'max:120'], 'attribution_requirement' => ['nullable', 'string', 'max:255'],
+            'storage_rights_confirmed' => ['sometimes', 'boolean'],
+            'storage_rights_reference' => ['nullable', 'string', 'max:255'],
             'enabled' => ['required', 'boolean'],
         ]);
-        $configuration = ['license_or_authorization' => trim($data['license_or_authorization'])];
-        $registry->get($data['source_key'])->validateConfiguration([...$configuration, 'allowed_collection_method' => $data['allowed_collection_method']]);
+        $storageRightsConfirmed = ($data['storage_rights_confirmed'] ?? false) === true
+            && trim((string) ($data['storage_rights_reference'] ?? '')) !== '';
+        $storageRightsStatus = $data['source_key'] === 'csv_upload' ? 'not_required'
+            : ($storageRightsConfirmed ? 'confirmed' : 'not_confirmed');
+        if ($data['source_key'] === 'brave_search' && $data['enabled'] && ! $storageRightsConfirmed) {
+            throw ValidationException::withMessages(['storage_rights_confirmed' => ['Explicit provider result-storage rights are required before enabling this live source.']]);
+        }
+        $configuration = ['license_or_authorization' => trim($data['license_or_authorization']),
+            'storage_rights_confirmed' => $storageRightsConfirmed,
+            'storage_rights_reference' => mb_substr(trim((string) ($data['storage_rights_reference'] ?? '')), 0, 255)];
+        $adapter = $registry->get($data['source_key']);
+        if ($data['source_key'] === 'brave_search' && $data['enabled']) {
+            try {
+                $adapter->validateConfiguration([...$configuration, 'allowed_collection_method' => $data['allowed_collection_method'],
+                    'source_enabled' => true, 'authorization_status' => 'authorized', 'storage_rights_status' => $storageRightsStatus]);
+            } catch (\App\LeadDiscovery\LiveLeadSourceException $error) {
+                return response()->json(['message' => $error->getMessage(), 'reason_code' => $error->errorCode], 422);
+            }
+        }
         $tenant = app('tenant.id'); $id = (string) Str::uuid();
-        DB::transaction(function () use ($id, $tenant, $data, $configuration): void {
+        DB::transaction(function () use ($id, $tenant, $data, $configuration, $storageRightsStatus): void {
             DB::table('lead_discovery_sources')->insert([
                 'id' => $id, 'tenant_id' => $tenant, 'source_key' => $data['source_key'], 'provider_name' => $data['provider_name'],
-                'source_type' => 'licensed_csv', 'authorization_status' => 'authorized', 'allowed_collection_method' => $data['allowed_collection_method'],
+                'source_type' => $data['source_key'] === 'brave_search' ? 'licensed_search_api' : 'licensed_csv', 'authorization_status' => 'authorized', 'allowed_collection_method' => $data['allowed_collection_method'],
+                'storage_rights_status' => $storageRightsStatus,
                 'retention_policy' => $data['retention_policy'] ?? null, 'attribution_requirement' => $data['attribution_requirement'] ?? null,
                 'configuration' => json_encode($configuration), 'rate_limit_config' => json_encode(['max_rows_per_import' => config('lead_discovery.max_rows_per_import')]),
-                'enabled' => (bool) $data['enabled'], 'health_state' => (bool) $data['enabled'] ? 'ready' : 'disabled', 'created_at' => now(), 'updated_at' => now(),
+                'enabled' => (bool) $data['enabled'], 'health_state' => (bool) $data['enabled'] ? 'ready' : ($storageRightsStatus === 'not_confirmed' ? 'not_configured' : 'disabled'), 'created_at' => now(), 'updated_at' => now(),
             ]);
             $this->audit('lead_discovery_source_configured', $id, ['source_key' => $data['source_key'], 'enabled' => (bool) $data['enabled']]);
         });
@@ -64,6 +111,16 @@ final class LeadDiscoveryController extends Controller
         $tenant = app('tenant.id');
         $row = DB::table('lead_discovery_sources')->where('tenant_id', $tenant)->where('id', $source)->first();
         abort_unless($row, 404);
+        if ($row->source_key === 'brave_search' && $data['enabled']) {
+            $configuration = json_decode((string) $row->configuration, true) ?: [];
+            try {
+                app(LeadSourceAdapterRegistry::class)->get('brave_search')->validateConfiguration([...$configuration,
+                    'source_enabled' => true, 'authorization_status' => $row->authorization_status,
+                    'storage_rights_status' => $row->storage_rights_status]);
+            } catch (\App\LeadDiscovery\LiveLeadSourceException $error) {
+                return response()->json(['message' => $error->getMessage(), 'reason_code' => $error->errorCode], 422);
+            }
+        }
         DB::transaction(function () use ($tenant, $source, $data): void {
             DB::table('lead_discovery_sources')->where('tenant_id', $tenant)->where('id', $source)->update([
                 'enabled' => (bool) $data['enabled'], 'health_state' => $data['enabled'] ? 'ready' : 'disabled', 'updated_at' => now(),
@@ -85,32 +142,71 @@ final class LeadDiscoveryController extends Controller
         $data = $request->validate([
             'name' => ['required', 'string', 'max:160'], 'industry' => ['required', 'string', 'max:150'],
             'country_code' => ['required', 'string', 'size:2'], 'region' => ['nullable', 'string', 'max:120'], 'city' => ['nullable', 'string', 'max:120'],
-            'target_leads' => ['sometimes', 'integer', 'min:1', 'max:5000'], 'limits' => ['sometimes', 'array'],
+            'target_leads' => ['sometimes', 'integer', 'min:1', 'max:5000'], 'source_ids' => ['sometimes', 'array', 'min:1', 'max:1'], 'source_ids.*' => ['required', 'uuid'], 'limits' => ['sometimes', 'array'],
             'limits.source_requests' => ['sometimes', 'integer', 'min:1', 'max:500'], 'limits.candidates' => ['sometimes', 'integer', 'min:1', 'max:500'],
             'limits.processing' => ['sometimes', 'integer', 'min:1', 'max:500'], 'limits.enrichment' => ['sometimes', 'integer', 'min:0', 'max:500'],
             'limits.runtime_seconds' => ['sometimes', 'integer', 'min:30', 'max:3600'], 'limits.http_requests' => ['sometimes', 'integer', 'min:0', 'max:1000'],
             'limits.ai_calls' => ['sometimes', 'integer', 'in:0'], 'limits.provider_spend_minor' => ['sometimes', 'integer', 'in:0'],
         ]);
         $id = (string) Str::uuid(); $tenant = app('tenant.id');
+        $selectedSources = $data['source_ids'] ?? [];
+        if ($selectedSources) {
+            $count = DB::table('lead_discovery_sources')->where('tenant_id', $tenant)->whereIn('id', $selectedSources)
+                ->where('source_key', 'brave_search')->where('enabled', true)->where('authorization_status', 'authorized')
+                ->where('storage_rights_status', 'confirmed')->count();
+            abort_unless($count === count($selectedSources), 422, 'Choose a live source with approved authorization and explicit storage rights.');
+        }
         $limits = array_replace([
             'source_requests' => config('lead_discovery.max_source_requests_per_run'), 'candidates' => config('lead_discovery.max_candidates_per_run'),
             'processing' => config('lead_discovery.max_candidate_processing'), 'enrichment' => config('lead_discovery.max_enrichment_per_run'),
             'runtime_seconds' => config('lead_discovery.max_runtime_seconds'), 'http_requests' => config('lead_discovery.max_http_requests_per_candidate'),
             'ai_calls' => 0, 'provider_spend_minor' => 0,
         ], $data['limits'] ?? []);
-        DB::transaction(function () use ($id, $tenant, $data, $limits, $request): void {
+        $target = $data['target_leads'] ?? (count($selectedSources) ? config('lead_discovery.live_default_target', 25) : 5000);
+        DB::transaction(function () use ($id, $tenant, $data, $limits, $request, $selectedSources, $target): void {
             DB::table('lead_discovery_campaigns')->insert([
                 'id' => $id, 'tenant_id' => $tenant, 'name' => $data['name'], 'industry' => $data['industry'],
                 'country_code' => strtoupper($data['country_code']), 'region' => $data['region'] ?? null, 'city' => $data['city'] ?? null,
-                'configuration' => json_encode(['limits' => $limits, 'website_verification' => true, 'contact_enrichment' => true, 'deduplication' => true]),
-                'target_leads' => $data['target_leads'] ?? 5000, 'auto_promotion_enabled' => false, 'created_by' => $request->user()->id,
+                'configuration' => json_encode(['limits' => $limits, 'website_verification' => true, 'contact_enrichment' => true, 'deduplication' => true, 'discovery_source_ids' => $selectedSources]),
+                'target_leads' => $target, 'auto_promotion_enabled' => false, 'created_by' => $request->user()->id,
                 'status' => 'draft', 'created_at' => now(), 'updated_at' => now(),
             ]);
-            $this->audit('lead_discovery_campaign_created', $id, ['auto_promotion' => false, 'target_leads' => $data['target_leads'] ?? 5000]);
+            $this->audit('lead_discovery_campaign_created', $id, ['auto_promotion' => false, 'target_leads' => $target]);
         });
         $campaign = DB::table('lead_discovery_campaigns')->where('tenant_id', $tenant)->where('id', $id)->first();
         $campaign->auto_promotion_enabled = (bool) $campaign->auto_promotion_enabled;
         return response()->json($campaign, 201);
+    }
+
+    public function startDiscovery(Request $request, string $campaign)
+    {
+        abort_unless(config('lead_discovery.enabled'), 503, 'Lead Discovery is disabled by configuration.');
+        $this->requireManager($request, ['owner', 'admin', 'manager']);
+        $request->validate(['source_ids' => ['sometimes', 'array', 'min:1', 'max:1'], 'source_ids.*' => ['required', 'uuid']]);
+        $tenant = app('tenant.id');
+        $row = DB::table('lead_discovery_campaigns')->where('tenant_id', $tenant)->where('id', $campaign)->first();
+        abort_unless($row, 404);
+        abort_unless($row->status === 'draft', 409, 'Only a draft campaign can be started.');
+        $config = json_decode((string) $row->configuration, true) ?: [];
+        $sourceIds = $request->input('source_ids', data_get($config, 'discovery_source_ids', []));
+        abort_unless(count($sourceIds) === 1, 422, 'Select one configured live source for this campaign.');
+        $source = DB::table('lead_discovery_sources')->where('tenant_id', $tenant)->where('id', $sourceIds[0])->where('source_key', 'brave_search')->first();
+        abort_unless($source, 422, 'A tenant-configured live search source is required.');
+        $configuration = json_decode((string) $source->configuration, true) ?: [];
+        $reason = $this->sourceBlockReason($source);
+        if ($reason !== null) return response()->json(['message' => $this->sourceBlockMessage($reason), 'reason_code' => $reason], 422);
+        try {
+            app(LeadSourceAdapterRegistry::class)->get('brave_search')->validateConfiguration([...$configuration,
+                'source_enabled' => (bool) $source->enabled, 'authorization_status' => $source->authorization_status,
+                'storage_rights_status' => $source->storage_rights_status]);
+        } catch (\App\LeadDiscovery\LiveLeadSourceException $error) {
+            return response()->json(['message' => $error->getMessage(), 'reason_code' => $error->errorCode], 422);
+        }
+        DB::table('lead_discovery_campaigns')->where('tenant_id', $tenant)->where('id', $campaign)->update(['status' => 'queued', 'updated_at' => now()]);
+        $this->audit('lead_discovery_campaign_started', $campaign, ['source_id' => $source->id, 'target_leads' => (int) $row->target_leads, 'automatic_promotion' => false]);
+        $this->audit('lead_discovery.campaign_started', $campaign, ['source_id' => $source->id, 'target_leads' => (int) $row->target_leads, 'automatic_promotion' => false]);
+        StartLeadDiscoveryCampaignJob::dispatch($tenant, $campaign, $sourceIds)->afterCommit();
+        return response()->json(['campaign_id' => $campaign, 'status' => 'queued', 'auto_promotion' => false], 202);
     }
 
     public function campaign(string $campaign)
@@ -125,7 +221,8 @@ final class LeadDiscoveryController extends Controller
             'contacts_enriched' => DB::table('lead_discovery_candidate_evidence')->where('tenant_id', $tenant)->where('campaign_id', $campaign)
                 ->whereIn('field_name', ['business_email', 'business_phone'])->distinct()->count('candidate_id'),
             'source_errors' => (int) DB::table('lead_discovery_runs')->where('tenant_id', $tenant)->where('campaign_id', $campaign)->sum('source_errors'),
-            'runs' => DB::table('lead_discovery_runs')->where('tenant_id', $tenant)->where('campaign_id', $campaign)->orderByDesc('created_at')->limit(20)->get()]);
+            'runs' => DB::table('lead_discovery_runs')->where('tenant_id', $tenant)->where('campaign_id', $campaign)->orderByDesc('created_at')->limit(20)->get(),
+            'checkpoints' => DB::table('lead_discovery_checkpoints')->where('tenant_id', $tenant)->where('campaign_id', $campaign)->orderBy('query_key')->get()]);
     }
 
     public function import(Request $request, string $campaign, LeadSourceAdapterRegistry $registry)
@@ -255,16 +352,37 @@ final class LeadDiscoveryController extends Controller
                 DB::table('lead_discovery_campaigns')->where('tenant_id', $tenant)->where('id', $campaign)->update(['status' => 'cancelled', 'completed_at' => now(), 'updated_at' => now()]);
                 DB::table('lead_discovery_runs')->where('tenant_id', $tenant)->where('campaign_id', $campaign)->whereNotIn('run_status', ['completed', 'completed_with_errors'])->update(['run_status' => 'cancelled', 'finished_at' => now(), 'updated_at' => now()]);
                 DB::table('lead_discovery_candidates')->where('tenant_id', $tenant)->where('campaign_id', $campaign)->whereNotIn('promotion_status', ['promoted', 'rejected'])->update(['processing_status' => 'cancelled', 'updated_at' => now()]);
+                DB::table('lead_discovery_checkpoints')->where('tenant_id', $tenant)->where('campaign_id', $campaign)->whereIn('status', ['queued', 'running'])->update(['status' => 'stopped', 'error_code' => 'CAMPAIGN_CANCELLED', 'completed_at' => now(), 'updated_at' => now()]);
             }
             $action = match ($operation) { 'pause' => 'lead_discovery_campaign_paused', 'resume' => 'lead_discovery_campaign_resumed', default => 'lead_discovery_campaign_cancelled' };
             $this->audit($action, $campaign, []);
+            $this->audit(match ($operation) { 'pause' => 'lead_discovery.campaign_paused', 'resume' => 'lead_discovery.campaign_resumed', default => 'lead_discovery.campaign_cancelled' }, $campaign, []);
         });
         if ($operation === 'resume') {
             DB::table('lead_discovery_candidates')->where('tenant_id', $tenant)->where('campaign_id', $campaign)->where('processing_status', 'discovered')
                 ->whereNotNull('claimed_website')->where('promotion_status', 'not_promoted')->pluck('id')
                 ->each(fn ($id) => VerifyLeadDiscoveryCandidateJob::dispatch($tenant, (string) $id));
+            DB::table('lead_discovery_checkpoints')->where('tenant_id', $tenant)->where('campaign_id', $campaign)->whereIn('status', ['queued', 'running'])
+                ->pluck('id')->each(fn ($id) => DiscoverLeadSourcePageJob::dispatch($tenant, (string) $id));
         }
         return response()->json(['campaign_id' => $campaign, 'status' => DB::table('lead_discovery_campaigns')->where('tenant_id', $tenant)->where('id', $campaign)->value('status')]);
+    }
+
+    public function retryFailed(Request $request, string $campaign)
+    {
+        $this->requireManager($request, ['owner', 'admin', 'manager']);
+        $tenant = app('tenant.id');
+        $row = DB::table('lead_discovery_campaigns')->where('tenant_id', $tenant)->where('id', $campaign)->first();
+        abort_unless($row, 404);
+        abort_unless(in_array($row->status, ['completed_with_errors', 'failed'], true), 409, 'Only a completed campaign with errors can be retried.');
+        $ids = DB::table('lead_discovery_checkpoints')->where('tenant_id', $tenant)->where('campaign_id', $campaign)->where('status', 'failed')->where('attempts', '<', 3)->pluck('id');
+        abort_unless($ids->isNotEmpty(), 409, 'No failed source pages remain within the retry limit.');
+        DB::table('lead_discovery_checkpoints')->where('tenant_id', $tenant)->whereIn('id', $ids)->update(['status' => 'queued', 'error_code' => null, 'completed_at' => null, 'updated_at' => now()]);
+        DB::table('lead_discovery_campaigns')->where('tenant_id', $tenant)->where('id', $campaign)->update(['status' => 'running', 'completed_at' => null, 'last_error_code' => null, 'updated_at' => now()]);
+        DB::table('lead_discovery_runs')->where('tenant_id', $tenant)->where('campaign_id', $campaign)->whereIn('run_status', ['failed', 'completed_with_errors'])->update(['run_status' => 'running', 'finished_at' => null, 'updated_at' => now()]);
+        $ids->each(fn ($id) => DiscoverLeadSourcePageJob::dispatch($tenant, (string) $id));
+        $this->audit('lead_discovery_source_retry_requested', $campaign, ['retry_count' => $ids->count()]);
+        return response()->json(['campaign_id' => $campaign, 'status' => 'running', 'retry_count' => $ids->count()]);
     }
 
     public function candidates(Request $request)
@@ -393,11 +511,49 @@ final class LeadDiscoveryController extends Controller
     private function sourcePayload(?object $row): ?array
     {
         if (! $row) return null;
+        $configuration = json_decode((string) $row->configuration, true) ?: [];
+        $reason = $row->source_key === 'brave_search' ? $this->sourceBlockReason($row) : null;
         return ['id' => $row->id, 'source_key' => $row->source_key, 'provider_name' => $row->provider_name, 'source_type' => $row->source_type,
             'authorization_status' => $row->authorization_status, 'allowed_collection_method' => $row->allowed_collection_method,
-            'authorization_summary' => mb_substr((string) (json_decode((string) $row->configuration, true)['license_or_authorization'] ?? ''), 0, 500),
+            'authorization_summary' => mb_substr((string) ($configuration['license_or_authorization'] ?? ''), 0, 500),
             'retention_policy' => $row->retention_policy, 'attribution_requirement' => $row->attribution_requirement,
-            'enabled' => (bool) $row->enabled, 'health_state' => $row->health_state, 'last_success_at' => $row->last_success_at, 'last_error_code' => $row->last_error_code];
+            'enabled' => (bool) $row->enabled, 'health_state' => $row->health_state, 'last_success_at' => $row->last_success_at, 'last_error_code' => $row->last_error_code,
+            'credential_status' => $row->source_key === 'brave_search' ? (filled(config('services.brave_search.key')) ? 'available' : 'missing') : 'not_required',
+            'storage_rights_status' => $row->source_key === 'brave_search' ? $row->storage_rights_status : 'not_required',
+            'storage_rights_confirmed' => $row->source_key !== 'brave_search' || $row->storage_rights_status === 'confirmed',
+            'execution_ready' => $row->source_key === 'brave_search' ? $reason === null : ((bool) $row->enabled && $row->authorization_status === 'authorized'),
+            'readiness_reason_code' => $reason];
+    }
+
+    private function sourceExecutionReady(object $source): bool
+    {
+        return $this->sourceBlockReason($source) === null;
+    }
+
+    private function sourceBlockReason(object $source): ?string
+    {
+        if ($source->source_key !== 'brave_search') return null;
+        if ($source->storage_rights_status !== 'confirmed') return 'STORAGE_RIGHTS_NOT_CONFIRMED';
+        if ($source->authorization_status !== 'authorized') return 'SOURCE_NOT_AUTHORIZED';
+        if (! filled(config('services.brave_search.key'))) return 'SOURCE_CREDENTIAL_MISSING';
+        if (! (bool) $source->enabled) return 'SOURCE_DISABLED';
+        if (! config('lead_discovery.live_enabled')) return 'SOURCE_DISABLED';
+
+        $configuration = json_decode((string) ($source->configuration ?? '{}'), true) ?: [];
+        if (($configuration['storage_rights_confirmed'] ?? false) !== true
+            || trim((string) ($configuration['storage_rights_reference'] ?? '')) === '') return 'STORAGE_RIGHTS_NOT_CONFIRMED';
+        if (trim((string) ($configuration['license_or_authorization'] ?? '')) === '') return 'SOURCE_NOT_AUTHORIZED';
+        return null;
+    }
+
+    private function sourceBlockMessage(string $reason): string
+    {
+        return match ($reason) {
+            'STORAGE_RIGHTS_NOT_CONFIRMED' => 'Persistent search-result storage rights are not explicitly confirmed for this source.',
+            'SOURCE_CREDENTIAL_MISSING' => 'The live search provider credential is not configured.',
+            'SOURCE_NOT_AUTHORIZED' => 'The source is not approved for this tenant.',
+            default => 'Live search is disabled or the source is not enabled.',
+        };
     }
 
     private function safeSourceUrl(string $value): ?string

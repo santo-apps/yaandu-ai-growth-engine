@@ -126,12 +126,15 @@ Route::prefix('v1')->group(function (): void {
     Route::post('/discovery/import/preview', [DiscoveryController::class, 'previewImport']);
     Route::post('/discovery/import', [DiscoveryController::class, 'import']);
     Route::get('/lead-discovery/sources', [LeadDiscoveryController::class, 'sources']);
+    Route::get('/lead-discovery/source-health', [LeadDiscoveryController::class, 'sourceHealth']);
     Route::post('/lead-discovery/sources', [LeadDiscoveryController::class, 'createSource']);
     Route::patch('/lead-discovery/sources/{source}', [LeadDiscoveryController::class, 'updateSource']);
     Route::get('/lead-discovery/campaigns', [LeadDiscoveryController::class, 'campaigns']);
     Route::post('/lead-discovery/campaigns', [LeadDiscoveryController::class, 'createCampaign']);
+    Route::post('/lead-discovery/campaigns/{campaign}/start', [LeadDiscoveryController::class, 'startDiscovery'])->middleware('throttle:10,1');
     Route::get('/lead-discovery/campaigns/{campaign}', [LeadDiscoveryController::class, 'campaign']);
     Route::post('/lead-discovery/campaigns/{campaign}/{operation}', [LeadDiscoveryController::class, 'controlCampaign'])->whereIn('operation', ['pause', 'resume', 'cancel']);
+    Route::post('/lead-discovery/campaigns/{campaign}/retry-failed', [LeadDiscoveryController::class, 'retryFailed'])->middleware('throttle:5,1');
     Route::post('/lead-discovery/campaigns/{campaign}/import', [LeadDiscoveryController::class, 'import'])->middleware('throttle:10,1');
     Route::get('/lead-discovery/candidates', [LeadDiscoveryController::class, 'candidates']);
     Route::get('/lead-discovery/candidates/{candidate}', [LeadDiscoveryController::class, 'candidate']);
