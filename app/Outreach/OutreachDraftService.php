@@ -66,6 +66,7 @@ final class OutreachDraftService
         } catch(\Throwable $error) {
             Log::warning('Outreach draft generation failed safely.', ['tenant_id'=>$tenantId,'agent_run_id'=>$runId,'correlation_id'=>$correlation,
                 'exception_class'=>$error::class,'failure_stage'=>$error instanceof \App\AI\Providers\AIProviderException ? $error->stage : 'agent_execution',
+                ...($error instanceof OutreachDraftGroundingException ? ['grounding_reason_code'=>$error->reasonCode,'field'=>$error->field] : []),
                 ...($error instanceof \App\AI\Providers\AIProviderException ? $error->safeDiagnostics() : [])]);
             DB::table('agent_runs')->where('tenant_id',$tenantId)->where('id',$runId)->update(['status'=>'failed','error_summary'=>'Outreach draft generation failed safely.','finished_at'=>now(),'updated_at'=>now()]);
             DB::table('agent_events')->insert(['id'=>(string)Str::uuid(),'tenant_id'=>$tenantId,'agent_run_id'=>$runId,'sequence'=>2,'event_key'=>'failed','payload'=>json_encode(['correlation_id'=>$correlation,'error_code'=>'OUTREACH_DRAFT_FAILED']),'created_at'=>now()]);
@@ -99,7 +100,9 @@ final class OutreachDraftService
     {
         $channels=DB::table('contacts')->join('contact_methods',function($join):void{$join->on('contact_methods.contact_id','=','contacts.id')->on('contact_methods.tenant_id','=','contacts.tenant_id');})
             ->where('contacts.tenant_id',$tenantId)->where('contacts.company_id',$company->id)->whereIn('contact_methods.verification_status',['verified','publicly_listed'])
-            ->whereIn('contact_methods.type',['email','phone','whatsapp','contact_page'])->limit(12)->get(['contact_methods.type','contact_methods.verification_status','contact_methods.confidence']);
+            ->whereIn('contact_methods.type',['email','phone','whatsapp','linkedin','contact_page'])
+            ->selectRaw('contact_methods.type, contact_methods.verification_status, MAX(contact_methods.confidence) as confidence')
+            ->groupBy('contact_methods.type','contact_methods.verification_status')->get();
         return ['prospect'=>['company'=>['name'=>$company->name],
             'selected_service_capability'=>['name'=>$review->service_name,'description'=>mb_substr((string)$review->service_description,0,800),
                 'boundary'=>'General service capability only; not evidence about this prospect.'],
