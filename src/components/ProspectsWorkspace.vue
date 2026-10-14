@@ -2,6 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { humanize, salesRequest, unwrap, csrfToken } from '../salesApi'
 import ProspectImportPanel from './ProspectImportPanel.vue'
+import LeadDiscoveryWorkspace from './LeadDiscoveryWorkspace.vue'
 import EmptyState from './ui/EmptyState.vue'
 import LoadingState from './ui/LoadingState.vue'
 import { safeRequestError } from '../salesApi'
@@ -16,6 +17,7 @@ const error = ref('')
 const notice = ref('')
 const showAdd = ref(false)
 const showDiscovery = ref(false)
+const showLeadDiscovery = ref(false)
 const discoveryTab = ref<'search' | 'results' | 'csv'>('search')
 const draft = ref({ name: '', website: '', industry: '', location: '' })
 const searchDraft = ref({ name: 'Dubai Furniture Prospects', locations: 'Dubai', industries: 'Furniture', keywords: 'furniture, home decor', websiteCriteria: 'outdated design, poor mobile experience, slow site, weak conversion', services: 'E-commerce modernization, performance optimization, AI customer engagement', companySize: 'Unknown', maxCandidates: 20, source: 'location_open_web' })
@@ -218,7 +220,8 @@ onBeforeUnmount(() => { if (pollTimer) clearInterval(pollTimer) })
 
 <template>
   <section class="prospects-workspace">
-    <div class="prospects-toolbar"><label class="prospect-search"><span>⌕</span><input v-model="query" placeholder="Search existing prospects" aria-label="Search prospects" /></label><button class="quiet" @click="showDiscovery = !showDiscovery; if (showDiscovery) loadDiscovery()">{{ showDiscovery ? 'Close discovery' : 'Find Prospects' }}</button><button class="primary" @click="showAdd = !showAdd">＋ Add prospect</button></div>
+    <div class="prospects-toolbar"><label class="prospect-search"><span>⌕</span><input v-model="query" placeholder="Search existing prospects" aria-label="Search prospects" /></label><button class="quiet" @click="showLeadDiscovery = !showLeadDiscovery; showDiscovery = false">{{ showLeadDiscovery ? 'Close Lead Discovery' : 'Lead Discovery' }}</button><button class="quiet" @click="showDiscovery = !showDiscovery; showLeadDiscovery = false; if (showDiscovery) loadDiscovery()">{{ showDiscovery ? 'Close discovery' : 'Find Prospects' }}</button><button class="primary" @click="showAdd = !showAdd">＋ Add prospect</button></div>
+    <LeadDiscoveryWorkspace v-if="showLeadDiscovery" :tenant-id="tenantId" :manager="manager" />
     <ProspectImportPanel :tenant-id="tenantId" :manager="manager" @import-completed="loadCompanies" />
     <form v-if="showAdd" class="discovery-card add-card" @submit.prevent="saveProspect"><h2>Add an existing company</h2><div class="discovery-form-grid"><label>Company name<input v-model="draft.name" required maxlength="255" /></label><label>Website<input v-model="draft.website" type="url" placeholder="https://company.com" /></label><label>Industry<input v-model="draft.industry" /></label><label>Location<input v-model="draft.location" /></label></div><button class="primary" :disabled="saving">{{ saving ? 'Saving…' : 'Save prospect' }}</button></form>
     <section v-if="showDiscovery" class="discovery-shell">
