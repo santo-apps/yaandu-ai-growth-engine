@@ -6,7 +6,6 @@ use App\AI\AIModelRouter;
 use App\Models\Company;
 use App\Models\Tenant;
 use App\Models\User;
-use App\Outreach\OutreachDraftGroundingValidator;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
@@ -18,17 +17,26 @@ use Tests\TestCase;
 
 final class OutreachDraftGenerationTest extends TestCase
 {
-    public function test_outreach_readiness_surfaces_missing_tenant_route_without_enabling_generation(): void
+    public function test_outreach_readiness_allows_deterministic_composition_without_optional_ai_route(): void
     {
         [$tenant, $owner, $company] = $this->fixture('outreach-readiness-route');
         Sanctum::actingAs($owner);
 
         $response = $this->withHeaders(['X-Tenant-ID' => $tenant->id])->getJson('/api/v1/companies/'.$company->id.'/outreach-drafts')->assertOk();
         self::assertTrue($response->json('eligible'), 'The existing sales eligibility contract remains Pursue plus approved service.');
-        self::assertFalse($response->json('generation_ready'));
+        self::assertTrue($response->json('generation_ready'));
         self::assertFalse(collect($response->json('readiness.checks'))->firstWhere('key', 'route')['ready']);
         self::assertFalse(collect($response->json('readiness.checks'))->firstWhere('key', 'credential')['ready']);
+        self::assertTrue(collect($response->json('readiness.checks'))->firstWhere('key', 'route')['optional']);
         self::assertTrue(collect($response->json('readiness.checks'))->firstWhere('key', 'prompt')['ready']);
+
+        $this->app->instance(AIModelRouter::class, new AIModelRouter([], []));
+        $draft = $this->withHeaders(['X-Tenant-ID' => $tenant->id, 'Idempotency-Key' => 'no-ai-route-fallback'])
+            ->postJson('/api/v1/companies/'.$company->id.'/outreach-drafts', ['finding_ids' => [$response->json('findings.0.id')]])
+            ->assertCreated();
+        self::assertSame('deterministic', $draft->json('provider'));
+        self::assertDatabaseCount('outreach_drafts', 1);
+        self::assertDatabaseCount('ai_usage_records', 0);
     }
 
     public function test_outreach_readiness_requires_enabled_tenant_route_and_runtime_provider_credential(): void
@@ -63,10 +71,11 @@ final class OutreachDraftGenerationTest extends TestCase
             ->assertCreated()->assertJsonPath('task_key','outreach_drafting')->assertJsonPath('version',1);
 
         self::assertSame('conversation-test',$response->json('provider'));
-        self::assertSame('Prospect Co',$provider->requests[0]->evidence['prospect']['company']['name']);
         self::assertSame('outreach_drafting',$provider->requests[0]->task);
-        self::assertCount(1,$provider->requests[0]->evidence['prospect']['selected_validated_findings']);
-        self::assertStringContainsString('never send',strtolower($provider->requests[0]->systemInstruction));
+        self::assertCount(1,$provider->requests[0]->evidence['selected_findings']);
+        self::assertSame(['tone','opening_variant','cta_variant','service_mention','finding_order'],array_keys($provider->requests[0]->outputSchema['properties']));
+        self::assertArrayNotHasKey('email',$provider->requests[0]->outputSchema['properties']);
+        self::assertStringContainsString('do not write sentences',strtolower($provider->requests[0]->systemInstruction));
         $this->assertDatabaseHas('outreach_drafts',['tenant_id'=>$tenant->id,'company_id'=>$company->id,'selected_service_id'=>$service,'version'=>1]);
         $this->assertDatabaseHas('agent_runs',['tenant_id'=>$tenant->id,'agent_key'=>'OutreachDraftAgent','status'=>'succeeded']);
         $this->assertDatabaseHas('audit_logs',['tenant_id'=>$tenant->id,'action'=>'outreach_draft.generated']);
@@ -78,149 +87,46 @@ final class OutreachDraftGenerationTest extends TestCase
         $this->assertDatabaseHas('company_human_sales_reviews',['tenant_id'=>$tenant->id,'company_id'=>$company->id,'decision'=>'pursue','selected_service_id'=>$service]);
     }
 
-    public function test_ebarza_h1_finding_allows_measured_observation_and_general_service_capability_only(): void
+    public function test_ebarza_h1_finding_is_composed_deterministically_from_selected_evidence(): void
     {
-        [$tenant,$user,$company,$service,$mobileFinding]=$this->fixture('outreach-ebarza-grounded');
+        [$tenant,$user,$company,$service,$unused]=$this->fixture('outreach-ebarza-grounded');
         DB::table('companies')->where('tenant_id',$tenant->id)->where('id',$company->id)->update(['name'=>'Ebarza']);
         $insight=(string)Str::uuid();$evidence=(string)Str::uuid();
-        $observation='Improving the presence and content of H1 headings on pages could enhance SEO and user clarity.';
-        DB::table('lead_insights')->insert(['id'=>$insight,'tenant_id'=>$tenant->id,'company_id'=>$company->id,'kind'=>'business_fit',
-            'statement'=>$observation,'confidence'=>.95,'created_at'=>now(),'updated_at'=>now()]);
-        DB::table('lead_evidence')->insert(['id'=>$evidence,'tenant_id'=>$tenant->id,'lead_insight_id'=>$insight,'evidence_type'=>'website_content',
-            'source_url'=>'https://ebarza.com/','excerpt'=>$observation,'observed_at'=>now(),'confidence'=>.95,'created_at'=>now(),'updated_at'=>now()]);
+        $summary='Improving the presence and content of H1 headings on pages could enhance SEO and user clarity.';
+        DB::table('lead_insights')->insert(['id'=>$insight,'tenant_id'=>$tenant->id,'company_id'=>$company->id,'kind'=>'business_fit','statement'=>$summary,'confidence'=>.95,'created_at'=>now(),'updated_at'=>now()]);
+        DB::table('lead_evidence')->insert(['id'=>$evidence,'tenant_id'=>$tenant->id,'lead_insight_id'=>$insight,'evidence_type'=>'website_content','source_url'=>'https://ebarza.com/','excerpt'=>'No non-empty H1 heading was found.','observed_at'=>now(),'confidence'=>.95,'created_at'=>now(),'updated_at'=>now()]);
         DB::table('lead_scores')->where('tenant_id',$tenant->id)->where('company_id',$company->id)->update(['components'=>json_encode([
-            'poor_mobile_ux'=>['status'=>'POSITIVE','evidence_reference'=>$mobileFinding],
             'strong_business_fit'=>['status'=>'POSITIVE','evidence_reference'=>['source'=>'business_insight','id'=>$insight]],
         ])]);
-        $output=['pitch_summary'=>'An opportunity to improve H1 heading content could enhance SEO and user clarity.',
-            'recommended_channel'=>'email','recommended_channel_reason'=>'A verified email is available.',
-            'email'=>['subject'=>'An idea for H1 heading content','body'=>'We noticed an opportunity to improve H1 heading presence and content, which could enhance SEO and user clarity. Our Website Performance Optimization service can include performance and technical improvements where relevant. Would you be open to a brief discussion?'],
-            'whatsapp'=>'A WhatsApp message for the prospect.','linkedin'=>'A LinkedIn message for the prospect.','follow_up_email'=>'','follow_up_short'=>'','evidence_used'=>[['finding_id'=>$insight,'summary'=>'Model supplied summary is not trusted.']]];
-        $provider=$this->provider($tenant->id,$insight,$output);Sanctum::actingAs($user);
+        $provider=$this->provider($tenant->id,$insight,$this->stylePlan([$insight]));
+        Log::spy();Sanctum::actingAs($user);
 
-        $response=$this->withHeaders(['X-Tenant-ID'=>$tenant->id,'Idempotency-Key'=>'ebarza-h1-grounded'])
+        $response=$this->withHeaders(['X-Tenant-ID'=>$tenant->id,'Idempotency-Key'=>'ebarza-h1-deterministic'])
             ->postJson('/api/v1/companies/'.$company->id.'/outreach-drafts',['finding_ids'=>[$insight]])->assertCreated();
-
-        self::assertSame('contact_page',$response->json('draft_payload.recommended_channel'));
-        self::assertSame('No verified direct email, WhatsApp, or LinkedIn channel is available. A public contact page is available.',
-            $response->json('draft_payload.recommended_channel_reason'));
-        self::assertSame('',$response->json('draft_payload.whatsapp'));
-        self::assertSame('',$response->json('draft_payload.linkedin'));
-        self::assertCount(1,$provider->requests,'Incorrect model channel output does not consume a grounding repair call.');
-        self::assertSame([$insight],array_column($provider->requests[0]->evidence['prospect']['selected_validated_findings'],'id'));
-        self::assertArrayNotHasKey('score_context',$provider->requests[0]->evidence['prospect']);
-        self::assertArrayNotHasKey('human_sales_review',$provider->requests[0]->evidence['prospect']);
-        self::assertSame('Website Performance Optimization',$provider->requests[0]->evidence['prospect']['selected_service_capability']['name']);
-        self::assertSame([['finding_id'=>$insight,'summary'=>$observation]],$response->json('draft_payload.evidence_used'));
-        self::assertDatabaseCount('outbound_messages',0);
-        self::assertDatabaseCount('campaign_recipients',0);
-        self::assertDatabaseCount('campaign_events',0);
-
-        $unsafe=$output;
-        $unsafe['email']['body']='We noticed your website needs speed, responsiveness and technical performance improvements. This could significantly enhance SEO.';
-        $this->provider($tenant->id,$insight,$unsafe);
-        $this->withHeaders(['X-Tenant-ID'=>$tenant->id,'Idempotency-Key'=>'ebarza-h1-unsupported'])
-            ->postJson('/api/v1/companies/'.$company->id.'/outreach-drafts',['finding_ids'=>[$insight]])->assertUnprocessable();
-        self::assertSame(1,DB::table('outreach_drafts')->where('tenant_id',$tenant->id)->where('company_id',$company->id)->count());
-        self::assertDatabaseCount('outbound_messages',0);
-        self::assertDatabaseCount('campaign_recipients',0);
+        $payload=$response->json('draft_payload');
+        self::assertSame('contact_page',$payload['recommended_channel']);
+        self::assertSame('No verified direct email, WhatsApp, or LinkedIn channel is available. A public contact page is available.',$payload['recommended_channel_reason']);
+        self::assertSame('',$payload['whatsapp']);self::assertSame('',$payload['linkedin']);
+        self::assertSame(1,count($provider->requests));
+        self::assertSame(['tone','opening_variant','cta_variant','service_mention','finding_order'],array_keys($provider->requests[0]->outputSchema['properties']));
+        self::assertSame($insight,$provider->requests[0]->evidence['selected_findings'][0]['finding_id']);
+        self::assertStringNotContainsString('No non-empty H1 heading was found',$provider->requests[0]->systemInstruction);
+        self::assertStringContainsString('No non-empty H1 heading was found.',$payload['email']['body']);
+        self::assertStringContainsString('could enhance SEO and user clarity.',$payload['email']['body']);
+        self::assertStringContainsString('Our Website Performance Optimization work can support this type of improvement where relevant.',$payload['email']['body']);
+        foreach (['speed problem','responsiveness problem','poor mobile UX','performance problems','significantly'] as $unsupported) {
+            self::assertStringNotContainsString($unsupported,strtolower(json_encode($payload)));
+        }
+        self::assertSame([['finding_id'=>$insight,'summary'=>$summary]],$payload['evidence_used']);
+        self::assertDatabaseCount('outreach_drafts',1);self::assertDatabaseCount('outbound_messages',0);
+        self::assertDatabaseCount('campaign_recipients',0);self::assertDatabaseCount('campaign_events',0);
         self::assertDatabaseHas('company_human_sales_reviews',['tenant_id'=>$tenant->id,'company_id'=>$company->id,'decision'=>'pursue','selected_service_id'=>$service]);
+        self::assertDatabaseHas('ai_usage_records',['tenant_id'=>$tenant->id,'task_key'=>'outreach_drafting','status'=>'COMPLETED']);
+        Log::shouldHaveReceived('info')->withArgs(fn(string $message,array $context):bool =>
+            $message==='Outreach draft composed.' && $context['composition_mode']==='ai_style_plan'
+            && $context['selected_finding_count']===1 && $context['recommended_channel']==='contact_page'
+            && $context['style_plan_valid']===true && !array_key_exists('draft',$context))->once();
     }
-
-    public function test_ebarza_grounding_validator_rejects_unselected_claims_in_every_prospect_message(): void
-    {
-        $validator=app(OutreachDraftGroundingValidator::class);
-        $evidence='Improving the presence and content of H1 headings on pages could enhance SEO and user clarity.';
-        $finding=['id'=>(string)Str::uuid(),'key'=>'strong_business_fit','label'=>'Strong business fit','summary'=>$evidence,'evidence'=>$evidence];
-        $service=(object)['name'=>'Website Performance Optimization','description'=>'Website usability and performance'];
-        $contactContext=[['channel'=>'contact_page','status'=>'publicly_listed','confidence'=>.95]];
-        $base=['pitch_summary'=>'A measured opportunity to improve H1 headings and SEO.','recommended_channel'=>'contact_page',
-            'recommended_channel_reason'=>'No verified direct email, WhatsApp, or LinkedIn channel is available. A public contact page is available.','email'=>['subject'=>'H1 heading content','body'=>'H1 heading content could enhance SEO and user clarity.'],
-            'whatsapp'=>'','linkedin'=>'','follow_up_email'=>'','follow_up_short'=>'','evidence_used'=>[]];
-        $validator->assertGrounded($base,[$finding],$service,'Ebarza',$contactContext);
-        $capability='Our Website Performance Optimization service can include performance and technical improvements where relevant.';
-        $base['linkedin']=$capability;
-        $validator->assertGrounded($base,[$finding],$service,'Ebarza',$contactContext);
-        $base['linkedin']='Website Performance Optimization is the selected service for this opportunity.';
-        $validator->assertGrounded($base,[$finding],$service,'Ebarza',$contactContext);
-
-        $claims=['We noticed poor mobile UX.','Your website has a responsiveness problem.','Your website is slow.',
-            'We found a website speed problem.','We found a technical performance problem.','This could significantly enhance SEO.',
-            'Ebarza has website performance problems.','Your website needs performance improvements.',
-            'Improving speed and responsiveness would help.','Website Performance Optimization shows that Ebarza has poor performance.',
-            'Our service description says Ebarza has website usability and performance problems.'];
-        $fields=['pitch_summary','email.subject','email.body','whatsapp','linkedin','follow_up_email','follow_up_short'];
-        foreach($fields as $field){
-            foreach($claims as $claim){
-                $candidate=$base;
-                if($field==='pitch_summary')$candidate[$field]=$claim;
-                elseif($field==='email.subject')$candidate['email']['subject']=$claim;
-                elseif($field==='email.body')$candidate['email']['body']=$claim;
-                else $candidate[$field]=$claim;
-                try{$validator->assertGrounded($candidate,[$finding],$service,'Ebarza',$contactContext);self::fail("Unsupported claim was accepted in {$field}: {$claim}");}
-                catch(\App\Outreach\OutreachDraftGroundingException $error){self::assertContains($error->reasonCode,['OUTREACH_GROUNDING_STRENGTH','OUTREACH_GROUNDING_TOPIC','OUTREACH_GROUNDING_PROSPECT_CLAIM']);}
-            }
-        }
-    }
-
-    public function test_grounding_validator_aggregates_deduplicated_reason_field_violations_without_text(): void
-    {
-        $validator=app(OutreachDraftGroundingValidator::class);
-        $finding=['id'=>(string)Str::uuid(),'key'=>'strong_business_fit','label'=>'Strong business fit',
-            'summary'=>'Improving the presence and content of H1 headings on pages could enhance SEO and user clarity.',
-            'evidence'=>'No non-empty H1 heading was found.'];
-        $service=(object)['name'=>'Website Performance Optimization','description'=>'General service capability.'];
-        $draft=['pitch_summary'=>'This could significantly enhance SEO.','recommended_channel'=>'contact_page',
-            'recommended_channel_reason'=>'No verified direct email, WhatsApp, or LinkedIn channel is available. A public contact page is available.',
-            'email'=>['subject'=>'H1 heading content','body'=>'Ebarza has an issue that needs attention.'],
-            'whatsapp'=>'','linkedin'=>'','follow_up_email'=>'','follow_up_short'=>'',
-            'evidence_used'=>[]];
-
-        $result=$validator->validate($draft,[$finding],$service,'Ebarza',[
-            ['channel'=>'contact_page','status'=>'publicly_listed','confidence'=>.95],
-        ]);
-
-        self::assertFalse($result->valid);
-        self::assertSame([
-            ['reason_code'=>'OUTREACH_GROUNDING_STRENGTH','field'=>'pitch_summary'],
-            ['reason_code'=>'OUTREACH_GROUNDING_PROSPECT_CLAIM','field'=>'email.body'],
-        ],$result->violations);
-        self::assertStringNotContainsString('Ebarza',json_encode($result->violations));
-        self::assertStringNotContainsString('significantly',json_encode($result->violations));
-    }
-
-    public function test_channel_reason_is_grounded_only_in_verified_public_contact_context(): void
-    {
-        $validator=app(OutreachDraftGroundingValidator::class);
-        $finding=['id'=>(string)Str::uuid(),'key'=>'strong_business_fit','label'=>'Strong business fit',
-            'summary'=>'Improving H1 heading content could enhance SEO.','evidence'=>'Improving H1 heading content could enhance SEO.'];
-        $service=(object)['name'=>'Website Performance Optimization','description'=>'General service capability.'];
-        $context=[['channel'=>'contact_page','status'=>'publicly_listed','confidence'=>.95]];
-        $draft=['pitch_summary'=>'H1 heading content could enhance SEO.','recommended_channel'=>'contact_page',
-            'recommended_channel_reason'=>'No verified direct email, WhatsApp, or LinkedIn channel is available. A public contact page is available.',
-            'email'=>['subject'=>'H1 content','body'=>'H1 heading content could enhance SEO.'],'whatsapp'=>'','linkedin'=>'',
-            'follow_up_email'=>'','follow_up_short'=>'','evidence_used'=>[]];
-        $validator->assertGrounded($draft,[$finding],$service,'Ebarza',$context);
-
-        foreach ([
-            ['channel'=>'contact_page','reason'=>'A verified email address is available.','field'=>'recommended_channel_reason'],
-            ['channel'=>'email','reason'=>'No verified email address is available.','field'=>'recommended_channel'],
-            ['channel'=>'contact_page','reason'=>'No verified direct channel is available; use the public contact page.','field'=>'recommended_channel_reason'],
-            ['channel'=>'contact_page','reason'=>'The contact page is best because Ebarza has poor mobile UX.'],
-        ] as $case) {
-            $candidate=$draft;
-            $candidate['recommended_channel']=$case['channel'];
-            $candidate['recommended_channel_reason']=$case['reason'];
-            try {
-                $validator->assertGrounded($candidate,[$finding],$service,'Ebarza',$context);
-                self::fail('Unsupported channel context was accepted: '.$case['reason']);
-            } catch (\App\Outreach\OutreachDraftGroundingException $error) {
-                self::assertSame('OUTREACH_GROUNDING_CHANNEL',$error->reasonCode);
-                self::assertSame($case['field']??'recommended_channel_reason',$error->field);
-            }
-        }
-    }
-
     public function test_channel_resolver_uses_only_supported_contact_context_and_deterministic_fallbacks(): void
     {
         $resolver=app(\App\Outreach\OutreachChannelResolver::class);
@@ -422,9 +328,7 @@ final class OutreachDraftGenerationTest extends TestCase
             'parameters'=>json_encode(['max_output_tokens'=>1800]),'version'=>1,'created_at'=>now(),'updated_at'=>now()]);
         config(['ai.providers.conversation-test.key'=>'synthetic-test-key']);
 
-        $provider=$this->provider($tenant->id,$issue,['pitch_summary'=>'Reviewed finding only.','recommended_channel'=>'contact_page','recommended_channel_reason'=>'Use the public contact page.',
-            'email'=>['subject'=>'A note on mobile usability','body'=>'A mobile usability observation for your review.'],'whatsapp'=>'','linkedin'=>'','follow_up_email'=>'','follow_up_short'=>'',
-            'evidence_used'=>[['finding_id'=>$issue,'summary'=>'The viewport metadata disables user zoom on mobile.']]]);
+        $provider=$this->provider($tenant->id,$issue,$this->stylePlan([$issue]));
         Sanctum::actingAs($user);
         $workspace=$this->withHeaders(['X-Tenant-ID'=>$tenant->id])->getJson('/api/v1/companies/'.$company->id.'/outreach-drafts')->assertOk()->json();
 
@@ -472,7 +376,7 @@ final class OutreachDraftGenerationTest extends TestCase
             ->postJson('/api/v1/companies/'.$company->id.'/outreach-drafts',['finding_ids'=>[$issue]]);
         self::assertSame(201,$generation->status(),$generation->getContent().' '.json_encode(DB::table('agent_runs')->where('tenant_id',$tenant->id)->get(['agent_key','status','error_summary'])));
         self::assertCount(1,$provider->requests,'The fake provider is called only after explicit Generate Draft action.');
-        self::assertSame([$issue],array_column($provider->requests[0]->evidence['prospect']['selected_validated_findings'],'id'));
+        self::assertSame([$issue],array_column($provider->requests[0]->evidence['selected_findings'],'finding_id'));
         $persisted=json_decode(DB::table('outreach_drafts')->where('tenant_id',$tenant->id)->where('company_id',$company->id)->value('validated_findings'),true);
         self::assertSame('poor_mobile_ux',$persisted[0]['key']);
         self::assertSame($issue,$persisted[0]['evidence_reference']['id']);
@@ -483,153 +387,93 @@ final class OutreachDraftGenerationTest extends TestCase
         $this->assertDatabaseHas('lead_scores',['tenant_id'=>$tenant->id,'company_id'=>$company->id,'score'=>60]);
     }
 
-    public function test_unusable_provider_output_fails_safely_without_persisting_or_leaking_raw_output(): void
+    public function test_invalid_ai_style_schema_uses_deterministic_fallback_without_leaking_provider_data(): void
     {
-        [$tenant,$user,$company,,$finding]=$this->fixture('outreach-invalid-output');
+        [$tenant,$user,$company,,$finding]=$this->fixture('outreach-invalid-style');
         $provider=$this->provider($tenant->id,$finding,['provider_response_secret'=>'should never be returned']);
         Sanctum::actingAs($user);
-        $response=$this->withHeaders(['X-Tenant-ID'=>$tenant->id,'Idempotency-Key'=>'invalid-outreach-output'])
-            ->postJson('/api/v1/companies/'.$company->id.'/outreach-drafts',['finding_ids'=>[$finding]])
-            ->assertUnprocessable();
-        self::assertStringNotContainsString('should never be returned',$response->getContent());
+        $response=$this->withHeaders(['X-Tenant-ID'=>$tenant->id,'Idempotency-Key'=>'invalid-outreach-style'])
+            ->postJson('/api/v1/companies/'.$company->id.'/outreach-drafts',['finding_ids'=>[$finding]])->assertCreated();
+        self::assertSame('deterministic',$response->json('provider'));
+        self::assertSame('deterministic-style-plan-v1',$response->json('model'));
         self::assertStringNotContainsString('provider_response_secret',$response->getContent());
-        self::assertDatabaseCount('outreach_drafts',0);
-        $this->assertDatabaseHas('agent_runs',['tenant_id'=>$tenant->id,'agent_key'=>'OutreachDraftAgent','status'=>'failed']);
-        $this->assertDatabaseCount('outbound_messages',0);
+        self::assertStringNotContainsString('should never be returned',$response->getContent());
         self::assertCount(1,$provider->requests);
+        self::assertDatabaseCount('outreach_drafts',1);
+        self::assertDatabaseHas('ai_usage_records',['tenant_id'=>$tenant->id,'task_key'=>'outreach_drafting','status'=>'FAILED']);
+        self::assertDatabaseCount('outbound_messages',0);self::assertDatabaseCount('campaign_recipients',0);self::assertDatabaseCount('campaign_events',0);
     }
 
-    public function test_ebarza_grounding_failure_is_repaired_once_with_same_selected_context_and_accounted_calls(): void
+    public function test_provider_exception_uses_deterministic_fallback_and_preserves_failure_observability(): void
     {
-        [$tenant,$user,$company,,$finding]=$this->fixture('outreach-ebarza-repair');
-        $finding=$this->makeEbarzaH1Finding($tenant->id,$company->id,$finding);
-        $rejected='Ebarza has an issue that needs attention.';
-        $firstPitch='This could significantly enhance SEO.';
-        $provider=new SequencedAIProvider([
-            $this->ebarzaDraft($finding,$firstPitch,emailBody:$rejected),
-            $this->ebarzaDraft($finding,'Ebarza could benefit from reviewing the H1 heading structure on pages where no non-empty H1 was found. Website Performance Optimization is the selected service for this opportunity.'),
-        ]);
-        $this->bindSequencedProvider($tenant->id,$provider);
-        Log::spy();
-        Sanctum::actingAs($user);
-
-        $response=$this->withHeaders(['X-Tenant-ID'=>$tenant->id,'Idempotency-Key'=>'ebarza-grounding-repair'])
-            ->postJson('/api/v1/companies/'.$company->id.'/outreach-drafts',['finding_ids'=>[$finding]])
-            ->assertCreated();
-
-        self::assertCount(2,$provider->requests);
-        self::assertSame($provider->requests[0]->evidence,$provider->requests[1]->evidence);
-        self::assertSame($provider->requests[0]->tenantId,$provider->requests[1]->tenantId);
-        self::assertSame($provider->requests[0]->correlationId,$provider->requests[1]->correlationId,
-            'Both independently accounted provider calls remain associated with the same workflow correlation.');
-        self::assertStringContainsString('OUTREACH_GROUNDING_STRENGTH: pitch_summary',$provider->requests[1]->systemInstruction);
-        self::assertStringContainsString('OUTREACH_GROUNDING_PROSPECT_CLAIM: email.body',$provider->requests[1]->systemInstruction);
-        self::assertStringContainsString('email.body',$provider->requests[1]->systemInstruction);
-        self::assertStringNotContainsString($rejected,$provider->requests[1]->systemInstruction,
-            'Rejected generated text must never be echoed into the repair request.');
-        self::assertStringNotContainsString($firstPitch,$provider->requests[1]->systemInstruction,
-            'Rejected generated text must never be echoed into the repair request.');
-        self::assertStringContainsString('significant, significantly, major, substantial, poor, slow, weak, broken, or lacking',$provider->requests[1]->systemInstruction);
-        self::assertSame($provider->requests[0]->outputSchema,$provider->requests[1]->outputSchema);
-        self::assertSame(1800,$provider->requests[1]->maxOutputTokens);
-        self::assertSame(0.3,$provider->requests[1]->temperature);
-        self::assertSame(1,DB::table('outreach_drafts')->where('tenant_id',$tenant->id)->where('company_id',$company->id)->count());
-        self::assertSame(2,DB::table('ai_usage_records')->where('tenant_id',$tenant->id)->where('task_key','outreach_drafting')->count());
-        self::assertSame(2,DB::table('ai_usage_records')->where('tenant_id',$tenant->id)->where('task_key','outreach_drafting')->where('status','COMPLETED')->count());
-        $usageRows=DB::table('ai_usage_records')->where('tenant_id',$tenant->id)->where('task_key','outreach_drafting')->orderBy('created_at')->get();
-        self::assertCount(2,$usageRows);
-        self::assertCount(2,$usageRows->pluck('idempotency_key')->unique(),'Each model call receives its own usage/idempotency record.');
-        self::assertCount(1,$usageRows->pluck('correlation_id')->unique(),'Both calls remain correlated with the same agent workflow.');
-        self::assertSame([1349,1349],$usageRows->pluck('input_tokens')->map(fn($tokens)=>(int)$tokens)->all());
-        self::assertSame([352,352],$usageRows->pluck('output_tokens')->map(fn($tokens)=>(int)$tokens)->all());
-        self::assertSame(0,(int)DB::table('ai_usage_records')->where('tenant_id',$tenant->id)->where('task_key','outreach_drafting')->sum('reserved_tokens'));
-        self::assertSame(2698,(int)DB::table('ai_usage_records')->where('tenant_id',$tenant->id)->where('task_key','outreach_drafting')->sum('input_tokens'));
-        self::assertSame(704,(int)DB::table('ai_usage_records')->where('tenant_id',$tenant->id)->where('task_key','outreach_drafting')->sum('output_tokens'));
+        [$tenant,$user,$company,,$finding]=$this->fixture('outreach-style-provider-failure');
+        $provider=new SequencedAIProvider([null]);$this->bindSequencedProvider($tenant->id,$provider);
+        Log::spy();Sanctum::actingAs($user);
+        $response=$this->withHeaders(['X-Tenant-ID'=>$tenant->id,'Idempotency-Key'=>'style-provider-failure'])
+            ->postJson('/api/v1/companies/'.$company->id.'/outreach-drafts',['finding_ids'=>[$finding]])->assertCreated();
+        self::assertSame('deterministic',$response->json('provider'));self::assertCount(1,$provider->requests);
+        self::assertDatabaseCount('outreach_drafts',1);
+        self::assertDatabaseHas('ai_usage_records',['tenant_id'=>$tenant->id,'task_key'=>'outreach_drafting','status'=>'FAILED']);
+        Log::shouldHaveReceived('warning')->withArgs(fn(string $message,array $context):bool =>
+            $message==='Outreach AI style planning unavailable; deterministic composition used.'
+            && isset($context['failure_class']) && !isset($context['provider_message']))->once();
         self::assertDatabaseCount('outbound_messages',0);
-        self::assertDatabaseCount('campaign_recipients',0);
-        self::assertDatabaseCount('campaign_events',0);
-        Log::shouldHaveReceived('notice')->once()->withArgs(function(string $message,array $context):bool {
-            return $message==='Outreach draft grounding repair finished.'
-                && $context===['repair_attempted'=>true,
-                    'original_violations'=>[
-                        ['reason_code'=>'OUTREACH_GROUNDING_STRENGTH','field'=>'pitch_summary'],
-                        ['reason_code'=>'OUTREACH_GROUNDING_PROSPECT_CLAIM','field'=>'email.body'],
-                    ],
-                    'final_outcome'=>'accepted','remaining_violations'=>[]];
-        });
-        self::assertSame('Ebarza could benefit from reviewing the H1 heading structure on pages where no non-empty H1 was found. Website Performance Optimization is the selected service for this opportunity.',
-            json_decode(DB::table('outreach_drafts')->where('tenant_id',$tenant->id)->value('draft_payload'),true)['pitch_summary']);
-        self::assertSame(201,$response->status());
     }
 
-    public function test_second_grounding_failure_fails_safely_without_persisting_a_draft(): void
+    public function test_invalid_ai_style_enum_uses_deterministic_fallback(): void
     {
-        [$tenant,$user,$company,,$finding]=$this->fixture('outreach-ebarza-repair-fails');
-        $finding=$this->makeEbarzaH1Finding($tenant->id,$company->id,$finding);
-        Log::spy();
-        $provider=new SequencedAIProvider([
-            $this->ebarzaDraft($finding,'This could significantly enhance SEO.',emailBody:'Ebarza has an issue that needs attention.'),
-            $this->ebarzaDraft($finding,'This could substantially enhance SEO.'),
-        ]);
-        $this->bindSequencedProvider($tenant->id,$provider);
+        [$tenant,$user,$company,,$finding]=$this->fixture('outreach-style-invalid-enum');
+        $provider=$this->provider($tenant->id,$finding,$this->stylePlan([$finding],['tone'=>'inventive']));
         Sanctum::actingAs($user);
-
-        $this->withHeaders(['X-Tenant-ID'=>$tenant->id,'Idempotency-Key'=>'ebarza-grounding-repair-fails'])
-            ->postJson('/api/v1/companies/'.$company->id.'/outreach-drafts',['finding_ids'=>[$finding]])->assertUnprocessable();
-
-        self::assertCount(2,$provider->requests,'Grounding repair is bounded to one attempt.');
-        self::assertDatabaseCount('outreach_drafts',0);
-        self::assertSame(2,DB::table('ai_usage_records')->where('tenant_id',$tenant->id)->where('task_key','outreach_drafting')->where('status','COMPLETED')->count());
-        Log::shouldHaveReceived('warning')->withArgs(function(string $message,array $context):bool {
-            return $message==='Outreach draft grounding repair finished.'
-                && $context===['repair_attempted'=>true,
-                    'original_violations'=>[
-                        ['reason_code'=>'OUTREACH_GROUNDING_STRENGTH','field'=>'pitch_summary'],
-                        ['reason_code'=>'OUTREACH_GROUNDING_PROSPECT_CLAIM','field'=>'email.body'],
-                    ],
-                    'final_outcome'=>'rejected',
-                    'remaining_violations'=>[
-                        ['reason_code'=>'OUTREACH_GROUNDING_STRENGTH','field'=>'pitch_summary'],
-                    ]];
-        })->once();
-        self::assertStringContainsString('OUTREACH_GROUNDING_STRENGTH: pitch_summary',$provider->requests[1]->systemInstruction);
-        self::assertStringContainsString('OUTREACH_GROUNDING_PROSPECT_CLAIM: email.body',$provider->requests[1]->systemInstruction);
-        $this->assertDatabaseCount('outbound_messages',0);
-        $this->assertDatabaseCount('campaign_recipients',0);
-        $this->assertDatabaseCount('campaign_events',0);
+        $response=$this->withHeaders(['X-Tenant-ID'=>$tenant->id,'Idempotency-Key'=>'style-invalid-enum'])
+            ->postJson('/api/v1/companies/'.$company->id.'/outreach-drafts',['finding_ids'=>[$finding]])->assertCreated();
+        self::assertSame('deterministic',$response->json('provider'));
+        self::assertCount(1,$provider->requests);
+        self::assertDatabaseCount('outreach_drafts',1);
+        self::assertDatabaseHas('ai_usage_records',['tenant_id'=>$tenant->id,'task_key'=>'outreach_drafting','status'=>'FAILED']);
+        self::assertDatabaseCount('outbound_messages',0);
     }
 
-    public function test_grounding_repair_still_rejects_unsupported_prospect_topics(): void
+    public function test_unselected_ai_finding_order_is_rejected_and_defaults_to_reviewer_order(): void
     {
-        $badRepairs=[
-            'Your site has speed problems.',
-            'Your website has responsiveness problems.',
-            'Your site has poor mobile UX.',
-            'Ebarza has performance problems.',
-            'This could significantly enhance SEO.',
-        ];
-
-        foreach($badRepairs as $index=>$badPitch){
-            [$tenant,$user,$company,,$finding]=$this->fixture('outreach-repair-rejected-'.$index);
-            $finding=$this->makeEbarzaH1Finding($tenant->id,$company->id,$finding);
-            $provider=new SequencedAIProvider([
-                $this->ebarzaDraft($finding,'This could substantially enhance SEO.'),
-                $this->ebarzaDraft($finding,$badPitch),
-            ]);
-            $this->bindSequencedProvider($tenant->id,$provider);
-            Sanctum::actingAs($user);
-            $repairResponse=$this->withHeaders(['X-Tenant-ID'=>$tenant->id,'Idempotency-Key'=>'repair-reject-'.$index])
-                ->postJson('/api/v1/companies/'.$company->id.'/outreach-drafts',['finding_ids'=>[$finding]]);
-            self::assertSame(422,$repairResponse->status(),'Unexpected repair acceptance for test case: '.$badPitch.'; '.$repairResponse->getContent());
-            self::assertCount(2,$provider->requests);
-            self::assertSame(0,DB::table('outreach_drafts')->where('tenant_id',$tenant->id)->where('company_id',$company->id)->count());
-            self::assertDatabaseCount('outbound_messages',0);
-            self::assertDatabaseCount('campaign_recipients',0);
-            self::assertDatabaseCount('campaign_events',0);
-        }
-
+        [$tenant,$user,$company,,$finding]=$this->fixture('outreach-style-unselected-id');
+        $plan=$this->stylePlan([$finding]);$plan['finding_order']=[(string)Str::uuid()];
+        $provider=$this->provider($tenant->id,$finding,$plan);Sanctum::actingAs($user);
+        $response=$this->withHeaders(['X-Tenant-ID'=>$tenant->id,'Idempotency-Key'=>'style-unselected-id'])
+            ->postJson('/api/v1/companies/'.$company->id.'/outreach-drafts',['finding_ids'=>[$finding]])->assertCreated();
+        self::assertSame('deterministic',$response->json('provider'));
+        self::assertSame([$finding],array_column($response->json('draft_payload.evidence_used'),'finding_id'));
+        self::assertCount(1,$provider->requests);self::assertDatabaseCount('outreach_drafts',1);
+        self::assertDatabaseCount('outbound_messages',0);
     }
 
+    public function test_ai_budget_prevents_style_call_but_deterministic_draft_succeeds(): void
+    {
+        [$tenant,$user,$company,,$finding]=$this->fixture('outreach-style-budget');
+        $provider=$this->provider($tenant->id,$finding);
+        DB::table('ai_usage_records')->insert(['id'=>(string)Str::uuid(),'tenant_id'=>$tenant->id,'task_key'=>'outreach_drafting',
+            'provider'=>'conversation-test','model'=>'test-model','status'=>'COMPLETED','idempotency_key'=>'prior-style-budget-call','created_at'=>now()]);
+        config(['ai.daily_call_limit'=>1]);Sanctum::actingAs($user);
+        $response=$this->withHeaders(['X-Tenant-ID'=>$tenant->id,'Idempotency-Key'=>'style-budget-fallback'])
+            ->postJson('/api/v1/companies/'.$company->id.'/outreach-drafts',['finding_ids'=>[$finding]])->assertCreated();
+        self::assertSame('deterministic',$response->json('provider'));self::assertCount(0,$provider->requests);
+        self::assertDatabaseCount('outreach_drafts',1);self::assertDatabaseCount('ai_usage_records',1);
+        self::assertDatabaseCount('outbound_messages',0);
+    }
+
+    public function test_ebarza_deterministic_composition_failure_paths_never_repair_or_send(): void
+    {
+        [$tenant,$user,$company,,$finding]=$this->fixture('outreach-ebarza-no-repair');
+        $finding=$this->makeEbarzaH1Finding($tenant->id,$company->id,$finding);
+        $provider=new SequencedAIProvider([$this->stylePlan([$finding]), null]);
+        $this->bindSequencedProvider($tenant->id,$provider);Sanctum::actingAs($user);
+        $response=$this->withHeaders(['X-Tenant-ID'=>$tenant->id,'Idempotency-Key'=>'ebarza-one-call'])
+            ->postJson('/api/v1/companies/'.$company->id.'/outreach-drafts',['finding_ids'=>[$finding]])->assertCreated();
+        self::assertCount(1,$provider->requests,'Draft generation never makes a prose repair call.');
+        self::assertSame('contact_page',$response->json('draft_payload.recommended_channel'));
+        self::assertDatabaseCount('outreach_drafts',1);self::assertDatabaseCount('outbound_messages',0);
+        self::assertDatabaseCount('campaign_recipients',0);self::assertDatabaseCount('campaign_events',0);
+    }
     private function makeEbarzaH1Finding(string $tenantId,string $companyId,string $findingId):string
     {
         DB::table('companies')->where('tenant_id',$tenantId)->where('id',$companyId)->update(['name'=>'Ebarza']);
@@ -646,15 +490,6 @@ final class OutreachDraftGenerationTest extends TestCase
         ])]);
 
         return (string)$insightId;
-    }
-
-    private function ebarzaDraft(string $findingId,string $pitchSummary,?string $channelReason=null,?string $emailBody=null):array
-    {
-        return ['pitch_summary'=>$pitchSummary,'recommended_channel'=>'contact_page',
-            'recommended_channel_reason'=>$channelReason??'No verified direct channel is available; use the public contact page.',
-            'email'=>['subject'=>'A note on H1 headings','body'=>$emailBody??'We noticed an opportunity to review H1 heading usage on pages where no non-empty H1 heading was found.'],
-            'whatsapp'=>'','linkedin'=>'','follow_up_email'=>'','follow_up_short'=>'',
-            'evidence_used'=>[['finding_id'=>$findingId,'summary'=>'Improving the presence and content of H1 headings on pages could enhance SEO and user clarity.']]];
     }
 
     private function bindSequencedProvider(string $tenantId,SequencedAIProvider $provider):void
@@ -686,9 +521,15 @@ final class OutreachDraftGenerationTest extends TestCase
         return [$tenant,$user,$company,$service,$finding];
     }
 
+    private function stylePlan(array $findingIds, array $overrides=[]): array
+    {
+        return array_replace(['tone'=>'consultative','opening_variant'=>'brief_observation','cta_variant'=>'soft_discussion',
+            'service_mention'=>'light','finding_order'=>array_values($findingIds)],$overrides);
+    }
+
     private function provider(string $tenantId,string $finding,?array $output=null): StaticAIProvider
     {
-        $provider=new StaticAIProvider($output ?? ['pitch_summary'=>'A measured opportunity.','recommended_channel'=>'contact_page','recommended_channel_reason'=>'No verified direct channel is available; use the public contact page.','email'=>['subject'=>'A thought on mobile usability','body'=>'We noticed a mobile layout detail that may be worth reviewing.'],'whatsapp'=>'','linkedin'=>'','follow_up_email'=>'','follow_up_short'=>'','evidence_used'=>[['finding_id'=>$finding,'summary'=>'Mobile layout overflows on a narrow viewport.']]]);
+        $provider=new StaticAIProvider($output ?? $this->stylePlan([$finding]));
         $this->app->instance(AIModelRouter::class,new AIModelRouter([$provider],['outreach_drafting'=>['provider'=>'conversation-test','model'=>'test-model']]));
         return $provider;
     }
