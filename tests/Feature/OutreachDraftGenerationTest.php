@@ -6,6 +6,7 @@ use App\AI\AIModelRouter;
 use App\Models\Company;
 use App\Models\Tenant;
 use App\Models\User;
+use App\Outreach\OutreachDraftGroundingValidator;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
@@ -73,6 +74,85 @@ final class OutreachDraftGenerationTest extends TestCase
         $this->assertDatabaseCount('website_scans',0);
         $this->assertDatabaseCount('lead_scores',1);
         $this->assertDatabaseHas('company_human_sales_reviews',['tenant_id'=>$tenant->id,'company_id'=>$company->id,'decision'=>'pursue','selected_service_id'=>$service]);
+    }
+
+    public function test_ebarza_h1_finding_allows_measured_observation_and_general_service_capability_only(): void
+    {
+        [$tenant,$user,$company,$service,$mobileFinding]=$this->fixture('outreach-ebarza-grounded');
+        DB::table('companies')->where('tenant_id',$tenant->id)->where('id',$company->id)->update(['name'=>'Ebarza']);
+        $insight=(string)Str::uuid();$evidence=(string)Str::uuid();
+        $observation='Improving the presence and content of H1 headings on pages could enhance SEO and user clarity.';
+        DB::table('lead_insights')->insert(['id'=>$insight,'tenant_id'=>$tenant->id,'company_id'=>$company->id,'kind'=>'business_fit',
+            'statement'=>$observation,'confidence'=>.95,'created_at'=>now(),'updated_at'=>now()]);
+        DB::table('lead_evidence')->insert(['id'=>$evidence,'tenant_id'=>$tenant->id,'lead_insight_id'=>$insight,'evidence_type'=>'website_content',
+            'source_url'=>'https://ebarza.com/','excerpt'=>$observation,'observed_at'=>now(),'confidence'=>.95,'created_at'=>now(),'updated_at'=>now()]);
+        DB::table('lead_scores')->where('tenant_id',$tenant->id)->where('company_id',$company->id)->update(['components'=>json_encode([
+            'poor_mobile_ux'=>['status'=>'POSITIVE','evidence_reference'=>$mobileFinding],
+            'strong_business_fit'=>['status'=>'POSITIVE','evidence_reference'=>['source'=>'business_insight','id'=>$insight]],
+        ])]);
+        $output=['pitch_summary'=>'An opportunity to improve H1 heading content could enhance SEO and user clarity.',
+            'recommended_channel'=>'contact_page','recommended_channel_reason'=>'No verified direct contact is available; use the public contact page.',
+            'email'=>['subject'=>'An idea for H1 heading content','body'=>'We noticed an opportunity to improve H1 heading presence and content, which could enhance SEO and user clarity. Our Website Performance Optimization service can include performance and technical improvements where relevant. Would you be open to a brief discussion?'],
+            'whatsapp'=>'','linkedin'=>'','follow_up_email'=>'','follow_up_short'=>'','evidence_used'=>[['finding_id'=>$insight,'summary'=>'Model supplied summary is not trusted.']]];
+        $provider=$this->provider($tenant->id,$insight,$output);Sanctum::actingAs($user);
+
+        $response=$this->withHeaders(['X-Tenant-ID'=>$tenant->id,'Idempotency-Key'=>'ebarza-h1-grounded'])
+            ->postJson('/api/v1/companies/'.$company->id.'/outreach-drafts',['finding_ids'=>[$insight]])->assertCreated();
+
+        self::assertSame('contact_page',$response->json('draft_payload.recommended_channel'));
+        self::assertSame([$insight],array_column($provider->requests[0]->evidence['prospect']['selected_validated_findings'],'id'));
+        self::assertArrayNotHasKey('score_context',$provider->requests[0]->evidence['prospect']);
+        self::assertArrayNotHasKey('human_sales_review',$provider->requests[0]->evidence['prospect']);
+        self::assertSame('Website Performance Optimization',$provider->requests[0]->evidence['prospect']['selected_service_capability']['name']);
+        self::assertSame([['finding_id'=>$insight,'summary'=>$observation]],$response->json('draft_payload.evidence_used'));
+        self::assertDatabaseCount('outbound_messages',0);
+        self::assertDatabaseCount('campaign_recipients',0);
+        self::assertDatabaseCount('campaign_events',0);
+
+        $unsafe=$output;
+        $unsafe['email']['body']='We noticed your website needs speed, responsiveness and technical performance improvements. This could significantly enhance SEO.';
+        $this->provider($tenant->id,$insight,$unsafe);
+        $this->withHeaders(['X-Tenant-ID'=>$tenant->id,'Idempotency-Key'=>'ebarza-h1-unsupported'])
+            ->postJson('/api/v1/companies/'.$company->id.'/outreach-drafts',['finding_ids'=>[$insight]])->assertUnprocessable();
+        self::assertSame(1,DB::table('outreach_drafts')->where('tenant_id',$tenant->id)->where('company_id',$company->id)->count());
+        self::assertDatabaseCount('outbound_messages',0);
+        self::assertDatabaseCount('campaign_recipients',0);
+        self::assertDatabaseHas('company_human_sales_reviews',['tenant_id'=>$tenant->id,'company_id'=>$company->id,'decision'=>'pursue','selected_service_id'=>$service]);
+    }
+
+    public function test_ebarza_grounding_validator_rejects_unselected_claims_in_every_prospect_message(): void
+    {
+        $validator=app(OutreachDraftGroundingValidator::class);
+        $evidence='Improving the presence and content of H1 headings on pages could enhance SEO and user clarity.';
+        $finding=['id'=>(string)Str::uuid(),'key'=>'strong_business_fit','label'=>'Strong business fit','summary'=>$evidence,'evidence'=>$evidence];
+        $service=(object)['name'=>'Website Performance Optimization','description'=>'Website usability and performance'];
+        $base=['pitch_summary'=>'A measured opportunity to improve H1 headings and SEO.','recommended_channel'=>'contact_page',
+            'recommended_channel_reason'=>'Use the public contact page.','email'=>['subject'=>'H1 heading content','body'=>'H1 heading content could enhance SEO and user clarity.'],
+            'whatsapp'=>'','linkedin'=>'','follow_up_email'=>'','follow_up_short'=>'','evidence_used'=>[]];
+        $validator->assertGrounded($base,[$finding],$service,'Ebarza');
+        $capability='Our Website Performance Optimization service can include performance and technical improvements where relevant.';
+        $base['linkedin']=$capability;
+        $validator->assertGrounded($base,[$finding],$service,'Ebarza');
+        $base['linkedin']='Website Performance Optimization is the selected service for this opportunity.';
+        $validator->assertGrounded($base,[$finding],$service,'Ebarza');
+
+        $claims=['We noticed poor mobile UX.','Your website has a responsiveness problem.','Your website is slow.',
+            'We found a website speed problem.','We found a technical performance problem.','This could significantly enhance SEO.',
+            'Ebarza has website performance problems.','Your website needs performance improvements.',
+            'Improving speed and responsiveness would help.','Website Performance Optimization shows that Ebarza has poor performance.',
+            'Our service description says Ebarza has website usability and performance problems.'];
+        $fields=['pitch_summary','email.subject','email.body','whatsapp','linkedin','follow_up_email','follow_up_short'];
+        foreach($fields as $field){
+            foreach($claims as $claim){
+                $candidate=$base;
+                if($field==='pitch_summary')$candidate[$field]=$claim;
+                elseif($field==='email.subject')$candidate['email']['subject']=$claim;
+                elseif($field==='email.body')$candidate['email']['body']=$claim;
+                else $candidate[$field]=$claim;
+                try{$validator->assertGrounded($candidate,[$finding],$service,'Ebarza');self::fail("Unsupported claim was accepted in {$field}: {$claim}");}
+                catch(\RuntimeException $error){self::assertStringContainsString('selected evidence',$error->getMessage());}
+            }
+        }
     }
 
     public function test_generation_is_blocked_until_pursue_and_reviewer_selected_service(): void
