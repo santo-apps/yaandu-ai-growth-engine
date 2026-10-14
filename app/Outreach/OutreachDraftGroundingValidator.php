@@ -12,6 +12,9 @@ final class OutreachDraftGroundingValidator
     /** @param list<array<string, mixed>> $selectedFindings @param list<array<string, mixed>> $publicContactContext */
     public function assertComposition(OutreachDraftComposition $composition, array $selectedFindings, object $service, array $publicContactContext): void
     {
+        if (! in_array($composition->requestedWritingStyle, ['consultative', 'professional', 'concise'], true)) {
+            throw new RuntimeException('The composed draft uses an unsupported writing style.');
+        }
         $selected = array_values(array_unique(array_map('strval', array_column($selectedFindings, 'id'))));
         if ($selected === [] || count($selected) !== count($selectedFindings)
             || count($composition->findingIds) !== count($selected)
@@ -81,23 +84,55 @@ final class OutreachDraftGroundingValidator
                 $source = match ($type) {
                     'observation' => 'We noticed: '.mb_substr(trim((string) ($finding['evidence'] ?? '')), 0, 120),
                     'opportunity' => mb_substr(trim((string) ($finding['summary'] ?? '')), 0, 180),
-                    'finding_label' => mb_substr('A note about '.(string) ($finding['label'] ?? ''), 0, 180),
+                    'finding_label' => mb_substr(match ($composition->requestedWritingStyle) {
+                        'professional' => 'Website observation: ',
+                        'concise' => 'Quick note: ',
+                        default => 'A quick observation about ',
+                    }.(string) ($finding['label'] ?? ''), 0, 180),
                 };
                 if ($text !== $source) {
                     throw new RuntimeException('A provenance segment does not match its selected evidence atom.');
                 }
                 if (in_array($type, ['observation', 'opportunity'], true)) $seenAtoms[$id][$type] = true;
             } elseif ($type === 'service_capability') {
-                $expected = 'Our '.(string) ($service->name ?? '').' work can support this type of improvement where relevant.';
+                $expected = match ($composition->requestedWritingStyle) {
+                    'professional' => "Yaandu's ".(string) ($service->name ?? '').' service can support this area where appropriate.',
+                    'concise' => 'Our '.(string) ($service->name ?? '').' service may help with this area.',
+                    default => 'Our '.(string) ($service->name ?? '').' work can support this type of improvement where relevant.',
+                };
                 if ($text !== $expected) throw new RuntimeException('The service capability segment does not match the approved service template.');
             } elseif ($type === 'template') {
-                if (! in_array($text, ['Hello,', 'Hello, I am reaching out from Yaandu with a note about a selected finding.',
-                    'Hello, we noticed a detail in the reviewed website evidence.', 'Best regards, Yaandu', 'Regards, Yaandu', 'Warm regards, Yaandu'], true)) {
+                $templates = match ($composition->requestedWritingStyle) {
+                    'professional' => [
+                        'Website observation: ',
+                        'Hello, we are reaching out from Yaandu regarding an observation identified during our review.',
+                        "Kind regards,\nYaandu", 'I am following up regarding the website observation below.',
+                    ],
+                    'concise' => ['Hello,', 'Regards, Yaandu', 'Following up:'],
+                    default => [
+                        'A point worth exploring: ',
+                        'Hello, while reviewing the available website evidence, we noticed one point that may be worth exploring.',
+                        "Best regards,\nYaandu", 'Just following up on the website observation we shared.',
+                    ],
+                };
+                if (! in_array($text, $templates, true)) {
                     throw new RuntimeException('A deterministic template segment is not approved.');
                 }
             } elseif ($type === 'cta') {
-                if (! in_array($text, ['Would a brief review of this finding be useful?', 'Would you be interested in discussing this?',
-                    'Would you be open to a brief conversation about this?'], true)) {
+                $ctas = match ($composition->requestedWritingStyle) {
+                    'professional' => [
+                        'Please let us know if you would like to discuss this observation further.',
+                        'Please let us know if you would like to discuss it further.',
+                        'Please let us know if you would like to discuss.',
+                    ],
+                    'concise' => ['Interested in a quick discussion?', 'Interested?'],
+                    default => [
+                        'Would you be open to a brief conversation to explore whether this is relevant for your priorities?',
+                        'Would it be useful to explore whether this is relevant to your priorities?',
+                        'Would it be useful to explore this?',
+                    ],
+                };
+                if (! in_array($text, $ctas, true)) {
                     throw new RuntimeException('A deterministic call-to-action segment is not approved.');
                 }
             } elseif ($type !== 'cta') {

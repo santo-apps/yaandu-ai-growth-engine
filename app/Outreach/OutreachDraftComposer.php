@@ -7,23 +7,15 @@ use InvalidArgumentException;
 /** Renders prospect-facing copy from reviewer-selected evidence atoms and fixed templates. */
 final class OutreachDraftComposer
 {
-    private const TONES = ['consultative', 'concise', 'warm_professional'];
-    private const OPENINGS = ['direct', 'brief_observation'];
-    private const CTAS = ['soft_discussion', 'offer_review', 'ask_interest'];
-    private const SERVICE_MENTIONS = ['none', 'light'];
+    private const STYLES = ['consultative', 'professional', 'concise'];
 
     public function __construct(private readonly OutreachChannelResolver $channels) {}
 
     /** @param list<OutreachEvidenceAtom> $atoms @param array<string, mixed> $plan @param list<array<string, mixed>> $contactContext */
-    public function compose(array $atoms, string $serviceId, string $serviceName, array $plan, array $contactContext): OutreachDraftComposition
+    public function compose(array $atoms, string $serviceId, string $serviceName, array $plan, array $contactContext, string $requestedWritingStyle = 'consultative'): OutreachDraftComposition
     {
         $channel = $this->channels->resolve($contactContext);
-        if (! in_array($plan['tone'] ?? null, self::TONES, true)
-            || ! in_array($plan['opening_variant'] ?? null, self::OPENINGS, true)
-            || ! in_array($plan['cta_variant'] ?? null, self::CTAS, true)
-            || ! in_array($plan['service_mention'] ?? null, self::SERVICE_MENTIONS, true)) {
-            throw new InvalidArgumentException('The outreach style plan contains unsupported values.');
-        }
+        if (! in_array($requestedWritingStyle, self::STYLES, true)) $requestedWritingStyle = 'consultative';
 
         $byId = [];
         foreach ($atoms as $atom) $byId[$atom->findingId] = $atom;
@@ -36,17 +28,7 @@ final class OutreachDraftComposer
             throw new InvalidArgumentException('The outreach style plan must order every selected finding exactly once.');
         }
         $orderedAtoms = array_map(fn (string $id): OutreachEvidenceAtom => $byId[$id], $orderedIds);
-        $cta = match ($plan['cta_variant']) {
-            'offer_review' => 'Would a brief review of this finding be useful?',
-            'ask_interest' => 'Would you be interested in discussing this?',
-            default => 'Would you be open to a brief conversation about this?',
-        };
-        $opening = $plan['opening_variant'] === 'direct'
-            ? 'Hello, I am reaching out from Yaandu with a note about a selected finding.'
-            : 'Hello, we noticed a detail in the reviewed website evidence.';
-        $serviceSentence = $plan['service_mention'] === 'light'
-            ? 'Our '.$serviceName.' work can support this type of improvement where relevant.'
-            : null;
+        $profile = $this->profile($requestedWritingStyle, $serviceName);
 
         $segments = [];
         $append = function (string $field, string $type, string $text, string $separator = '', ?string $findingId = null) use (&$segments): void {
@@ -54,11 +36,13 @@ final class OutreachDraftComposer
             if ($findingId !== null) $segment['finding_id'] = $findingId;
             $segments[] = $segment;
         };
+        if ($requestedWritingStyle === 'consultative') $append('pitch_summary', 'template', 'A point worth exploring: ');
+        if ($requestedWritingStyle === 'professional') $append('pitch_summary', 'template', 'Website observation: ');
         foreach (array_slice($orderedAtoms, 0, 3) as $index => $atom) {
             $append('pitch_summary', 'opportunity', mb_substr(trim($atom->opportunity), 0, 180), $index === 0 ? '' : ' ', $atom->findingId);
         }
-        $append('email.subject', 'finding_label', mb_substr('A note about '.$orderedAtoms[0]->label, 0, 180), '', $orderedAtoms[0]->findingId);
-        $append('email.body', 'template', $opening);
+        $append('email.subject', 'finding_label', mb_substr($profile['subject_prefix'].$orderedAtoms[0]->label, 0, 180), '', $orderedAtoms[0]->findingId);
+        $append('email.body', 'template', $profile['opening']);
         foreach ($orderedAtoms as $atom) {
             $id = $atom->findingId;
             $observation = mb_substr(trim($atom->observation), 0, 120);
@@ -66,29 +50,29 @@ final class OutreachDraftComposer
             $append('email.body', 'observation', 'We noticed: '.$observation, "\n\n", $id);
             $append('email.body', 'opportunity', $opportunity, "\n\n", $id);
         }
-        if ($serviceSentence !== null) $append('email.body', 'service_capability', $serviceSentence, "\n\n");
-        $append('email.body', 'cta', $cta, "\n\n");
-        $append('email.body', 'template', $this->closing($plan['tone']), "\n\n");
+        $append('email.body', 'service_capability', $profile['service_sentence'], "\n\n");
+        $append('email.body', 'cta', $profile['cta'], "\n\n");
+        $append('email.body', 'template', $profile['closing'], "\n\n");
 
         if ($this->channels->isAvailable('whatsapp', $contactContext)) {
-            $append('whatsapp', 'template', 'Hello,');
+            $append('whatsapp', 'template', $profile['opening']);
             foreach (array_slice($orderedAtoms, 0, 5) as $atom) $append('whatsapp', 'opportunity', mb_substr(trim($atom->opportunity), 0, 180), "\n\n", $atom->findingId);
-            $append('whatsapp', 'cta', $cta, "\n\n");
+            $append('whatsapp', 'cta', $profile['cta'], "\n\n");
         }
         if ($this->channels->isAvailable('linkedin', $contactContext)) {
-            $append('linkedin', 'template', 'Hello,');
+            $append('linkedin', 'template', $profile['opening']);
             foreach (array_slice($orderedAtoms, 0, 5) as $atom) $append('linkedin', 'opportunity', mb_substr(trim($atom->opportunity), 0, 180), "\n\n", $atom->findingId);
-            $append('linkedin', 'cta', $cta, "\n\n");
+            $append('linkedin', 'cta', $profile['cta'], "\n\n");
         }
 
-        $append('follow_up_email', 'template', 'Hello,');
-        foreach ($orderedAtoms as $atom) $append('follow_up_email', 'opportunity', mb_substr(trim($atom->opportunity), 0, 180), ' ', $atom->findingId);
-        $append('follow_up_email', 'cta', $cta, "\n\n");
-        $append('follow_up_email', 'template', $this->closing($plan['tone']), "\n\n");
+        $append('follow_up_email', 'template', $profile['follow_up_opening']);
+        foreach ($orderedAtoms as $index => $atom) $append('follow_up_email', 'opportunity', mb_substr(trim($atom->opportunity), 0, 180), $index === 0 ? "\n\n" : ' ', $atom->findingId);
+        $append('follow_up_email', 'cta', $profile['follow_up_cta'], "\n\n");
+        if ($profile['follow_up_closing'] !== '') $append('follow_up_email', 'template', $profile['follow_up_closing'], "\n\n");
         foreach (array_slice($orderedAtoms, 0, 3) as $index => $atom) {
             $append('follow_up_short', 'opportunity', mb_substr(trim($atom->opportunity), 0, 180), $index === 0 ? '' : ' ', $atom->findingId);
         }
-        $append('follow_up_short', 'cta', $cta, ' ');
+        $append('follow_up_short', 'cta', $profile['short_cta'], ' ');
 
         $fieldText = [];
         foreach ($segments as $segment) $fieldText[$segment['field']] = ($fieldText[$segment['field']] ?? '').$segment['separator_before'].$segment['text'];
@@ -115,15 +99,47 @@ final class OutreachDraftComposer
             findingIds: array_values($orderedIds),
             serviceId: $serviceId,
             recommendedChannel: (string) $channel['recommended_channel'],
+            requestedWritingStyle: $requestedWritingStyle,
         );
     }
 
-    private function closing(string $tone): string
+    /** @return array{subject_prefix: string, opening: string, cta: string, closing: string, service_sentence: string, follow_up_opening: string, follow_up_cta: string, follow_up_closing: string, short_cta: string} */
+    private function profile(string $style, string $serviceName): array
     {
-        return match ($tone) {
-            'concise' => 'Regards, Yaandu',
-            'warm_professional' => 'Warm regards, Yaandu',
-            default => 'Best regards, Yaandu',
+        return match ($style) {
+            'professional' => [
+                'subject_prefix' => 'Website observation: ',
+                'opening' => 'Hello, we are reaching out from Yaandu regarding an observation identified during our review.',
+                'cta' => 'Please let us know if you would like to discuss this observation further.',
+                'closing' => "Kind regards,\nYaandu",
+                'service_sentence' => "Yaandu's {$serviceName} service can support this area where appropriate.",
+                'follow_up_opening' => 'I am following up regarding the website observation below.',
+                'follow_up_cta' => 'Please let us know if you would like to discuss it further.',
+                'follow_up_closing' => "Kind regards,\nYaandu",
+                'short_cta' => 'Please let us know if you would like to discuss.',
+            ],
+            'concise' => [
+                'subject_prefix' => 'Quick note: ',
+                'opening' => 'Hello,',
+                'cta' => 'Interested in a quick discussion?',
+                'closing' => 'Regards, Yaandu',
+                'service_sentence' => "Our {$serviceName} service may help with this area.",
+                'follow_up_opening' => 'Following up:',
+                'follow_up_cta' => 'Interested?',
+                'follow_up_closing' => '',
+                'short_cta' => 'Interested?',
+            ],
+            default => [
+                'subject_prefix' => 'A quick observation about ',
+                'opening' => 'Hello, while reviewing the available website evidence, we noticed one point that may be worth exploring.',
+                'cta' => 'Would you be open to a brief conversation to explore whether this is relevant for your priorities?',
+                'closing' => "Best regards,\nYaandu",
+                'service_sentence' => "Our {$serviceName} work can support this type of improvement where relevant.",
+                'follow_up_opening' => 'Just following up on the website observation we shared.',
+                'follow_up_cta' => 'Would it be useful to explore whether this is relevant to your priorities?',
+                'follow_up_closing' => "Best regards,\nYaandu",
+                'short_cta' => 'Would it be useful to explore this?',
+            ],
         };
     }
 }

@@ -12,5 +12,6 @@ final readonly class OutreachDraftComposition
         public array $findingIds,
         public string $serviceId,
         public string $recommendedChannel,
+        public string $requestedWritingStyle = 'consultative',
     ) {}
 }
