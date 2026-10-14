@@ -59,7 +59,9 @@ final class OutreachDraftAgent implements AgentInterface
         $usedIds = array_values(array_unique(array_map('strval', array_column($data['evidence_used'], 'finding_id'))));
         if (array_diff($usedIds, $selectedIds) !== []) throw new RuntimeException('The generated draft referenced findings that were not selected by the reviewer.');
         if (trim($data['email']['subject']) === '' || trim($data['email']['body']) === '') throw new RuntimeException('The provider returned an incomplete draft.');
-        $this->groundingValidator->assertGrounded($data, $selectedFindings, $service, (string) ($groundedContext['prospect']['company']['name'] ?? ''));
+        $this->groundingValidator->assertGrounded($data, $selectedFindings, $service,
+            (string) ($groundedContext['prospect']['company']['name'] ?? ''),
+            (array) ($groundedContext['prospect']['public_contact_context'] ?? []));
         $selectedFindingMap = collect($selectedFindings)->keyBy('id');
         $data['evidence_used'] = array_map(fn (string $id): array => ['finding_id'=>$id,'summary'=>(string)$selectedFindingMap->get($id)['summary']], $usedIds);
         $data['provider'] = $response->provider;

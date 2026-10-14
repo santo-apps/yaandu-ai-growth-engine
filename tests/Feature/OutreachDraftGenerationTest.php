@@ -91,7 +91,7 @@ final class OutreachDraftGenerationTest extends TestCase
             'strong_business_fit'=>['status'=>'POSITIVE','evidence_reference'=>['source'=>'business_insight','id'=>$insight]],
         ])]);
         $output=['pitch_summary'=>'An opportunity to improve H1 heading content could enhance SEO and user clarity.',
-            'recommended_channel'=>'contact_page','recommended_channel_reason'=>'No verified direct contact is available; use the public contact page.',
+            'recommended_channel'=>'contact_page','recommended_channel_reason'=>'No verified direct channel is available; use the public contact page.',
             'email'=>['subject'=>'An idea for H1 heading content','body'=>'We noticed an opportunity to improve H1 heading presence and content, which could enhance SEO and user clarity. Our Website Performance Optimization service can include performance and technical improvements where relevant. Would you be open to a brief discussion?'],
             'whatsapp'=>'','linkedin'=>'','follow_up_email'=>'','follow_up_short'=>'','evidence_used'=>[['finding_id'=>$insight,'summary'=>'Model supplied summary is not trusted.']]];
         $provider=$this->provider($tenant->id,$insight,$output);Sanctum::actingAs($user);
@@ -126,15 +126,16 @@ final class OutreachDraftGenerationTest extends TestCase
         $evidence='Improving the presence and content of H1 headings on pages could enhance SEO and user clarity.';
         $finding=['id'=>(string)Str::uuid(),'key'=>'strong_business_fit','label'=>'Strong business fit','summary'=>$evidence,'evidence'=>$evidence];
         $service=(object)['name'=>'Website Performance Optimization','description'=>'Website usability and performance'];
+        $contactContext=[['channel'=>'contact_page','status'=>'publicly_listed','confidence'=>.95]];
         $base=['pitch_summary'=>'A measured opportunity to improve H1 headings and SEO.','recommended_channel'=>'contact_page',
-            'recommended_channel_reason'=>'Use the public contact page.','email'=>['subject'=>'H1 heading content','body'=>'H1 heading content could enhance SEO and user clarity.'],
+            'recommended_channel_reason'=>'A public contact page is available, so contact_page is recommended.','email'=>['subject'=>'H1 heading content','body'=>'H1 heading content could enhance SEO and user clarity.'],
             'whatsapp'=>'','linkedin'=>'','follow_up_email'=>'','follow_up_short'=>'','evidence_used'=>[]];
-        $validator->assertGrounded($base,[$finding],$service,'Ebarza');
+        $validator->assertGrounded($base,[$finding],$service,'Ebarza',$contactContext);
         $capability='Our Website Performance Optimization service can include performance and technical improvements where relevant.';
         $base['linkedin']=$capability;
-        $validator->assertGrounded($base,[$finding],$service,'Ebarza');
+        $validator->assertGrounded($base,[$finding],$service,'Ebarza',$contactContext);
         $base['linkedin']='Website Performance Optimization is the selected service for this opportunity.';
-        $validator->assertGrounded($base,[$finding],$service,'Ebarza');
+        $validator->assertGrounded($base,[$finding],$service,'Ebarza',$contactContext);
 
         $claims=['We noticed poor mobile UX.','Your website has a responsiveness problem.','Your website is slow.',
             'We found a website speed problem.','We found a technical performance problem.','This could significantly enhance SEO.',
@@ -149,8 +150,47 @@ final class OutreachDraftGenerationTest extends TestCase
                 elseif($field==='email.subject')$candidate['email']['subject']=$claim;
                 elseif($field==='email.body')$candidate['email']['body']=$claim;
                 else $candidate[$field]=$claim;
-                try{$validator->assertGrounded($candidate,[$finding],$service,'Ebarza');self::fail("Unsupported claim was accepted in {$field}: {$claim}");}
-                catch(\RuntimeException $error){self::assertStringContainsString('selected evidence',$error->getMessage());}
+                try{$validator->assertGrounded($candidate,[$finding],$service,'Ebarza',$contactContext);self::fail("Unsupported claim was accepted in {$field}: {$claim}");}
+                catch(\App\Outreach\OutreachDraftGroundingException $error){self::assertContains($error->reasonCode,['OUTREACH_GROUNDING_STRENGTH','OUTREACH_GROUNDING_TOPIC','OUTREACH_GROUNDING_PROSPECT_CLAIM']);}
+            }
+        }
+    }
+
+    public function test_channel_reason_is_grounded_only_in_verified_public_contact_context(): void
+    {
+        $validator=app(OutreachDraftGroundingValidator::class);
+        $finding=['id'=>(string)Str::uuid(),'key'=>'strong_business_fit','label'=>'Strong business fit',
+            'summary'=>'Improving H1 heading content could enhance SEO.','evidence'=>'Improving H1 heading content could enhance SEO.'];
+        $service=(object)['name'=>'Website Performance Optimization','description'=>'General service capability.'];
+        $context=[['channel'=>'contact_page','status'=>'publicly_listed','confidence'=>.95]];
+        $draft=['pitch_summary'=>'H1 heading content could enhance SEO.','recommended_channel'=>'contact_page',
+            'recommended_channel_reason'=>'No verified direct channels such as email, WhatsApp, or LinkedIn are available; the public contact page is the most appropriate option.',
+            'email'=>['subject'=>'H1 content','body'=>'H1 heading content could enhance SEO.'],'whatsapp'=>'','linkedin'=>'',
+            'follow_up_email'=>'','follow_up_short'=>'','evidence_used'=>[]];
+        $validator->assertGrounded($draft,[$finding],$service,'Ebarza',$context);
+
+        $draft['recommended_channel_reason']='No verified email address is available; a public contact page is available.';
+        $validator->assertGrounded($draft,[$finding],$service,'Ebarza',$context);
+        $draft['recommended_channel_reason']='No verified WhatsApp contact is available.';
+        $validator->assertGrounded($draft,[$finding],$service,'Ebarza',$context);
+        $draft['recommended_channel_reason']='A public contact page is available.';
+        $validator->assertGrounded($draft,[$finding],$service,'Ebarza',$context);
+
+        foreach ([
+            ['channel'=>'contact_page','reason'=>'A verified email address is available.','field'=>'recommended_channel_reason'],
+            ['channel'=>'email','reason'=>'No verified email address is available.','field'=>'recommended_channel'],
+            ['channel'=>'contact_page','reason'=>'No verified named decision maker is available.','field'=>'recommended_channel_reason'],
+            ['channel'=>'contact_page','reason'=>'The contact page is best because Ebarza has poor mobile UX.'],
+        ] as $case) {
+            $candidate=$draft;
+            $candidate['recommended_channel']=$case['channel'];
+            $candidate['recommended_channel_reason']=$case['reason'];
+            try {
+                $validator->assertGrounded($candidate,[$finding],$service,'Ebarza',$context);
+                self::fail('Unsupported channel context was accepted: '.$case['reason']);
+            } catch (\App\Outreach\OutreachDraftGroundingException $error) {
+                self::assertSame('OUTREACH_GROUNDING_CHANNEL',$error->reasonCode);
+                self::assertSame($case['field']??'recommended_channel_reason',$error->field);
             }
         }
     }
@@ -413,6 +453,11 @@ final class OutreachDraftGenerationTest extends TestCase
         $tenant=Tenant::create(['id'=>(string)Str::uuid(),'name'=>$slug,'slug'=>$slug]);
         $user=User::create(['name'=>'Pilot user','email'=>$slug.'@example.test','password'=>'password']);$user->tenants()->attach($tenant->id,['role'=>'sales','status'=>'active']);
         $company=Company::create(['tenant_id'=>$tenant->id,'name'=>'Prospect Co','normalized_domain'=>$slug.'.test','status'=>'new']);
+        $contact=(string)Str::uuid();DB::table('contacts')->insert(['id'=>$contact,'tenant_id'=>$tenant->id,'company_id'=>$company->id,'name'=>null,
+            'source_url'=>'https://'.$slug.'.test/contact','observed_at'=>now(),'extraction_method'=>'test_fixture','confidence'=>.95,'created_at'=>now(),'updated_at'=>now()]);
+        DB::table('contact_methods')->insert(['id'=>(string)Str::uuid(),'tenant_id'=>$tenant->id,'contact_id'=>$contact,'type'=>'contact_page',
+            'value'=>'https://'.$slug.'.test/contact','source_url'=>'https://'.$slug.'.test/contact','observed_at'=>now(),'extraction_method'=>'test_fixture',
+            'confidence'=>.95,'verification_status'=>'publicly_listed','created_at'=>now(),'updated_at'=>now()]);
         $service=(string)Str::uuid();DB::table('tenant_services')->insert(['id'=>$service,'tenant_id'=>$tenant->id,'sku'=>'WEB-001','name'=>'Website Performance Optimization','description'=>'Website usability and performance','unit_price'=>1000,'currency'=>'INR','active'=>true,'approved_by'=>$user->id,'created_at'=>now(),'updated_at'=>now()]);
         $review=(string)Str::uuid();DB::table('company_human_sales_reviews')->insert(['id'=>$review,'tenant_id'=>$tenant->id,'company_id'=>$company->id,'reviewer_id'=>$user->id,'decision'=>'pursue','selected_service_id'=>$service,'notes'=>'Keep the message concise.','reviewed_at'=>now(),'created_at'=>now(),'updated_at'=>now()]);
         $finding=(string)Str::uuid();$insight=(string)Str::uuid();
@@ -426,7 +471,7 @@ final class OutreachDraftGenerationTest extends TestCase
 
     private function provider(string $tenantId,string $finding,?array $output=null): StaticAIProvider
     {
-        $provider=new StaticAIProvider($output ?? ['pitch_summary'=>'A measured opportunity.','recommended_channel'=>'contact_page','recommended_channel_reason'=>'No verified named decision maker is available.','email'=>['subject'=>'A thought on mobile usability','body'=>'We noticed a mobile layout detail that may be worth reviewing.'],'whatsapp'=>'','linkedin'=>'','follow_up_email'=>'','follow_up_short'=>'','evidence_used'=>[['finding_id'=>$finding,'summary'=>'Mobile layout overflows on a narrow viewport.']]]);
+        $provider=new StaticAIProvider($output ?? ['pitch_summary'=>'A measured opportunity.','recommended_channel'=>'contact_page','recommended_channel_reason'=>'No verified direct channel is available; use the public contact page.','email'=>['subject'=>'A thought on mobile usability','body'=>'We noticed a mobile layout detail that may be worth reviewing.'],'whatsapp'=>'','linkedin'=>'','follow_up_email'=>'','follow_up_short'=>'','evidence_used'=>[['finding_id'=>$finding,'summary'=>'Mobile layout overflows on a narrow viewport.']]]);
         $this->app->instance(AIModelRouter::class,new AIModelRouter([$provider],['outreach_drafting'=>['provider'=>'conversation-test','model'=>'test-model']]));
         return $provider;
     }
