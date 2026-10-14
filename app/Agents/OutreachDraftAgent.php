@@ -5,6 +5,7 @@ namespace App\Agents;
 use App\AI\AIModelRouter;
 use App\AI\AIRequest;
 use App\AI\ApprovedPromptRepository;
+use App\Outreach\OutreachChannelResolver;
 use App\Outreach\OutreachDraftGroundingValidator;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
@@ -13,7 +14,7 @@ use RuntimeException;
 final class OutreachDraftAgent implements AgentInterface
 {
     public function __construct(private readonly AIModelRouter $router, private readonly ApprovedPromptRepository $prompts,
-        private readonly OutreachDraftGroundingValidator $groundingValidator) {}
+        private readonly OutreachDraftGroundingValidator $groundingValidator, private readonly OutreachChannelResolver $channels) {}
 
     public function name(): string { return 'OutreachDraftAgent'; }
     public function description(): string { return 'Creates evidence-grounded, unsent outreach drafts for human review.'; }
@@ -47,7 +48,7 @@ final class OutreachDraftAgent implements AgentInterface
 
         $systemInstruction = self::policy()."\n\n".$prompt->systemInstruction."\n\nApproved template:\n".$prompt->template."\n\n".self::policy();
         $response = $this->router->generate($this->request($context, $groundedContext, $systemInstruction));
-        $data = $response->data;
+        $data = $this->resolveChannel($response->data, $groundedContext);
         try {
             $usedIds = $this->assertCompleteAndGrounded($data, $selectedIds, $selectedFindings, $service, $groundedContext);
         } catch (\App\Outreach\OutreachDraftGroundingException $firstFailure) {
@@ -55,7 +56,7 @@ final class OutreachDraftAgent implements AgentInterface
 
             try {
                 $response = $this->router->generate($this->request($context, $groundedContext, $repairInstruction));
-                $data = $response->data;
+                $data = $this->resolveChannel($response->data, $groundedContext);
                 $usedIds = $this->assertCompleteAndGrounded($data, $selectedIds, $selectedFindings, $service, $groundedContext);
                 Log::notice('Outreach draft grounding repair finished.', [
                     'repair_attempted' => true,
@@ -131,6 +132,18 @@ final class OutreachDraftAgent implements AgentInterface
             .'Do not use unsupported strength terms including significant, significantly, major, substantial, poor, slow, weak, broken, or lacking. '
             .'Do not introduce unselected technical topics or unsupported channel claims. Keep service capabilities general and conditional. '
             .'Return only the required schema.';
+    }
+
+    private function resolveChannel(array $data, array $groundedContext): array
+    {
+        $contactContext = (array) ($groundedContext['prospect']['public_contact_context'] ?? []);
+        $resolution = $this->channels->resolve($contactContext);
+        $data['recommended_channel'] = $resolution['recommended_channel'];
+        $data['recommended_channel_reason'] = $resolution['recommended_channel_reason'];
+        if (! $this->channels->isAvailable('whatsapp', $contactContext)) $data['whatsapp'] = '';
+        if (! $this->channels->isAvailable('linkedin', $contactContext)) $data['linkedin'] = '';
+
+        return $data;
     }
 
     /** @return list<string> */

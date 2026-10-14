@@ -5,6 +5,8 @@ namespace App\Outreach;
 /** Rejects ungrounded prospect claims before an outreach draft is persisted. */
 final class OutreachDraftGroundingValidator
 {
+    public function __construct(private readonly OutreachChannelResolver $channels) {}
+
     /** @var array<string, string> */
     private const UNSUPPORTED_STRENGTH = [
         'significant' => '/\bsignificant(?:ly)?\b/i',
@@ -40,7 +42,7 @@ final class OutreachDraftGroundingValidator
         ]), $findings)));
         $serviceName = mb_strtolower((string) ($service->name ?? ''));
         $companyName = mb_strtolower($companyName);
-        $this->assertChannelGrounded($draft, $publicContactContext, $companyName);
+        $this->assertChannelGrounded($draft, $publicContactContext);
         $assertedFields = [
             'pitch_summary' => $draft['pitch_summary'] ?? '',
             'email.subject' => $draft['email']['subject'] ?? '',
@@ -84,87 +86,13 @@ final class OutreachDraftGroundingValidator
     }
 
     /** @param array<string, mixed> $draft @param list<array<string, mixed>> $context */
-    private function assertChannelGrounded(array $draft, array $context, string $companyName): void
+    private function assertChannelGrounded(array $draft, array $context): void
     {
-        $available = [];
-        foreach ($context as $entry) {
-            if (! is_array($entry) || ! in_array($entry['status'] ?? null, ['verified', 'publicly_listed'], true)) continue;
-            $channel = match (strtolower((string) ($entry['channel'] ?? ''))) {
-                'email' => 'email',
-                'whatsapp' => 'whatsapp',
-                'linkedin' => 'linkedin',
-                'phone', 'telephone' => 'phone',
-                'contact_page' => 'contact_page',
-                default => null,
-            };
-            if ($channel !== null) $available[$channel] = true;
+        $resolved = $this->channels->resolve($context);
+        if (($draft['recommended_channel'] ?? null) !== $resolved['recommended_channel']) {
+            throw new OutreachDraftGroundingException('OUTREACH_GROUNDING_CHANNEL', 'recommended_channel');
         }
-
-        $recommended = (string) ($draft['recommended_channel'] ?? '');
-        $recommendedContext = match ($recommended) {
-            'email', 'whatsapp', 'linkedin', 'contact_page' => $recommended,
-            'manual_contact' => ! empty($available['email']) || ! empty($available['whatsapp']) || ! empty($available['linkedin']) || ! empty($available['phone']) ? 'manual_contact' : null,
-            'none' => null,
-            default => null,
-        };
-        $hasDirect = ! empty($available['email']) || ! empty($available['whatsapp']) || ! empty($available['linkedin']) || ! empty($available['phone']);
-        $validRecommendation = match ($recommended) {
-            'email', 'whatsapp', 'linkedin', 'contact_page' => ! empty($available[$recommended]),
-            'manual_contact' => $recommendedContext === 'manual_contact',
-            'none' => ! $hasDirect && empty($available['contact_page']),
-            default => false,
-        };
-        if (! $validRecommendation) throw new OutreachDraftGroundingException('OUTREACH_GROUNDING_CHANNEL', 'recommended_channel');
-
-        $reason = (string) ($draft['recommended_channel_reason'] ?? '');
-        if (trim($reason) === '') throw new OutreachDraftGroundingException('OUTREACH_GROUNDING_CHANNEL', 'recommended_channel_reason');
-        $reasonLower = mb_strtolower($reason);
-        $genericDirectUnavailable = preg_match('/\bno\s+(?:verified\s+)?direct\s+(?:contact\s+)?channels?\b.*\b(?:available|verified|identified)\b/i', $reason) === 1
-            || preg_match('/\bno\s+verified\s+direct\s+channel\s+is\s+available\b/i', $reason) === 1;
-        if ($genericDirectUnavailable && $hasDirect) throw new OutreachDraftGroundingException('OUTREACH_GROUNDING_CHANNEL', 'recommended_channel_reason');
-
-        $terms = [
-            'email' => '/\bemail(?: address)?\b/i',
-            'whatsapp' => '/\bwhatsapp\b/i',
-            'linkedin' => '/\blinkedin\b/i',
-            'phone' => '/\b(?:phone|telephone)\b/i',
-            'contact_page' => '/\b(?:public\s+)?contact(?:_|\s+)page\b/i',
-        ];
-        $hasContextBoundReason = $genericDirectUnavailable;
-        foreach ($terms as $channel => $pattern) {
-            if (! preg_match_all($pattern, $reason, $matches, PREG_OFFSET_CAPTURE)) continue;
-            $hasContextBoundReason = true;
-            foreach ($matches[0] as [$mention, $offset]) {
-                if ($genericDirectUnavailable && in_array($channel, ['email', 'whatsapp', 'linkedin', 'phone'], true)) {
-                    if (! empty($available[$channel])) throw new OutreachDraftGroundingException('OUTREACH_GROUNDING_CHANNEL', 'recommended_channel_reason');
-                    continue;
-                }
-                $before = substr($reason, max(0, $offset - 80), min(80, $offset));
-                $after = substr($reason, $offset + strlen($mention), 80);
-                $negativeBefore = preg_match('/\b(?:no|not|without|unavailable|cannot|can not|could not|isn.t|aren.t)\b(?:[\s\w-]{0,40})$/i', $before) === 1;
-                $negativeAfter = preg_match('/^\s*(?:(?:address|contact|channel)\s+)?(?:is|are)?\s*(?:not\s+(?:verified|available|present)|unavailable|missing)\b/i', $after) === 1;
-                $negative = $negativeBefore || $negativeAfter;
-                $positive = ($channel === 'contact_page' && preg_match('/\bpublic\s+contact\s+page\b/i', $mention) === 1)
-                    || preg_match('/\b(?:verified|available|publicly listed|present|public|most appropriate)\b(?:[\s\w-]{0,32})$/i', $before) === 1
-                    || preg_match('/^\s*(?:(?:address|contact|page|channel)\s+)?(?:is|are)?\s*(?:verified|available|publicly listed|present|recommended|the most appropriate|most appropriate)\b/i', $after) === 1;
-                if ($negative) $positive = false;
-                if ($negative === $positive) throw new OutreachDraftGroundingException('OUTREACH_GROUNDING_CHANNEL', 'recommended_channel_reason');
-                if ($negative && ! empty($available[$channel])) throw new OutreachDraftGroundingException('OUTREACH_GROUNDING_CHANNEL', 'recommended_channel_reason');
-                if ($positive && empty($available[$channel])) throw new OutreachDraftGroundingException('OUTREACH_GROUNDING_CHANNEL', 'recommended_channel_reason');
-            }
-        }
-        if (! $hasContextBoundReason) throw new OutreachDraftGroundingException('OUTREACH_GROUNDING_CHANNEL', 'recommended_channel_reason');
-
-        // Channel explanations are not a place to smuggle business or technical claims.
-        $claimText = preg_replace($terms, ' ', $reason) ?? $reason;
-        foreach (self::UNSUPPORTED_STRENGTH as $pattern) {
-            if (preg_match($pattern, $claimText)) throw new OutreachDraftGroundingException('OUTREACH_GROUNDING_CHANNEL', 'recommended_channel_reason');
-        }
-        foreach (self::TECHNICAL_TOPICS as $pattern) {
-            if (preg_match($pattern, $claimText)) throw new OutreachDraftGroundingException('OUTREACH_GROUNDING_CHANNEL', 'recommended_channel_reason');
-        }
-        if ($companyName !== '' && str_contains($reasonLower, $companyName)
-            && preg_match('/\b(?:has|have|is|are|needs?|lacks?|shows?|contains?|could|may|might)\b/i', $reason)) {
+        if (($draft['recommended_channel_reason'] ?? null) !== $resolved['recommended_channel_reason']) {
             throw new OutreachDraftGroundingException('OUTREACH_GROUNDING_CHANNEL', 'recommended_channel_reason');
         }
     }

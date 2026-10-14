@@ -93,15 +93,20 @@ final class OutreachDraftGenerationTest extends TestCase
             'strong_business_fit'=>['status'=>'POSITIVE','evidence_reference'=>['source'=>'business_insight','id'=>$insight]],
         ])]);
         $output=['pitch_summary'=>'An opportunity to improve H1 heading content could enhance SEO and user clarity.',
-            'recommended_channel'=>'contact_page','recommended_channel_reason'=>'No verified direct channel is available; use the public contact page.',
+            'recommended_channel'=>'email','recommended_channel_reason'=>'A verified email is available.',
             'email'=>['subject'=>'An idea for H1 heading content','body'=>'We noticed an opportunity to improve H1 heading presence and content, which could enhance SEO and user clarity. Our Website Performance Optimization service can include performance and technical improvements where relevant. Would you be open to a brief discussion?'],
-            'whatsapp'=>'','linkedin'=>'','follow_up_email'=>'','follow_up_short'=>'','evidence_used'=>[['finding_id'=>$insight,'summary'=>'Model supplied summary is not trusted.']]];
+            'whatsapp'=>'A WhatsApp message for the prospect.','linkedin'=>'A LinkedIn message for the prospect.','follow_up_email'=>'','follow_up_short'=>'','evidence_used'=>[['finding_id'=>$insight,'summary'=>'Model supplied summary is not trusted.']]];
         $provider=$this->provider($tenant->id,$insight,$output);Sanctum::actingAs($user);
 
         $response=$this->withHeaders(['X-Tenant-ID'=>$tenant->id,'Idempotency-Key'=>'ebarza-h1-grounded'])
             ->postJson('/api/v1/companies/'.$company->id.'/outreach-drafts',['finding_ids'=>[$insight]])->assertCreated();
 
         self::assertSame('contact_page',$response->json('draft_payload.recommended_channel'));
+        self::assertSame('No verified direct email, WhatsApp, or LinkedIn channel is available. A public contact page is available.',
+            $response->json('draft_payload.recommended_channel_reason'));
+        self::assertSame('',$response->json('draft_payload.whatsapp'));
+        self::assertSame('',$response->json('draft_payload.linkedin'));
+        self::assertCount(1,$provider->requests,'Incorrect model channel output does not consume a grounding repair call.');
         self::assertSame([$insight],array_column($provider->requests[0]->evidence['prospect']['selected_validated_findings'],'id'));
         self::assertArrayNotHasKey('score_context',$provider->requests[0]->evidence['prospect']);
         self::assertArrayNotHasKey('human_sales_review',$provider->requests[0]->evidence['prospect']);
@@ -130,7 +135,7 @@ final class OutreachDraftGenerationTest extends TestCase
         $service=(object)['name'=>'Website Performance Optimization','description'=>'Website usability and performance'];
         $contactContext=[['channel'=>'contact_page','status'=>'publicly_listed','confidence'=>.95]];
         $base=['pitch_summary'=>'A measured opportunity to improve H1 headings and SEO.','recommended_channel'=>'contact_page',
-            'recommended_channel_reason'=>'A public contact page is available, so contact_page is recommended.','email'=>['subject'=>'H1 heading content','body'=>'H1 heading content could enhance SEO and user clarity.'],
+            'recommended_channel_reason'=>'No verified direct email, WhatsApp, or LinkedIn channel is available. A public contact page is available.','email'=>['subject'=>'H1 heading content','body'=>'H1 heading content could enhance SEO and user clarity.'],
             'whatsapp'=>'','linkedin'=>'','follow_up_email'=>'','follow_up_short'=>'','evidence_used'=>[]];
         $validator->assertGrounded($base,[$finding],$service,'Ebarza',$contactContext);
         $capability='Our Website Performance Optimization service can include performance and technical improvements where relevant.';
@@ -166,22 +171,15 @@ final class OutreachDraftGenerationTest extends TestCase
         $service=(object)['name'=>'Website Performance Optimization','description'=>'General service capability.'];
         $context=[['channel'=>'contact_page','status'=>'publicly_listed','confidence'=>.95]];
         $draft=['pitch_summary'=>'H1 heading content could enhance SEO.','recommended_channel'=>'contact_page',
-            'recommended_channel_reason'=>'No verified direct channels such as email, WhatsApp, or LinkedIn are available; the public contact page is the most appropriate option.',
+            'recommended_channel_reason'=>'No verified direct email, WhatsApp, or LinkedIn channel is available. A public contact page is available.',
             'email'=>['subject'=>'H1 content','body'=>'H1 heading content could enhance SEO.'],'whatsapp'=>'','linkedin'=>'',
             'follow_up_email'=>'','follow_up_short'=>'','evidence_used'=>[]];
-        $validator->assertGrounded($draft,[$finding],$service,'Ebarza',$context);
-
-        $draft['recommended_channel_reason']='No verified email address is available; a public contact page is available.';
-        $validator->assertGrounded($draft,[$finding],$service,'Ebarza',$context);
-        $draft['recommended_channel_reason']='No verified WhatsApp contact is available.';
-        $validator->assertGrounded($draft,[$finding],$service,'Ebarza',$context);
-        $draft['recommended_channel_reason']='A public contact page is available.';
         $validator->assertGrounded($draft,[$finding],$service,'Ebarza',$context);
 
         foreach ([
             ['channel'=>'contact_page','reason'=>'A verified email address is available.','field'=>'recommended_channel_reason'],
             ['channel'=>'email','reason'=>'No verified email address is available.','field'=>'recommended_channel'],
-            ['channel'=>'contact_page','reason'=>'No verified named decision maker is available.','field'=>'recommended_channel_reason'],
+            ['channel'=>'contact_page','reason'=>'No verified direct channel is available; use the public contact page.','field'=>'recommended_channel_reason'],
             ['channel'=>'contact_page','reason'=>'The contact page is best because Ebarza has poor mobile UX.'],
         ] as $case) {
             $candidate=$draft;
@@ -195,6 +193,31 @@ final class OutreachDraftGenerationTest extends TestCase
                 self::assertSame($case['field']??'recommended_channel_reason',$error->field);
             }
         }
+    }
+
+    public function test_channel_resolver_uses_only_supported_contact_context_and_deterministic_fallbacks(): void
+    {
+        $resolver=app(\App\Outreach\OutreachChannelResolver::class);
+        $cases=[
+            [[['channel'=>'email','status'=>'verified']], 'email','An email channel is verified.'],
+            [[['channel'=>'whatsapp','status'=>'publicly_listed']], 'whatsapp','A WhatsApp channel is publicly listed.'],
+            [[['channel'=>'linkedin','status'=>'verified']], 'linkedin','A LinkedIn channel is verified.'],
+            [[['channel'=>'phone','status'=>'verified']], 'manual_contact','A phone contact is verified. Use manual contact.'],
+            [[['channel'=>'contact_page','status'=>'publicly_listed']], 'contact_page','No verified direct email, WhatsApp, or LinkedIn channel is available. A public contact page is available.'],
+            [[], 'none','No verified direct contact channel or public contact page is available.'],
+        ];
+        foreach($cases as [$context,$channel,$reason]){
+            self::assertSame(['recommended_channel'=>$channel,'recommended_channel_reason'=>$reason],$resolver->resolve($context));
+            self::assertTrue($resolver->isAvailable($channel==='manual_contact'?'phone':$channel,$context)||$channel==='none');
+        }
+        self::assertSame('email',$resolver->resolve([
+            ['channel'=>'contact_page','status'=>'publicly_listed'],['channel'=>'linkedin','status'=>'publicly_listed'],
+            ['channel'=>'email','status'=>'verified'],['channel'=>'whatsapp','status'=>'verified'],
+        ])['recommended_channel'],'Existing supported direct channels use stable priority before contact page.');
+        self::assertSame('contact_page',$resolver->resolve([
+            ['channel'=>'email','status'=>'unverified'],['channel'=>'whatsapp','status'=>'unavailable'],
+            ['channel'=>'linkedin','status'=>'pending'],['channel'=>'contact_page','status'=>'publicly_listed'],
+        ])['recommended_channel'],'Unverified methods cannot become available recommendations.');
     }
 
     public function test_generation_is_blocked_until_pursue_and_reviewer_selected_service(): void
@@ -454,9 +477,9 @@ final class OutreachDraftGenerationTest extends TestCase
     {
         [$tenant,$user,$company,,$finding]=$this->fixture('outreach-ebarza-repair');
         $finding=$this->makeEbarzaH1Finding($tenant->id,$company->id,$finding);
-        $rejected='This could significantly enhance SEO.';
+        $rejected='Ebarza has an issue that needs attention.';
         $provider=new SequencedAIProvider([
-            $this->ebarzaDraft($finding,$rejected),
+            $this->ebarzaDraft($finding,'A measured H1 opportunity.',emailBody:$rejected),
             $this->ebarzaDraft($finding,'Ebarza could benefit from reviewing the H1 heading structure on pages where no non-empty H1 was found. Website Performance Optimization is the selected service for this opportunity.'),
         ]);
         $this->bindSequencedProvider($tenant->id,$provider);
@@ -472,8 +495,8 @@ final class OutreachDraftGenerationTest extends TestCase
         self::assertSame($provider->requests[0]->tenantId,$provider->requests[1]->tenantId);
         self::assertSame($provider->requests[0]->correlationId,$provider->requests[1]->correlationId,
             'Both independently accounted provider calls remain associated with the same workflow correlation.');
-        self::assertStringContainsString('OUTREACH_GROUNDING_STRENGTH',$provider->requests[1]->systemInstruction);
-        self::assertStringContainsString('pitch_summary',$provider->requests[1]->systemInstruction);
+        self::assertStringContainsString('OUTREACH_GROUNDING_PROSPECT_CLAIM',$provider->requests[1]->systemInstruction);
+        self::assertStringContainsString('email.body',$provider->requests[1]->systemInstruction);
         self::assertStringNotContainsString($rejected,$provider->requests[1]->systemInstruction,
             'Rejected generated text must never be echoed into the repair request.');
         self::assertStringContainsString('significant, significantly, major, substantial, poor, slow, weak, broken, or lacking',$provider->requests[1]->systemInstruction);
@@ -497,7 +520,7 @@ final class OutreachDraftGenerationTest extends TestCase
         self::assertDatabaseCount('campaign_events',0);
         Log::shouldHaveReceived('notice')->once()->withArgs(function(string $message,array $context):bool {
             return $message==='Outreach draft grounding repair finished.'
-                && $context===['repair_attempted'=>true,'original_reason_code'=>'OUTREACH_GROUNDING_STRENGTH','original_field'=>'pitch_summary','final_outcome'=>'accepted'];
+                && $context===['repair_attempted'=>true,'original_reason_code'=>'OUTREACH_GROUNDING_PROSPECT_CLAIM','original_field'=>'email.body','final_outcome'=>'accepted'];
         });
         self::assertSame('Ebarza could benefit from reviewing the H1 heading structure on pages where no non-empty H1 was found. Website Performance Optimization is the selected service for this opportunity.',
             json_decode(DB::table('outreach_drafts')->where('tenant_id',$tenant->id)->value('draft_payload'),true)['pitch_summary']);
@@ -526,7 +549,7 @@ final class OutreachDraftGenerationTest extends TestCase
         $this->assertDatabaseCount('campaign_events',0);
     }
 
-    public function test_grounding_repair_still_rejects_unsupported_topics_and_channel_claims(): void
+    public function test_grounding_repair_still_rejects_unsupported_prospect_topics(): void
     {
         $badRepairs=[
             'Your site has speed problems.',
@@ -555,21 +578,6 @@ final class OutreachDraftGenerationTest extends TestCase
             self::assertDatabaseCount('campaign_events',0);
         }
 
-        [$tenant,$user,$company,,$finding]=$this->fixture('outreach-repair-rejects-channel-claim');
-        $finding=$this->makeEbarzaH1Finding($tenant->id,$company->id,$finding);
-        $provider=new SequencedAIProvider([
-            $this->ebarzaDraft($finding,'This could substantially enhance SEO.'),
-            $this->ebarzaDraft($finding,'A review of the H1 heading may be useful.', 'No verified email address or LinkedIn channel is available. The public contact page is available because Ebarza has poor mobile UX.'),
-        ]);
-        $this->bindSequencedProvider($tenant->id,$provider);
-        Sanctum::actingAs($user);
-        $this->withHeaders(['X-Tenant-ID'=>$tenant->id,'Idempotency-Key'=>'repair-reject-channel-claim'])
-            ->postJson('/api/v1/companies/'.$company->id.'/outreach-drafts',['finding_ids'=>[$finding]])->assertUnprocessable();
-        self::assertCount(2,$provider->requests);
-        self::assertSame(0,DB::table('outreach_drafts')->where('tenant_id',$tenant->id)->where('company_id',$company->id)->count());
-        $this->assertDatabaseCount('outbound_messages',0);
-        $this->assertDatabaseCount('campaign_recipients',0);
-        $this->assertDatabaseCount('campaign_events',0);
     }
 
     private function makeEbarzaH1Finding(string $tenantId,string $companyId,string $findingId):string
@@ -590,11 +598,11 @@ final class OutreachDraftGenerationTest extends TestCase
         return (string)$insightId;
     }
 
-    private function ebarzaDraft(string $findingId,string $pitchSummary,?string $channelReason=null):array
+    private function ebarzaDraft(string $findingId,string $pitchSummary,?string $channelReason=null,?string $emailBody=null):array
     {
         return ['pitch_summary'=>$pitchSummary,'recommended_channel'=>'contact_page',
             'recommended_channel_reason'=>$channelReason??'No verified direct channel is available; use the public contact page.',
-            'email'=>['subject'=>'A note on H1 headings','body'=>'We noticed an opportunity to review H1 heading usage on pages where no non-empty H1 heading was found.'],
+            'email'=>['subject'=>'A note on H1 headings','body'=>$emailBody??'We noticed an opportunity to review H1 heading usage on pages where no non-empty H1 heading was found.'],
             'whatsapp'=>'','linkedin'=>'','follow_up_email'=>'','follow_up_short'=>'',
             'evidence_used'=>[['finding_id'=>$findingId,'summary'=>'Improving the presence and content of H1 headings on pages could enhance SEO and user clarity.']]];
     }
