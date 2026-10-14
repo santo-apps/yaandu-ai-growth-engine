@@ -9,9 +9,11 @@ use App\Models\User;
 use App\Outreach\OutreachDraftGroundingValidator;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
 use Laravel\Sanctum\Sanctum;
 use Tests\Fakes\StaticAIProvider;
+use Tests\Fakes\SequencedAIProvider;
 use Tests\TestCase;
 
 final class OutreachDraftGenerationTest extends TestCase
@@ -446,6 +448,163 @@ final class OutreachDraftGenerationTest extends TestCase
         $this->assertDatabaseHas('agent_runs',['tenant_id'=>$tenant->id,'agent_key'=>'OutreachDraftAgent','status'=>'failed']);
         $this->assertDatabaseCount('outbound_messages',0);
         self::assertCount(1,$provider->requests);
+    }
+
+    public function test_ebarza_grounding_failure_is_repaired_once_with_same_selected_context_and_accounted_calls(): void
+    {
+        [$tenant,$user,$company,,$finding]=$this->fixture('outreach-ebarza-repair');
+        $finding=$this->makeEbarzaH1Finding($tenant->id,$company->id,$finding);
+        $rejected='This could significantly enhance SEO.';
+        $provider=new SequencedAIProvider([
+            $this->ebarzaDraft($finding,$rejected),
+            $this->ebarzaDraft($finding,'Ebarza could benefit from reviewing the H1 heading structure on pages where no non-empty H1 was found. Website Performance Optimization is the selected service for this opportunity.'),
+        ]);
+        $this->bindSequencedProvider($tenant->id,$provider);
+        Log::spy();
+        Sanctum::actingAs($user);
+
+        $response=$this->withHeaders(['X-Tenant-ID'=>$tenant->id,'Idempotency-Key'=>'ebarza-grounding-repair'])
+            ->postJson('/api/v1/companies/'.$company->id.'/outreach-drafts',['finding_ids'=>[$finding]])
+            ->assertCreated();
+
+        self::assertCount(2,$provider->requests);
+        self::assertSame($provider->requests[0]->evidence,$provider->requests[1]->evidence);
+        self::assertSame($provider->requests[0]->tenantId,$provider->requests[1]->tenantId);
+        self::assertSame($provider->requests[0]->correlationId,$provider->requests[1]->correlationId,
+            'Both independently accounted provider calls remain associated with the same workflow correlation.');
+        self::assertStringContainsString('OUTREACH_GROUNDING_STRENGTH',$provider->requests[1]->systemInstruction);
+        self::assertStringContainsString('pitch_summary',$provider->requests[1]->systemInstruction);
+        self::assertStringNotContainsString($rejected,$provider->requests[1]->systemInstruction,
+            'Rejected generated text must never be echoed into the repair request.');
+        self::assertStringContainsString('significant, significantly, major, substantial, poor, slow, weak, broken, or lacking',$provider->requests[1]->systemInstruction);
+        self::assertSame($provider->requests[0]->outputSchema,$provider->requests[1]->outputSchema);
+        self::assertSame(1800,$provider->requests[1]->maxOutputTokens);
+        self::assertSame(0.3,$provider->requests[1]->temperature);
+        self::assertSame(1,DB::table('outreach_drafts')->where('tenant_id',$tenant->id)->where('company_id',$company->id)->count());
+        self::assertSame(2,DB::table('ai_usage_records')->where('tenant_id',$tenant->id)->where('task_key','outreach_drafting')->count());
+        self::assertSame(2,DB::table('ai_usage_records')->where('tenant_id',$tenant->id)->where('task_key','outreach_drafting')->where('status','COMPLETED')->count());
+        $usageRows=DB::table('ai_usage_records')->where('tenant_id',$tenant->id)->where('task_key','outreach_drafting')->orderBy('created_at')->get();
+        self::assertCount(2,$usageRows);
+        self::assertCount(2,$usageRows->pluck('idempotency_key')->unique(),'Each model call receives its own usage/idempotency record.');
+        self::assertCount(1,$usageRows->pluck('correlation_id')->unique(),'Both calls remain correlated with the same agent workflow.');
+        self::assertSame([1349,1349],$usageRows->pluck('input_tokens')->map(fn($tokens)=>(int)$tokens)->all());
+        self::assertSame([352,352],$usageRows->pluck('output_tokens')->map(fn($tokens)=>(int)$tokens)->all());
+        self::assertSame(0,(int)DB::table('ai_usage_records')->where('tenant_id',$tenant->id)->where('task_key','outreach_drafting')->sum('reserved_tokens'));
+        self::assertSame(2698,(int)DB::table('ai_usage_records')->where('tenant_id',$tenant->id)->where('task_key','outreach_drafting')->sum('input_tokens'));
+        self::assertSame(704,(int)DB::table('ai_usage_records')->where('tenant_id',$tenant->id)->where('task_key','outreach_drafting')->sum('output_tokens'));
+        self::assertDatabaseCount('outbound_messages',0);
+        self::assertDatabaseCount('campaign_recipients',0);
+        self::assertDatabaseCount('campaign_events',0);
+        Log::shouldHaveReceived('notice')->once()->withArgs(function(string $message,array $context):bool {
+            return $message==='Outreach draft grounding repair finished.'
+                && $context===['repair_attempted'=>true,'original_reason_code'=>'OUTREACH_GROUNDING_STRENGTH','original_field'=>'pitch_summary','final_outcome'=>'accepted'];
+        });
+        self::assertSame('Ebarza could benefit from reviewing the H1 heading structure on pages where no non-empty H1 was found. Website Performance Optimization is the selected service for this opportunity.',
+            json_decode(DB::table('outreach_drafts')->where('tenant_id',$tenant->id)->value('draft_payload'),true)['pitch_summary']);
+        self::assertSame(201,$response->status());
+    }
+
+    public function test_second_grounding_failure_fails_safely_without_persisting_a_draft(): void
+    {
+        [$tenant,$user,$company,,$finding]=$this->fixture('outreach-ebarza-repair-fails');
+        $finding=$this->makeEbarzaH1Finding($tenant->id,$company->id,$finding);
+        $provider=new SequencedAIProvider([
+            $this->ebarzaDraft($finding,'This could significantly enhance SEO.'),
+            $this->ebarzaDraft($finding,'This could substantially enhance SEO.'),
+        ]);
+        $this->bindSequencedProvider($tenant->id,$provider);
+        Sanctum::actingAs($user);
+
+        $this->withHeaders(['X-Tenant-ID'=>$tenant->id,'Idempotency-Key'=>'ebarza-grounding-repair-fails'])
+            ->postJson('/api/v1/companies/'.$company->id.'/outreach-drafts',['finding_ids'=>[$finding]])->assertUnprocessable();
+
+        self::assertCount(2,$provider->requests,'Grounding repair is bounded to one attempt.');
+        self::assertDatabaseCount('outreach_drafts',0);
+        self::assertSame(2,DB::table('ai_usage_records')->where('tenant_id',$tenant->id)->where('task_key','outreach_drafting')->where('status','COMPLETED')->count());
+        $this->assertDatabaseCount('outbound_messages',0);
+        $this->assertDatabaseCount('campaign_recipients',0);
+        $this->assertDatabaseCount('campaign_events',0);
+    }
+
+    public function test_grounding_repair_still_rejects_unsupported_topics_and_channel_claims(): void
+    {
+        $badRepairs=[
+            'Your site has speed problems.',
+            'Your website has responsiveness problems.',
+            'Your site has poor mobile UX.',
+            'Ebarza has performance problems.',
+            'This could significantly enhance SEO.',
+        ];
+
+        foreach($badRepairs as $index=>$badPitch){
+            [$tenant,$user,$company,,$finding]=$this->fixture('outreach-repair-rejected-'.$index);
+            $finding=$this->makeEbarzaH1Finding($tenant->id,$company->id,$finding);
+            $provider=new SequencedAIProvider([
+                $this->ebarzaDraft($finding,'This could substantially enhance SEO.'),
+                $this->ebarzaDraft($finding,$badPitch),
+            ]);
+            $this->bindSequencedProvider($tenant->id,$provider);
+            Sanctum::actingAs($user);
+            $repairResponse=$this->withHeaders(['X-Tenant-ID'=>$tenant->id,'Idempotency-Key'=>'repair-reject-'.$index])
+                ->postJson('/api/v1/companies/'.$company->id.'/outreach-drafts',['finding_ids'=>[$finding]]);
+            self::assertSame(422,$repairResponse->status(),'Unexpected repair acceptance for test case: '.$badPitch.'; '.$repairResponse->getContent());
+            self::assertCount(2,$provider->requests);
+            self::assertSame(0,DB::table('outreach_drafts')->where('tenant_id',$tenant->id)->where('company_id',$company->id)->count());
+            self::assertDatabaseCount('outbound_messages',0);
+            self::assertDatabaseCount('campaign_recipients',0);
+            self::assertDatabaseCount('campaign_events',0);
+        }
+
+        [$tenant,$user,$company,,$finding]=$this->fixture('outreach-repair-rejects-channel-claim');
+        $finding=$this->makeEbarzaH1Finding($tenant->id,$company->id,$finding);
+        $provider=new SequencedAIProvider([
+            $this->ebarzaDraft($finding,'This could substantially enhance SEO.'),
+            $this->ebarzaDraft($finding,'A review of the H1 heading may be useful.', 'No verified email address or LinkedIn channel is available. The public contact page is available because Ebarza has poor mobile UX.'),
+        ]);
+        $this->bindSequencedProvider($tenant->id,$provider);
+        Sanctum::actingAs($user);
+        $this->withHeaders(['X-Tenant-ID'=>$tenant->id,'Idempotency-Key'=>'repair-reject-channel-claim'])
+            ->postJson('/api/v1/companies/'.$company->id.'/outreach-drafts',['finding_ids'=>[$finding]])->assertUnprocessable();
+        self::assertCount(2,$provider->requests);
+        self::assertSame(0,DB::table('outreach_drafts')->where('tenant_id',$tenant->id)->where('company_id',$company->id)->count());
+        $this->assertDatabaseCount('outbound_messages',0);
+        $this->assertDatabaseCount('campaign_recipients',0);
+        $this->assertDatabaseCount('campaign_events',0);
+    }
+
+    private function makeEbarzaH1Finding(string $tenantId,string $companyId,string $findingId):string
+    {
+        DB::table('companies')->where('tenant_id',$tenantId)->where('id',$companyId)->update(['name'=>'Ebarza']);
+        $insightId=DB::table('lead_evidence')->where('tenant_id',$tenantId)->where('id',$findingId)->value('lead_insight_id');
+        DB::table('lead_insights')->where('tenant_id',$tenantId)->where('id',$insightId)->update([
+            'kind'=>'opportunity',
+            'statement'=>'Improving the presence and content of H1 headings on pages could enhance SEO and user clarity.',
+        ]);
+        DB::table('lead_evidence')->where('tenant_id',$tenantId)->where('id',$findingId)->update([
+            'excerpt'=>'No non-empty H1 heading was found.',
+        ]);
+        DB::table('lead_scores')->where('tenant_id',$tenantId)->where('company_id',$companyId)->update(['components'=>json_encode([
+            'strong_business_fit'=>['status'=>'POSITIVE','evidence_reference'=>['source'=>'business_insight','id'=>$insightId]],
+        ])]);
+
+        return (string)$insightId;
+    }
+
+    private function ebarzaDraft(string $findingId,string $pitchSummary,?string $channelReason=null):array
+    {
+        return ['pitch_summary'=>$pitchSummary,'recommended_channel'=>'contact_page',
+            'recommended_channel_reason'=>$channelReason??'No verified direct channel is available; use the public contact page.',
+            'email'=>['subject'=>'A note on H1 headings','body'=>'We noticed an opportunity to review H1 heading usage on pages where no non-empty H1 heading was found.'],
+            'whatsapp'=>'','linkedin'=>'','follow_up_email'=>'','follow_up_short'=>'',
+            'evidence_used'=>[['finding_id'=>$findingId,'summary'=>'Improving the presence and content of H1 headings on pages could enhance SEO and user clarity.']]];
+    }
+
+    private function bindSequencedProvider(string $tenantId,SequencedAIProvider $provider):void
+    {
+        DB::table('ai_model_configurations')->insert(['id'=>(string)Str::uuid(),'tenant_id'=>$tenantId,'task_key'=>'outreach_drafting','provider'=>'conversation-test','model'=>'synthetic-test-model','enabled'=>true,
+            'parameters'=>json_encode(['max_output_tokens'=>1800]),'version'=>1,'created_at'=>now(),'updated_at'=>now()]);
+        config(['ai.providers.conversation-test.key'=>'synthetic-test-key']);
+        $this->app->instance(AIModelRouter::class,new AIModelRouter([$provider],['outreach_drafting'=>['provider'=>'conversation-test','model'=>'synthetic-test-model']]));
     }
 
     private function fixture(string $slug): array
