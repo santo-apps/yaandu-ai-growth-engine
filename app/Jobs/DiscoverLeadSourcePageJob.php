@@ -67,17 +67,21 @@ final class DiscoverLeadSourcePageJob implements ShouldQueue, ShouldBeUniqueUnti
             $this->stopRun($campaign, $run, $checkpoint, 'CAMPAIGN_LIMIT_REACHED'); return;
         }
 
-        $isOsm = (string) $source->source_key === 'osm_overpass';
+        $pacingInterval = match ((string) $source->source_key) {
+            'osm_overpass' => max(1, (int) config('lead_discovery.osm_min_request_interval_seconds', 5)),
+            'wikidata' => max(1, (int) config('lead_discovery.wikidata_min_request_interval_seconds', 5)),
+            default => null,
+        };
         $rateKey = 'lead-discovery-provider:'.(string) $source->source_key;
         $capability = $registry->get((string) $source->source_key)->capabilities();
-        if ($isOsm && RateLimiter::tooManyAttempts($rateKey, 1)) {
+        if ($pacingInterval !== null && RateLimiter::tooManyAttempts($rateKey, 1)) {
             // Local pacing is not a provider failure. Reschedule a fresh queued
             // execution so it does not consume the current job's retry budget.
             self::dispatch($this->tenantId, $this->checkpointId)
                 ->delay(now()->addSeconds(max(1, RateLimiter::availableIn($rateKey))));
             return;
         }
-        if (! $isOsm && RateLimiter::tooManyAttempts($rateKey, max(1, min((int) config('lead_discovery.live_rate_per_minute'), $capability->defaultRateLimit ?: (int) config('lead_discovery.live_rate_per_minute'))))) {
+        if ($pacingInterval === null && RateLimiter::tooManyAttempts($rateKey, max(1, min((int) config('lead_discovery.live_rate_per_minute'), $capability->defaultRateLimit ?: (int) config('lead_discovery.live_rate_per_minute'))))) {
             DB::table('lead_discovery_checkpoints')->where('tenant_id', $this->tenantId)->where('id', $checkpoint->id)->increment('attempts');
             $freshCheckpoint = DB::table('lead_discovery_checkpoints')->where('tenant_id', $this->tenantId)->where('id', $checkpoint->id)->first();
             if ((int) $freshCheckpoint->attempts >= 3) { $this->fail($checkpoint, $run, $source, 'SOURCE_RATE_LIMITED'); return; }
@@ -108,7 +112,7 @@ final class DiscoverLeadSourcePageJob implements ShouldQueue, ShouldBeUniqueUnti
             return;
         }
         if ($claimed !== 'claimed') return;
-        RateLimiter::hit($rateKey, $isOsm ? max(1, (int) config('lead_discovery.osm_min_request_interval_seconds', 5)) : 60);
+        RateLimiter::hit($rateKey, $pacingInterval ?? 60);
         DB::table('audit_logs')->insert(['id' => (string) Str::uuid(), 'tenant_id' => $this->tenantId, 'actor_user_id' => null,
             'action' => 'lead_discovery.source_requested', 'subject_type' => 'lead_discovery', 'subject_id' => $checkpoint->id,
             'metadata' => json_encode(['campaign_id' => $campaign->id, 'run_id' => $run->id, 'source_id' => $source->id, 'query_key' => $checkpoint->query_key]), 'created_at' => now()]);
@@ -157,14 +161,18 @@ final class DiscoverLeadSourcePageJob implements ShouldQueue, ShouldBeUniqueUnti
             DB::table('lead_discovery_sources')->where('tenant_id', $this->tenantId)->where('id', $source->id)->update([
                 'health_state' => 'ready', 'last_success_at' => now(), 'last_error_code' => null, 'updated_at' => now(),
             ]);
+            $providerAuditData = (string) $source->source_key === 'wikidata' ? array_intersect_key($page->providerMetadata, array_flip([
+                'query_key', 'industry_key', 'country_code', 'result_count', 'logical_request_count', 'query_sha256', 'stage_count',
+            ])) : [];
             Log::info('Lead discovery source page staged.', ['operation' => 'lead_discovery_source_page_completed', 'tenant_id' => $this->tenantId,
                 'campaign_id' => $campaign->id, 'run_id' => $run->id, 'source_id' => $source->id, 'query_key' => $checkpoint->query_key,
-                'request_count' => 1, 'candidate_count' => $created, 'duplicate_count' => $duplicates]);
+                'request_count' => 1, 'candidate_count' => $created, 'duplicate_count' => $duplicates, ...$providerAuditData]);
             DB::table('audit_logs')->insert(['id' => (string) Str::uuid(), 'tenant_id' => $this->tenantId, 'actor_user_id' => null,
                 'action' => 'lead_discovery.source_page_completed', 'subject_type' => 'lead_discovery', 'subject_id' => $checkpoint->id,
                 'metadata' => json_encode(['campaign_id' => $campaign->id, 'run_id' => $run->id, 'source_id' => $source->id, 'query_key' => $checkpoint->query_key,
                     'request_count' => 1, 'candidate_count' => $created, 'duplicate_count' => $duplicates,
-                    'endpoint_name' => data_get($page->providerMetadata, 'endpoint_name'), 'endpoint_url' => data_get($page->providerMetadata, 'endpoint_url')]), 'created_at' => now()]);
+                    'endpoint_name' => data_get($page->providerMetadata, 'endpoint_name'), 'endpoint_url' => data_get($page->providerMetadata, 'endpoint_url'),
+                    ...$providerAuditData]), 'created_at' => now()]);
             $freshRun = DB::table('lead_discovery_runs')->where('tenant_id', $this->tenantId)->where('id', $run->id)->first();
             $campaignCandidateCount = (int) DB::table('lead_discovery_candidates')->where('tenant_id', $this->tenantId)->where('campaign_id', $campaign->id)->count();
             if (! $page->exhausted && $freshCampaign->status !== 'paused' && $campaignCandidateCount < $limits['candidates'] && $this->withinLimits($campaign, $freshRun)) self::dispatch($this->tenantId, $this->checkpointId)->delay(now()->addSeconds(2));

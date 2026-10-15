@@ -44,6 +44,17 @@ return [
     ],
     'mca_resource_id' => env('DATA_GOV_IN_MCA_RESOURCE_ID', ''),
     'wikidata_user_agent' => env('WIKIDATA_USER_AGENT', ''),
+    'wikidata_result_count' => min(10, max(1, (int) env('LEAD_DISCOVERY_WIKIDATA_RESULT_COUNT', 10))),
+    'wikidata_min_request_interval_seconds' => max(1, (int) env('LEAD_DISCOVERY_WIKIDATA_MIN_REQUEST_INTERVAL_SECONDS', 5)),
+    'wikidata_max_pages' => 5,
+    'wikidata_industries' => [
+        'ecommerce_retail' => [
+            'industry' => [
+                'Q484847' => 'e-commerce',
+                'Q126793' => 'retail',
+            ],
+        ],
+    ],
     'countries' => require __DIR__.'/lead_discovery_countries.php',
     'osm_partitions' => [
         ['key' => 'IN:TN:Chennai', 'country_code' => 'IN', 'region' => 'Tamil Nadu', 'city' => 'Chennai', 'bbox' => [12.90, 80.10, 13.20, 80.40]],

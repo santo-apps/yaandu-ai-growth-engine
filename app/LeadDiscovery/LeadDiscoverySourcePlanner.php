@@ -25,7 +25,15 @@ final class LeadDiscoverySourcePlanner
                 || ! in_array($capability->governanceClass, ['OPEN_PERSISTABLE', 'CONDITIONAL'], true)) continue;
             $campaignConfiguration = $campaignSettings;
             $keywords = trim((string) data_get($campaignConfiguration, 'keywords', ''));
-            if ($industry === '') {
+            if ($source->source_key === 'wikidata') {
+                $wikidataMappings = (array) config('lead_discovery.wikidata_industries', []);
+                $mappedKeys = $industryKey !== null && isset($wikidataMappings[$industryKey]['industry'])
+                    ? [$industryKey]
+                    : ($industry === '' ? array_keys($wikidataMappings) : []);
+                $sourceQueries = array_map(static fn (string $key): array => [
+                    'key' => 'industry-'.$key, 'query' => '', 'industry_key' => $key,
+                ], $mappedKeys);
+            } elseif ($industry === '') {
                 $sourceQueries = $capability->supportsIndustryFilter
                     ? $queries
                     : [['key' => 'all-organizations', 'query' => $capability->supportsKeywordFilter ? $keywords : '', 'industry_key' => null]];

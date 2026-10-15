@@ -55,6 +55,13 @@ final class StartLeadDiscoveryCampaignJob implements ShouldQueue
                 $adapter = $registry->get((string) $source->source_key);
                 if (! $adapter instanceof \App\LeadDiscovery\SearchLeadSourceAdapterInterface || ! $adapter->capabilities()->supportsLiveQuery) continue;
                 if ($adapter->capabilities()->governanceClass === 'CONDITIONAL' && ! in_array($source->id, $sourceIds, true)) continue;
+                if ($adapter instanceof \App\LeadDiscovery\WikidataLeadSourceAdapter && ! empty($campaign->industry)
+                    && ! $adapter->supportsIndustryKey($campaign->normalized_industry_key ?? app(\App\LeadDiscovery\LeadDiscoveryIndustryTaxonomy::class)->keyFor((string) $campaign->industry))) {
+                    DB::table('lead_discovery_sources')->where('tenant_id', $this->tenantId)->where('id', $source->id)->update([
+                        'health_state' => 'not_configured', 'last_error_code' => 'SOURCE_QUERY_UNSUPPORTED', 'updated_at' => now(),
+                    ]);
+                    continue;
+                }
                 $adapter->validateConfiguration([...$configuration,
                     'source_enabled' => (bool) $source->enabled, 'authorization_status' => $source->authorization_status,
                     'storage_rights_status' => $source->storage_rights_status]);
