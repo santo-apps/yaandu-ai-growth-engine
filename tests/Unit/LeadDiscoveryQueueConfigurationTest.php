@@ -16,13 +16,12 @@ class LeadDiscoveryQueueConfigurationTest extends TestCase
         self::assertSame(3, config('horizon.environments.local.supervisor-lead-discovery.tries'));
     }
 
-    public function test_live_worker_concurrency_is_configurable_within_the_safe_one_to_two_cap(): void
+    public function test_live_discovery_worker_concurrency_is_serialized_for_provider_pacing(): void
     {
-        $configuredConcurrency = (int) config('lead_discovery.live_worker_concurrency');
-
-        self::assertGreaterThanOrEqual(1, $configuredConcurrency);
-        self::assertLessThanOrEqual(2, $configuredConcurrency);
-        self::assertSame($configuredConcurrency, config('horizon.environments.production.supervisor-lead-discovery.processes'));
-        self::assertSame($configuredConcurrency, config('horizon.environments.local.supervisor-lead-discovery.processes'));
+        self::assertSame(1, config('horizon.environments.production.supervisor-lead-discovery.processes'));
+        self::assertSame(1, config('horizon.environments.local.supervisor-lead-discovery.processes'));
+        self::assertSame(45, config('horizon.environments.production.supervisor-lead-discovery.timeout'));
+        self::assertSame(45, (new DiscoverLeadSourcePageJob('tenant-id', 'checkpoint-id'))->timeout);
+        self::assertSame(5, config('lead_discovery.osm_min_request_interval_seconds'));
     }
 }
