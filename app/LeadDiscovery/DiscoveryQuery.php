@@ -15,5 +15,7 @@ final readonly class DiscoveryQuery
         public string $keywords,
         public int $limit,
         public ?string $cursor = null,
+        public array $partition = [],
+        public ?string $industryKey = null,
     ) {}
 }

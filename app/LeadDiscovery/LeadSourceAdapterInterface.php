@@ -6,6 +6,8 @@ interface LeadSourceAdapterInterface
 {
     public function key(): string;
 
+    public function capabilities(): LeadSourceCapabilities;
+
     public function validateConfiguration(array $configuration): void;
 
     /** @return list<array<string, mixed>> */

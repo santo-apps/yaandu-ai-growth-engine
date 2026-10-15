@@ -61,40 +61,58 @@ final class DiscoverLeadSourcePageJob implements ShouldQueue, ShouldBeUniqueUnti
             $this->stopRun($campaign, $run, $checkpoint, 'CAMPAIGN_LIMIT_REACHED'); return;
         }
         $limits = $this->limits($campaign);
-        if ((int) $run->source_requests >= $limits['requests'] || (int) $run->raw_candidates >= $limits['raw']
+        if ((int) $run->source_requests >= $limits['requests'] || $this->campaignRequestCount($campaign) >= $limits['campaign_requests']
+            || (int) $run->raw_candidates >= $limits['raw']
             || (int) $run->eligible_candidates >= (int) $campaign->target_leads || (int) $run->source_errors >= (int) config('lead_discovery.live_max_failures')) {
             $this->stopRun($campaign, $run, $checkpoint, 'CAMPAIGN_LIMIT_REACHED'); return;
         }
 
-        $rateKey = 'lead-discovery-provider:brave_search';
-        if (RateLimiter::tooManyAttempts($rateKey, max(1, (int) config('lead_discovery.live_rate_per_minute')))) {
+        $rateKey = 'lead-discovery-provider:'.(string) $source->source_key;
+        $capability = $registry->get((string) $source->source_key)->capabilities();
+        if (RateLimiter::tooManyAttempts($rateKey, max(1, min((int) config('lead_discovery.live_rate_per_minute'), $capability->defaultRateLimit ?: (int) config('lead_discovery.live_rate_per_minute'))))) {
             DB::table('lead_discovery_checkpoints')->where('tenant_id', $this->tenantId)->where('id', $checkpoint->id)->increment('attempts');
             $freshCheckpoint = DB::table('lead_discovery_checkpoints')->where('tenant_id', $this->tenantId)->where('id', $checkpoint->id)->first();
             if ((int) $freshCheckpoint->attempts >= 3) { $this->fail($checkpoint, $run, $source, 'SOURCE_RATE_LIMITED'); return; }
             $this->release(3); return;
         }
-        $claimed = DB::transaction(function () use ($checkpoint): bool {
+        $claimed = DB::transaction(function () use ($checkpoint, $campaign, $run, $limits): string {
+            DB::table('lead_discovery_campaigns')->where('tenant_id', $this->tenantId)->where('id', $campaign->id)->lockForUpdate()->first();
             $fresh = DB::table('lead_discovery_checkpoints')->where('tenant_id', $this->tenantId)->where('id', $checkpoint->id)->lockForUpdate()->first();
-            if (! $fresh || in_array($fresh->status, ['completed', 'failed', 'stopped'], true)) return false;
-            if ($fresh->status === 'running' && $this->attempts() <= 1) return false;
-            if (! in_array($fresh->status, ['queued', 'running'], true)) return false;
+            if (! $fresh || in_array($fresh->status, ['completed', 'failed', 'stopped'], true)) return 'skip';
+            if ($fresh->status === 'running' && $this->attempts() <= 1) return 'skip';
+            if (! in_array($fresh->status, ['queued', 'running'], true)) return 'skip';
+            $campaignRequests = (int) DB::table('lead_discovery_runs')->where('tenant_id', $this->tenantId)->where('campaign_id', $campaign->id)->sum('source_requests');
+            if ($campaignRequests >= $limits['campaign_requests']) {
+                DB::table('lead_discovery_checkpoints')->where('tenant_id', $this->tenantId)->where('id', $fresh->id)
+                    ->update(['status' => 'stopped', 'error_code' => 'CAMPAIGN_PROVIDER_REQUEST_LIMIT', 'completed_at' => now(), 'updated_at' => now()]);
+                return 'limit';
+            }
             DB::table('lead_discovery_checkpoints')->where('tenant_id', $this->tenantId)->where('id', $fresh->id)->update([
                 'status' => 'running', 'attempts' => DB::raw('attempts + 1'), 'last_requested_at' => now(), 'updated_at' => now(),
             ]);
-            return true;
+            DB::table('lead_discovery_runs')->where('tenant_id', $this->tenantId)->where('id', $run->id)->increment('source_requests');
+            return 'claimed';
         });
-        if (! $claimed) return;
+        if ($claimed === 'limit') {
+            $freshCampaign = DB::table('lead_discovery_campaigns')->where('tenant_id', $this->tenantId)->where('id', $campaign->id)->first();
+            $freshRun = DB::table('lead_discovery_runs')->where('tenant_id', $this->tenantId)->where('id', $run->id)->first();
+            $this->finishIfDone($freshCampaign, $freshRun);
+            return;
+        }
+        if ($claimed !== 'claimed') return;
         RateLimiter::hit($rateKey, 60);
-        DB::table('lead_discovery_runs')->where('tenant_id', $this->tenantId)->where('id', $run->id)->increment('source_requests');
         DB::table('audit_logs')->insert(['id' => (string) Str::uuid(), 'tenant_id' => $this->tenantId, 'actor_user_id' => null,
             'action' => 'lead_discovery.source_requested', 'subject_type' => 'lead_discovery', 'subject_id' => $checkpoint->id,
             'metadata' => json_encode(['campaign_id' => $campaign->id, 'run_id' => $run->id, 'source_id' => $source->id, 'query_key' => $checkpoint->query_key]), 'created_at' => now()]);
 
         try {
             $page = $adapter->search(new DiscoveryQuery(
-                (string) $campaign->id, $this->tenantId, (string) $campaign->industry, (string) $campaign->country_code,
+                (string) $campaign->id, $this->tenantId, (string) ($campaign->industry ?? ''), (string) ($checkpoint->country_code ?? $campaign->country_code ?? ''),
                 $campaign->region, $campaign->city, (string) $checkpoint->query_key, (string) $checkpoint->query_text,
-                (int) config('lead_discovery.live_result_count', 10), $checkpoint->cursor,
+                min((int) config('lead_discovery.live_result_count', 10), (int) $limits['raw']), $checkpoint->cursor,
+                ['key' => $checkpoint->partition_key ?? '', 'country_code' => $checkpoint->country_code ?? null, 'region' => $checkpoint->region ?? null,
+                    'city' => $checkpoint->city ?? null, 'bbox' => $checkpoint->bbox ? json_decode((string) $checkpoint->bbox, true) : null],
+                $checkpoint->industry_key ?? null,
             ), $executionConfiguration);
             $freshCampaign = DB::table('lead_discovery_campaigns')->where('tenant_id', $this->tenantId)->where('id', $campaign->id)->first();
             if (! $freshCampaign || $freshCampaign->status === 'cancelled') {
@@ -112,7 +130,7 @@ final class DiscoverLeadSourcePageJob implements ShouldQueue, ShouldBeUniqueUnti
                     [...$candidate, '_request_id' => $page->providerRequestId], $index + 1 + ((int) $checkpoint->pages_completed * (int) config('lead_discovery.live_result_count', 10))));
                 if ($result['created']) {
                     $created++;
-                    VerifyLeadDiscoveryCandidateJob::dispatch($this->tenantId, (string) $result['verification_id'])->afterCommit();
+                    if ($result['verification_id']) VerifyLeadDiscoveryCandidateJob::dispatch($this->tenantId, (string) $result['verification_id'])->afterCommit();
                 }
                 if ($result['duplicate']) $duplicates++;
             }
@@ -156,6 +174,7 @@ final class DiscoverLeadSourcePageJob implements ShouldQueue, ShouldBeUniqueUnti
         $config = json_decode((string) $campaign->configuration, true) ?: [];
         return [
             'requests' => min((int) config('lead_discovery.live_max_source_requests'), (int) data_get($config, 'limits.source_requests', config('lead_discovery.live_max_source_requests'))),
+            'campaign_requests' => min((int) config('lead_discovery.live_max_provider_requests', 50), (int) data_get($config, 'limits.provider_requests', config('lead_discovery.live_max_provider_requests', 50)), (int) data_get($config, 'limits.source_requests', config('lead_discovery.live_max_source_requests'))),
             'raw' => min((int) config('lead_discovery.live_max_raw_candidates'), (int) data_get($config, 'limits.raw_candidates', config('lead_discovery.live_max_raw_candidates'))),
             'candidates' => min((int) config('lead_discovery.live_max_raw_candidates'), (int) data_get($config, 'limits.candidates', config('lead_discovery.max_candidates_per_run'))),
             'processing' => min((int) config('lead_discovery.live_max_raw_candidates'), (int) data_get($config, 'limits.processing', config('lead_discovery.max_candidate_processing'))),
@@ -165,8 +184,13 @@ final class DiscoverLeadSourcePageJob implements ShouldQueue, ShouldBeUniqueUnti
     private function withinLimits(object $campaign, object $run): bool
     {
         $limits = $this->limits($campaign);
-        return (int) $run->source_requests < $limits['requests'] && (int) $run->raw_candidates < $limits['raw']
+        return (int) $run->source_requests < $limits['requests'] && $this->campaignRequestCount($campaign) < $limits['campaign_requests'] && (int) $run->raw_candidates < $limits['raw']
             && now()->diffInSeconds($run->started_at) < (int) config('lead_discovery.live_max_runtime_seconds');
+    }
+
+    private function campaignRequestCount(object $campaign): int
+    {
+        return (int) DB::table('lead_discovery_runs')->where('tenant_id', $this->tenantId)->where('campaign_id', $campaign->id)->sum('source_requests');
     }
 
     private function fail(object $checkpoint, object $run, object $source, string $code): void

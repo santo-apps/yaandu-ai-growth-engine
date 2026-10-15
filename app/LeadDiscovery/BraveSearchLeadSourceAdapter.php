@@ -10,6 +10,14 @@ final class BraveSearchLeadSourceAdapter implements SearchLeadSourceAdapterInter
 {
     public function key(): string { return 'brave_search'; }
 
+    public function capabilities(): LeadSourceCapabilities
+    {
+        return new LeadSourceCapabilities('brave_search', 'conditional_search_api', true, false, true, false, true, true, true, true, true,
+            false, [], ['company_name', 'website'], true, true, true, false, 'Brave Search API agreement',
+            'https://api-dashboard.search.brave.com/documentation/resources/terms-of-service', null, 30, 'bounded_query', 'CONDITIONAL',
+            'Persistent result storage requires explicit agreement rights; disabled by default.');
+    }
+
     public function validateConfiguration(array $configuration): void
     {
         if (! config('lead_discovery.live_enabled')) throw new LiveLeadSourceException('SOURCE_DISABLED', 'Live discovery is disabled by application configuration.');
