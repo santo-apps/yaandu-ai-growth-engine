@@ -50,16 +50,209 @@ class LeadDiscoveryPhaseTwoBTest extends TestCase
     public function test_wikidata_uses_bounded_country_sparql_and_maps_qid_and_cc0(): void
     {
         Http::fake(['query.wikidata.org/*' => Http::response(['results' => ['bindings' => [[
-            'item' => ['value' => 'https://www.wikidata.org/entity/Q123'], 'itemLabel' => ['value' => 'Synthetic Company'],
-            'website' => ['value' => 'https://company.example'], 'industryLabel' => ['value' => 'Healthcare'], 'cityLabel' => ['value' => 'Dubai'],
+            'item' => ['value' => 'https://www.wikidata.org/entity/Q123'], 'label' => ['value' => 'Synthetic Company'],
+            'country' => ['value' => 'https://www.wikidata.org/entity/Q902'],
+            'industry' => ['value' => 'https://www.wikidata.org/entity/Q484847'],
+            'website' => ['value' => 'https://company.example'],
+            'headquarters' => ['value' => 'https://www.wikidata.org/entity/Q1353'],
+            'headquartersLabel' => ['value' => 'Dubai'],
         ]]]], 200)]);
-        $query = new DiscoveryQuery('campaign', 'tenant', '', 'AE', null, null, 'all', '', 10, null, ['country_code' => 'AE']);
+        $query = new DiscoveryQuery('campaign', 'tenant', 'E-commerce & Retail', 'AE', 'Dubai', 'Dubai', 'industry-ecommerce_retail', '', 10, null,
+            ['country_code' => 'AE'], 'ecommerce_retail');
         $page = app(WikidataLeadSourceAdapter::class)->search($query, $this->approvedSource());
         self::assertSame('Q123', $page->candidates[0]['wikidata_qid']);
+        self::assertSame('E-commerce & Retail', $page->candidates[0]['industry']);
+        self::assertSame('e-commerce', $page->candidates[0]['source_industry']);
+        self::assertSame('Dubai', $page->candidates[0]['city'], 'City comes only from direct P159 headquarters evidence.');
+        self::assertSame('https://www.wikidata.org/entity/Q1353', $page->candidates[0]['raw_metadata']['binding']['headquarters']['value']);
+        self::assertSame('https://www.wikidata.org/wiki/Q123', $page->candidates[0]['source_url']);
         self::assertSame('CC0 1.0', $page->candidates[0]['attribution']['license_name']);
+        self::assertSame(2, $page->providerMetadata['stage_count']);
+        self::assertSame(1, $page->providerMetadata['logical_request_count']);
         self::assertTrue($page->exhausted);
-        Http::assertSent(fn ($request) => $request->method() === 'GET' && str_contains((string) $request['query'], 'wdt:P297 "AE"')
-            && str_contains((string) $request['query'], 'LIMIT 10') && str_contains((string) $request['query'], 'OFFSET 0'));
+        Http::assertSent(function ($request): bool {
+            $sparql = (string) $request['query'];
+            return $request->method() === 'GET' && str_contains($sparql, 'wdt:P297 "AE"')
+                && str_contains($sparql, 'wdt:P452 ?industry') && str_contains($sparql, 'VALUES ?industry { wd:Q484847 wd:Q126793 }')
+                && str_contains($sparql, 'LIMIT 10') && ! str_contains($sparql, 'P31/P279')
+                && ! str_contains($sparql, 'SERVICE wikibase:label') && ! str_contains(strtoupper($sparql), 'ORDER BY');
+        });
+    }
+
+    public function test_wikidata_accepts_only_http_or_https_trusted_entity_uris_and_canonicalizes_provenance(): void
+    {
+        $binding = static fn (string $item, string $headquarters = 'http://www.wikidata.org/entity/Q1353'): array => [
+            'item' => ['value' => $item], 'label' => ['value' => 'Synthetic Retailer'],
+            'country' => ['value' => 'https://www.wikidata.org/entity/Q668'],
+            'industry' => ['value' => 'https://www.wikidata.org/entity/Q484847'],
+            'website' => ['value' => 'https://retailer.example'],
+            'headquarters' => ['value' => $headquarters], 'headquartersLabel' => ['value' => 'Dubai'],
+        ];
+        $bindings = [
+            $binding('http://www.wikidata.org/entity/Q122575'),
+            $binding('https://www.wikidata.org/entity/Q122575', 'https://www.wikidata.org/entity/Q1353'),
+            $binding('http://www.wikidata.org.evil.com/entity/Q122575'),
+            $binding('https://wikidata.org/entity/Q122575'),
+            $binding('https://evil.example/entity/Q122575'),
+            $binding('ftp://www.wikidata.org/entity/Q122575'),
+            $binding('https://www.wikidata.org/wiki/Q122575'),
+            $binding('https://www.wikidata.org/entity/Q0'),
+            $binding('https://www.wikidata.org/entity/Q0122575'),
+            $binding('https://www.wikidata.org/entity/Q122575?query=1'),
+            $binding('https://www.wikidata.org/entity/Q122575#fragment'),
+            $binding('https://www.wikidata.org:443/entity/Q122575'),
+            $binding('122575'),
+        ];
+        Http::fake(['query.wikidata.org/*' => Http::response(['results' => ['bindings' => $bindings]], 200)]);
+        $query = new DiscoveryQuery('campaign', 'tenant', 'E-commerce & Retail', 'IN', null, null, 'industry-ecommerce_retail', '', 10, null,
+            ['country_code' => 'IN'], 'ecommerce_retail');
+
+        $page = app(WikidataLeadSourceAdapter::class)->search($query, $this->approvedSource());
+
+        self::assertCount(2, $page->candidates, 'Only the exact trusted HTTP and HTTPS entity URI forms should produce candidates.');
+        foreach ($page->candidates as $candidate) {
+            self::assertSame('Q122575', $candidate['wikidata_qid']);
+            self::assertSame('https://www.wikidata.org/wiki/Q122575', $candidate['source_url']);
+            self::assertSame('IN', $candidate['country_code']);
+            self::assertSame('E-commerce & Retail', $candidate['industry']);
+            self::assertSame('e-commerce', $candidate['source_industry']);
+            self::assertSame('https://www.wikidata.org/entity/Q668', $candidate['raw_metadata']['binding']['country']['value']);
+            self::assertSame('https://www.wikidata.org/entity/Q484847', $candidate['raw_metadata']['binding']['industry']['value']);
+            self::assertSame('Q1353', $candidate['raw_metadata']['binding']['headquarters_qid']);
+            self::assertSame('Dubai', $candidate['city']);
+        }
+        self::assertSame('Q1353', $page->candidates[0]['raw_metadata']['binding']['headquarters_qid'],
+            'Headquarters QID extraction accepts the WDQS HTTP entity URI.');
+        self::assertSame('Q1353', $page->candidates[1]['raw_metadata']['binding']['headquarters_qid'],
+            'Headquarters QID extraction also accepts the HTTPS entity URI.');
+        self::assertSame('http://www.wikidata.org/entity/Q122575', $page->candidates[0]['raw_metadata']['binding']['item']['value'],
+            'The original provider binding remains available as provenance.');
+        Http::assertSent(fn ($request) => $request->method() === 'GET' && str_contains($request->url(), 'query.wikidata.org'));
+    }
+
+    public function test_wikidata_rejects_foreign_entity_uri_without_inventing_candidate_data(): void
+    {
+        Http::fake(['query.wikidata.org/*' => Http::response(['results' => ['bindings' => [[
+            'item' => ['value' => 'https://wikidata.org.evil.example/entity/Q122575'],
+            'label' => ['value' => 'Should Not Become A Candidate'],
+            'country' => ['value' => 'https://www.wikidata.org/entity/Q668'],
+            'industry' => ['value' => 'https://www.wikidata.org/entity/Q484847'],
+        ]]]], 200)]);
+        $query = new DiscoveryQuery('campaign', 'tenant', 'E-commerce & Retail', 'IN', null, null, 'industry-ecommerce_retail', '', 10, null,
+            ['country_code' => 'IN'], 'ecommerce_retail');
+
+        $page = app(WikidataLeadSourceAdapter::class)->search($query, $this->approvedSource());
+
+        self::assertSame([], $page->candidates);
+        Http::assertSentCount(1);
+    }
+
+    public function test_wikidata_unmapped_industry_fails_closed_without_provider_request(): void
+    {
+        Http::fake();
+        $query = new DiscoveryQuery('campaign', 'tenant', 'Marine Engineering', 'IN', null, null, 'custom', '', 10, null,
+            ['country_code' => 'IN'], null);
+        try {
+            app(WikidataLeadSourceAdapter::class)->search($query, $this->approvedSource());
+            self::fail('An unmapped industry must not issue an all-organizations query.');
+        } catch (\App\LeadDiscovery\LiveLeadSourceException $error) {
+            self::assertSame('SOURCE_QUERY_UNSUPPORTED', $error->errorCode);
+        }
+        Http::assertNothingSent();
+    }
+
+    public function test_wikidata_does_not_copy_campaign_city_when_headquarters_is_missing(): void
+    {
+        Http::fake(['query.wikidata.org/*' => Http::response(['results' => ['bindings' => [[
+            'item' => ['value' => 'https://www.wikidata.org/entity/Q321'], 'label' => ['value' => 'Synthetic Retailer'],
+            'country' => ['value' => 'https://www.wikidata.org/entity/Q668'], 'industry' => ['value' => 'https://www.wikidata.org/entity/Q126793'],
+        ]]]], 200)]);
+        $query = new DiscoveryQuery('campaign', 'tenant', 'E-commerce & Retail', 'IN', 'Tamil Nadu', 'Chennai', 'industry-ecommerce_retail', '', 10, null,
+            ['country_code' => 'IN'], 'ecommerce_retail');
+        $page = app(WikidataLeadSourceAdapter::class)->search($query, $this->approvedSource());
+        self::assertNull($page->candidates[0]['city']);
+        self::assertSame('IN', $page->candidates[0]['country_code']);
+        self::assertSame('country_industry', $page->candidates[0]['raw_metadata']['discovery_scope']);
+    }
+
+    public function test_wikidata_rejects_malformed_cursor_and_invalid_result_shape_safely(): void
+    {
+        $adapter = app(WikidataLeadSourceAdapter::class);
+        $query = new DiscoveryQuery('campaign', 'tenant', 'E-commerce & Retail', 'IN', null, null, 'industry-ecommerce_retail', '', 10, 'Q123:6',
+            ['country_code' => 'IN'], 'ecommerce_retail');
+        Http::fake();
+        try {
+            $adapter->search($query, $this->approvedSource());
+            self::fail('The sixth cursor page must be rejected.');
+        } catch (\App\LeadDiscovery\LiveLeadSourceException $error) {
+            self::assertSame('SOURCE_CURSOR_INVALID', $error->errorCode);
+        }
+        Http::assertNothingSent();
+
+        Http::fake(['query.wikidata.org/*' => Http::response('<html>error</html>', 200)]);
+        $validQuery = new DiscoveryQuery('campaign', 'tenant', 'E-commerce & Retail', 'IN', null, null, 'industry-ecommerce_retail', '', 10, null,
+            ['country_code' => 'IN'], 'ecommerce_retail');
+        try {
+            $adapter->search($validQuery, $this->approvedSource());
+            self::fail('An invalid JSON result shape must fail safely.');
+        } catch (\App\LeadDiscovery\LiveLeadSourceException $error) {
+            self::assertSame('SOURCE_RESPONSE_INVALID', $error->errorCode);
+            self::assertStringNotContainsString('<html>', $error->getMessage());
+        }
+    }
+
+    public function test_wikidata_connection_failure_is_classified_as_timeout(): void
+    {
+        Http::fake(static function () { throw new \Illuminate\Http\Client\ConnectionException('synthetic network timeout'); });
+        $query = new DiscoveryQuery('campaign', 'tenant', 'E-commerce & Retail', 'IN', null, null, 'industry-ecommerce_retail', '', 10, null,
+            ['country_code' => 'IN'], 'ecommerce_retail');
+        try {
+            app(WikidataLeadSourceAdapter::class)->search($query, $this->approvedSource());
+            self::fail('Connection failures must be classified as timeout.');
+        } catch (\App\LeadDiscovery\LiveLeadSourceException $error) {
+            self::assertSame('SOURCE_TIMEOUT', $error->errorCode);
+            self::assertStringNotContainsString('synthetic network timeout', $error->getMessage());
+        }
+    }
+
+    public function test_wikidata_page_size_and_keyset_cursor_are_bounded(): void
+    {
+        config(['lead_discovery.wikidata_result_count' => 10, 'lead_discovery.wikidata_max_pages' => 5]);
+        $bindings = [];
+        for ($i = 1; $i <= 10; $i++) $bindings[] = ['item' => ['value' => 'https://www.wikidata.org/entity/Q'.(100 + $i)],
+            'label' => ['value' => 'Retailer '.$i], 'industry' => ['value' => 'https://www.wikidata.org/entity/Q126793']];
+        Http::fake(['query.wikidata.org/*' => Http::response(['results' => ['bindings' => $bindings]], 200)]);
+        $query = new DiscoveryQuery('campaign', 'tenant', 'E-commerce & Retail', 'IN', null, null, 'industry-ecommerce_retail', '', 50, null,
+            ['country_code' => 'IN'], 'ecommerce_retail');
+        $page = app(WikidataLeadSourceAdapter::class)->search($query, $this->approvedSource());
+        self::assertSame('Q110:2', $page->nextCursor);
+        Http::assertSent(fn ($request) => str_contains((string) $request['query'], 'LIMIT 10') && ! str_contains((string) $request['query'], 'OFFSET'));
+
+    }
+
+    #[\PHPUnit\Framework\Attributes\DataProvider('wikidataHttpFailures')]
+    public function test_wikidata_classifies_http_failures_without_exposing_provider_body(int $status, string $expected): void
+    {
+        Http::fake(['query.wikidata.org/*' => Http::response('secret provider response body', $status, $status === 429 ? ['Retry-After' => '7'] : [])]);
+        $query = new DiscoveryQuery('campaign', 'tenant', 'E-commerce & Retail', 'IN', null, null, 'industry-ecommerce_retail', '', 10, null,
+            ['country_code' => 'IN'], 'ecommerce_retail');
+        try {
+            app(WikidataLeadSourceAdapter::class)->search($query, $this->approvedSource());
+            self::fail("Expected safe failure for HTTP {$status}.");
+        } catch (\App\LeadDiscovery\LiveLeadSourceException $error) {
+            self::assertSame($expected, $error->errorCode);
+            self::assertStringNotContainsString('secret provider response body', $error->getMessage());
+            if ($status === 429) self::assertSame(7, $error->retryAfter);
+        }
+    }
+
+    public static function wikidataHttpFailures(): array
+    {
+        return [
+            'rate limited' => [429, 'SOURCE_RATE_LIMITED'], 'bad gateway' => [502, 'SOURCE_TEMPORARILY_UNAVAILABLE'],
+            'unavailable' => [503, 'SOURCE_TEMPORARILY_UNAVAILABLE'], 'gateway timeout' => [504, 'SOURCE_TIMEOUT'],
+            'invalid query' => [400, 'SOURCE_QUERY_INVALID'], 'other failure' => [404, 'SOURCE_RESPONSE_INVALID'],
+        ];
     }
 
     public function test_mca_maps_official_identifiers_without_inventing_a_website(): void
@@ -146,7 +339,7 @@ class LeadDiscoveryPhaseTwoBTest extends TestCase
         self::assertNotEmpty($tasks);
         self::assertNotContains('india_ogd_mca', array_map(fn ($task) => $task['source']->source_key, $tasks));
         self::assertNotContains('osm_overpass', array_map(fn ($task) => $task['source']->source_key, $tasks), 'OSM has no safe configured Saudi city bbox, but other providers remain usable.');
-        self::assertContains('wikidata', array_map(fn ($task) => $task['source']->source_key, $tasks));
+        self::assertNotContains('wikidata', array_map(fn ($task) => $task['source']->source_key, $tasks), 'Unmapped industries must not fall back to broad Wikidata organization discovery.');
         self::assertContains('gleif', array_map(fn ($task) => $task['source']->source_key, $tasks));
         self::assertSame(['SA'], array_values(array_unique(array_map(fn ($task) => $task['partition']['country_code'], $tasks))));
         self::assertContains('Marine Engineering', array_column(array_column($tasks, 'query'), 'query'));

@@ -16,6 +16,7 @@ use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Queue;
+use Illuminate\Support\Facades\RateLimiter;
 use Illuminate\Support\Str;
 use Laravel\Sanctum\Sanctum;
 use Tests\TestCase;
@@ -27,7 +28,8 @@ class LeadDiscoveryLiveCampaignTest extends TestCase
     protected function setUp(): void
     {
         parent::setUp();
-        config(['lead_discovery.enabled' => true, 'lead_discovery.live_enabled' => true, 'services.brave_search.key' => 'synthetic-secret']);
+        config(['lead_discovery.enabled' => true, 'lead_discovery.live_enabled' => true, 'services.brave_search.key' => 'synthetic-secret',
+            'lead_discovery.user_agent' => 'PulamTest/1.0 (ops@example.test)']);
     }
 
     public function test_start_campaign_runs_mocked_search_paginates_deduplicates_and_stages_for_existing_safe_verification(): void
@@ -217,11 +219,218 @@ class LeadDiscoveryLiveCampaignTest extends TestCase
         self::assertSame('draft', DB::table('lead_discovery_campaigns')->where('tenant_id', $tenant->id)->where('id', $campaign['id'])->value('status'));
     }
 
+    public function test_osm_local_pacing_reschedules_without_failure_or_budget_accounting(): void
+    {
+        [$tenant] = $this->tenantAndUser('live-lead-discovery-osm-pacing');
+        Queue::fake();
+        [$campaignId, $runs] = $this->campaignWithSourceRuns($tenant->id, 1);
+        $this->configureOsmRun($tenant->id, $runs[0]);
+        config(['lead_discovery.osm_min_request_interval_seconds' => 5]);
+        RateLimiter::clear('lead-discovery-provider:osm_overpass');
+        RateLimiter::hit('lead-discovery-provider:osm_overpass', 30);
+        Http::fake();
+
+        (new DiscoverLeadSourcePageJob($tenant->id, $runs[0]['checkpoint']))
+            ->handle(app(LeadSourceAdapterRegistry::class), app(LiveCandidateStager::class));
+
+        $checkpoint = DB::table('lead_discovery_checkpoints')->where('tenant_id', $tenant->id)->where('id', $runs[0]['checkpoint'])->first();
+        self::assertSame('queued', $checkpoint->status);
+        self::assertSame(0, (int) $checkpoint->attempts);
+        self::assertNull($checkpoint->error_code);
+        self::assertSame(0, (int) DB::table('lead_discovery_runs')->where('id', $runs[0]['id'])->value('source_errors'));
+        self::assertSame(0, (int) DB::table('lead_discovery_runs')->where('id', $runs[0]['id'])->value('source_requests'));
+        self::assertSame('ready', DB::table('lead_discovery_sources')->where('id', $this->sourceForRun($runs[0]['id']))->value('health_state'));
+        Queue::assertPushed(DiscoverLeadSourcePageJob::class, 1);
+        Http::assertNothingSent();
+    }
+
+    public function test_wikidata_local_pacing_is_not_counted_and_success_audit_omits_query_text(): void
+    {
+        [$tenant] = $this->tenantAndUser('live-lead-discovery-wikidata-pacing');
+        Queue::fake();
+        [, $runs] = $this->campaignWithSourceRuns($tenant->id, 1);
+        $this->configureWikidataRun($tenant->id, $runs[0]);
+        config(['lead_discovery.wikidata_min_request_interval_seconds' => 5, 'lead_discovery.wikidata_user_agent' => 'Pulam tests <ops@example.test>']);
+        $rateKey = 'lead-discovery-provider:wikidata';
+        RateLimiter::clear($rateKey);
+        RateLimiter::hit($rateKey, 30);
+        Http::fake(['query.wikidata.org/*' => Http::response(['results' => ['bindings' => []]], 200)]);
+
+        (new DiscoverLeadSourcePageJob($tenant->id, $runs[0]['checkpoint']))
+            ->handle(app(LeadSourceAdapterRegistry::class), app(LiveCandidateStager::class));
+        $checkpoint = DB::table('lead_discovery_checkpoints')->where('tenant_id', $tenant->id)->where('id', $runs[0]['checkpoint'])->first();
+        self::assertSame('queued', $checkpoint->status);
+        self::assertSame(0, (int) $checkpoint->attempts);
+        self::assertNull($checkpoint->error_code);
+        self::assertSame(0, (int) DB::table('lead_discovery_runs')->where('id', $runs[0]['id'])->value('source_errors'));
+        self::assertSame(0, (int) DB::table('lead_discovery_runs')->where('id', $runs[0]['id'])->value('source_requests'));
+        self::assertSame('ready', DB::table('lead_discovery_sources')->where('id', $this->sourceForRun($runs[0]['id']))->value('health_state'));
+        Http::assertNothingSent();
+
+        $this->travel(6)->seconds();
+        RateLimiter::clear($rateKey);
+        (new DiscoverLeadSourcePageJob($tenant->id, $runs[0]['checkpoint']))
+            ->handle(app(LeadSourceAdapterRegistry::class), app(LiveCandidateStager::class));
+
+        self::assertSame('completed', DB::table('lead_discovery_checkpoints')->where('id', $runs[0]['checkpoint'])->value('status'), (string) DB::table('lead_discovery_checkpoints')->where('id', $runs[0]['checkpoint'])->value('error_code'));
+        self::assertSame(1, (int) DB::table('lead_discovery_runs')->where('id', $runs[0]['id'])->value('source_requests'));
+        self::assertSame(0, (int) DB::table('lead_discovery_runs')->where('id', $runs[0]['id'])->value('source_errors'));
+        $audit = DB::table('audit_logs')->where('tenant_id', $tenant->id)->where('action', 'lead_discovery.source_page_completed')->first();
+        $metadata = json_decode((string) $audit->metadata, true);
+        self::assertSame('IN:industry-ecommerce_retail', $metadata['query_key']);
+        self::assertSame('ecommerce_retail', $metadata['industry_key']);
+        self::assertSame('IN', $metadata['country_code']);
+        self::assertSame(0, $metadata['result_count']);
+        self::assertSame(1, $metadata['logical_request_count']);
+        self::assertSame(2, $metadata['stage_count']);
+        self::assertMatchesRegularExpression('/^[a-f0-9]{64}$/', $metadata['query_sha256']);
+        self::assertArrayNotHasKey('sparql', $metadata);
+        self::assertSame(0, DB::table('campaign_recipients')->where('tenant_id', $tenant->id)->count());
+        self::assertSame(0, DB::table('outbound_messages')->where('tenant_id', $tenant->id)->count());
+        Queue::assertNotPushed(\App\Jobs\SendOutboundMessage::class);
+        RateLimiter::clear($rateKey);
+    }
+
+    public function test_unsupported_wikidata_industry_is_reported_while_other_campaign_sources_continue(): void
+    {
+        [$tenant] = $this->tenantAndUser('live-lead-discovery-wikidata-unsupported');
+        Queue::fake();
+        [$campaignId, $existingRuns] = $this->campaignWithSourceRuns($tenant->id, 1, 'queued');
+        DB::table('lead_discovery_campaigns')->where('tenant_id', $tenant->id)->where('id', $campaignId)->update([
+            'industry' => 'Marine Engineering', 'country_code' => 'SA', 'city' => 'Jeddah',
+        ]);
+        $wikidataId = $this->sourceForRun($existingRuns[0]['id']);
+        DB::table('lead_discovery_checkpoints')->where('tenant_id', $tenant->id)->where('id', $existingRuns[0]['checkpoint'])->delete();
+        DB::table('lead_discovery_runs')->where('tenant_id', $tenant->id)->where('id', $existingRuns[0]['id'])->delete();
+        DB::table('lead_discovery_sources')->where('tenant_id', $tenant->id)->where('id', $wikidataId)->update([
+            'source_key' => 'wikidata', 'health_state' => 'ready', 'authorization_status' => 'authorized', 'storage_rights_status' => 'confirmed',
+            'configuration' => json_encode(['license_or_authorization' => 'Synthetic CC0', 'storage_rights_confirmed' => true,
+                'storage_rights_reference' => 'synthetic-cc0']),
+        ]);
+        $gleifId = (string) Str::uuid();
+        DB::table('lead_discovery_sources')->insert([
+            'id' => $gleifId, 'tenant_id' => $tenant->id, 'source_key' => 'gleif', 'provider_name' => 'Synthetic GLEIF',
+            'source_type' => 'open_data', 'authorization_status' => 'authorized', 'storage_rights_status' => 'confirmed',
+            'allowed_collection_method' => 'official_public_api', 'configuration' => json_encode(['license_or_authorization' => 'CC0',
+                'storage_rights_confirmed' => true, 'storage_rights_reference' => 'synthetic-gleif']),
+            'enabled' => true, 'health_state' => 'ready', 'created_at' => now(), 'updated_at' => now(),
+        ]);
+
+        (new StartLeadDiscoveryCampaignJob($tenant->id, $campaignId, [$wikidataId, $gleifId]))
+            ->handle(app(LeadDiscoveryQueryTaxonomy::class), app(LeadSourceAdapterRegistry::class), app(LeadDiscoverySourcePlanner::class));
+
+        self::assertSame('SOURCE_QUERY_UNSUPPORTED', DB::table('lead_discovery_sources')->where('tenant_id', $tenant->id)->where('id', $wikidataId)->value('last_error_code'));
+        self::assertSame('not_configured', DB::table('lead_discovery_sources')->where('tenant_id', $tenant->id)->where('id', $wikidataId)->value('health_state'));
+        self::assertSame('running', DB::table('lead_discovery_campaigns')->where('tenant_id', $tenant->id)->where('id', $campaignId)->value('status'));
+        self::assertSame(1, DB::table('lead_discovery_runs')->where('tenant_id', $tenant->id)->where('campaign_id', $campaignId)->where('source_id', $gleifId)->count());
+        self::assertSame(0, DB::table('lead_discovery_runs')->where('tenant_id', $tenant->id)->where('campaign_id', $campaignId)->where('source_id', $wikidataId)->count());
+        Queue::assertPushed(DiscoverLeadSourcePageJob::class, 1);
+        Http::assertNothingSent();
+        self::assertSame(0, DB::table('campaign_recipients')->where('tenant_id', $tenant->id)->count());
+        self::assertSame(0, DB::table('outbound_messages')->where('tenant_id', $tenant->id)->count());
+    }
+
+    public function test_osm_sibling_checkpoints_run_serially_and_count_one_request_each(): void
+    {
+        [$tenant] = $this->tenantAndUser('live-lead-discovery-osm-siblings');
+        Queue::fake();
+        [$campaignId, $runs] = $this->campaignWithSourceRuns($tenant->id, 2);
+        foreach ($runs as $run) $this->configureOsmRun($tenant->id, $run);
+        config(['lead_discovery.osm_min_request_interval_seconds' => 5]);
+        RateLimiter::clear('lead-discovery-provider:osm_overpass');
+        Http::fake(['overpass-api.de/*' => Http::response(['elements' => []], 200)]);
+
+        (new DiscoverLeadSourcePageJob($tenant->id, $runs[0]['checkpoint']))
+            ->handle(app(LeadSourceAdapterRegistry::class), app(LiveCandidateStager::class));
+        self::assertSame('completed', DB::table('lead_discovery_checkpoints')->where('id', $runs[0]['checkpoint'])->value('status'));
+        self::assertSame(1, (int) DB::table('lead_discovery_runs')->where('id', $runs[0]['id'])->value('source_requests'));
+
+        (new DiscoverLeadSourcePageJob($tenant->id, $runs[1]['checkpoint']))
+            ->handle(app(LeadSourceAdapterRegistry::class), app(LiveCandidateStager::class));
+        self::assertSame('queued', DB::table('lead_discovery_checkpoints')->where('id', $runs[1]['checkpoint'])->value('status'));
+        self::assertSame(0, (int) DB::table('lead_discovery_checkpoints')->where('id', $runs[1]['checkpoint'])->value('attempts'));
+        self::assertSame(1, Http::recorded()->count(), 'A sibling request waits instead of running concurrently/too soon.');
+
+        $this->travel(6)->seconds();
+        (new DiscoverLeadSourcePageJob($tenant->id, $runs[1]['checkpoint']))
+            ->handle(app(LeadSourceAdapterRegistry::class), app(LiveCandidateStager::class));
+
+        self::assertSame('completed', DB::table('lead_discovery_checkpoints')->where('id', $runs[1]['checkpoint'])->value('status'));
+        self::assertSame(1, (int) DB::table('lead_discovery_runs')->where('id', $runs[1]['id'])->value('source_requests'));
+        self::assertSame(0, (int) DB::table('lead_discovery_runs')->whereIn('id', array_column($runs, 'id'))->sum('source_errors'));
+        self::assertSame(2, Http::recorded()->count());
+        self::assertSame(0, DB::table('lead_discovery_campaigns')->where('tenant_id', $tenant->id)->where('id', $campaignId)->value('auto_promotion_enabled'));
+        self::assertSame(0, DB::table('campaign_recipients')->where('tenant_id', $tenant->id)->count());
+        self::assertSame(0, DB::table('outbound_messages')->where('tenant_id', $tenant->id)->count());
+        Queue::assertNotPushed(\App\Jobs\SendOutboundMessage::class);
+        $audit = DB::table('audit_logs')->where('tenant_id', $tenant->id)->where('action', 'lead_discovery.source_page_completed')->orderByDesc('created_at')->first();
+        self::assertSame('FOSSGIS main', json_decode((string) $audit->metadata, true)['endpoint_name']);
+        self::assertSame('https://overpass-api.de/api/interpreter', json_decode((string) $audit->metadata, true)['endpoint_url']);
+    }
+
+    public function test_osm_availability_failure_persists_checkpoint_code_and_degrades_source_health(): void
+    {
+        [$tenant] = $this->tenantAndUser('live-lead-discovery-osm-failure');
+        Queue::fake();
+        [, $runs] = $this->campaignWithSourceRuns($tenant->id, 1);
+        $this->configureOsmRun($tenant->id, $runs[0]);
+        Http::fake([
+            'overpass-api.de/*' => Http::response(['temporary' => true], 502),
+            'overpass.private.coffee/*' => Http::response(['temporary' => true], 503),
+        ]);
+
+        (new DiscoverLeadSourcePageJob($tenant->id, $runs[0]['checkpoint']))
+            ->handle(app(LeadSourceAdapterRegistry::class), app(LiveCandidateStager::class));
+
+        $sourceId = $this->sourceForRun($runs[0]['id']);
+        self::assertSame('failed', DB::table('lead_discovery_checkpoints')->where('tenant_id', $tenant->id)->where('id', $runs[0]['checkpoint'])->value('status'));
+        self::assertSame('SOURCE_TEMPORARILY_UNAVAILABLE', DB::table('lead_discovery_checkpoints')->where('id', $runs[0]['checkpoint'])->value('error_code'));
+        self::assertSame('degraded', DB::table('lead_discovery_sources')->where('tenant_id', $tenant->id)->where('id', $sourceId)->value('health_state'));
+        self::assertSame('SOURCE_TEMPORARILY_UNAVAILABLE', DB::table('lead_discovery_sources')->where('id', $sourceId)->value('last_error_code'));
+        self::assertSame(1, (int) DB::table('lead_discovery_runs')->where('id', $runs[0]['id'])->value('source_requests'), 'Fallback remains one logical provider operation.');
+        self::assertSame(1, (int) DB::table('lead_discovery_runs')->where('id', $runs[0]['id'])->value('source_errors'));
+        self::assertSame(0, DB::table('campaign_recipients')->where('tenant_id', $tenant->id)->count());
+        self::assertSame(0, DB::table('outbound_messages')->where('tenant_id', $tenant->id)->count());
+        Queue::assertNotPushed(\App\Jobs\SendOutboundMessage::class);
+        self::assertSame(2, Http::recorded()->count());
+    }
+
     private function tenantAndUser(string $slug): array
     {
         $tenant = Tenant::create(['id' => (string) Str::uuid(), 'name' => $slug, 'slug' => $slug, 'status' => 'active']);
         $user = User::create(['name' => 'Synthetic Discovery Owner', 'email' => $slug.'@example.test', 'password' => bcrypt('password')]);
         return [$tenant, $user];
+    }
+
+    private function configureOsmRun(string $tenantId, array $run): void
+    {
+        $sourceId = $this->sourceForRun($run['id']);
+        DB::table('lead_discovery_sources')->where('tenant_id', $tenantId)->where('id', $sourceId)->update([
+            'source_key' => 'osm_overpass', 'provider_name' => 'Synthetic Overpass',
+            'authorization_status' => 'authorized', 'storage_rights_status' => 'confirmed',
+            'configuration' => json_encode(['license_or_authorization' => 'Synthetic ODbL review', 'storage_rights_confirmed' => true,
+                'storage_rights_reference' => 'synthetic-osm-terms']),
+        ]);
+        DB::table('lead_discovery_checkpoints')->where('tenant_id', $tenantId)->where('id', $run['checkpoint'])
+            ->update(['industry_key' => 'ecommerce_retail', 'bbox' => json_encode([25.0, 55.0, 25.2, 55.4])]);
+    }
+
+    private function configureWikidataRun(string $tenantId, array $run): void
+    {
+        $sourceId = $this->sourceForRun($run['id']);
+        DB::table('lead_discovery_sources')->where('tenant_id', $tenantId)->where('id', $sourceId)->update([
+            'source_key' => 'wikidata', 'provider_name' => 'Synthetic Wikidata',
+            'authorization_status' => 'authorized', 'storage_rights_status' => 'confirmed',
+            'configuration' => json_encode(['license_or_authorization' => 'Synthetic CC0 basis', 'storage_rights_confirmed' => true,
+                'storage_rights_reference' => 'synthetic-cc0-reference']),
+        ]);
+        DB::table('lead_discovery_checkpoints')->where('tenant_id', $tenantId)->where('id', $run['checkpoint'])
+            ->update(['industry_key' => 'ecommerce_retail', 'country_code' => 'IN', 'query_key' => 'IN:industry-ecommerce_retail']);
+    }
+
+    private function sourceForRun(string $runId): string
+    {
+        return (string) DB::table('lead_discovery_runs')->where('id', $runId)->value('source_id');
     }
 
     /** @return array{string, list<array{id:string,checkpoint:string}>} */

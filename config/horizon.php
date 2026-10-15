@@ -11,7 +11,7 @@ return [
             'supervisor-discovery' => ['connection' => 'redis', 'queue' => ['discovery'], 'balance' => 'auto', 'minProcesses' => 1, 'maxProcesses' => 3, 'tries' => 3, 'timeout' => 240],
             'supervisor-candidate-discovery' => ['connection' => 'redis', 'queue' => ['candidate-discovery'], 'balance' => 'simple', 'processes' => min(2, max(1, (int) env('CANDIDATE_DISCOVERY_MAX_WORKERS', 1))), 'tries' => 1, 'timeout' => 65],
             'supervisor-lead-validation' => ['connection' => 'redis', 'queue' => ['lead-validation'], 'balance' => 'simple', 'processes' => min(2, max(1, (int) env('LEAD_DISCOVERY_WORKERS', 1))), 'tries' => 2, 'timeout' => 50],
-            'supervisor-lead-discovery' => ['connection' => 'redis', 'queue' => ['lead-discovery'], 'balance' => 'simple', 'processes' => config('lead_discovery.live_worker_concurrency', 1), 'tries' => 3, 'timeout' => 35],
+            'supervisor-lead-discovery' => ['connection' => 'redis', 'queue' => ['lead-discovery'], 'balance' => 'simple', 'processes' => 1, 'tries' => 3, 'timeout' => 45],
             'supervisor-crawl' => ['connection' => 'redis', 'queue' => ['crawl'], 'balance' => 'simple', 'processes' => 1, 'tries' => 2, 'timeout' => 390],
             'supervisor-web-index' => ['connection' => 'redis', 'queue' => ['web-index'], 'balance' => 'simple', 'processes' => min(2, max(1, (int) env('WEBSITE_INDEX_INGESTION_MAX_WORKERS', 1))), 'tries' => 10, 'timeout' => 390],
             'supervisor-intelligence' => ['connection' => 'redis', 'queue' => ['intelligence'], 'balance' => 'auto', 'minProcesses' => 1, 'maxProcesses' => 4, 'tries' => 3, 'timeout' => 240],
@@ -24,7 +24,7 @@ return [
         'local' => [
             'supervisor-local' => ['connection' => 'redis', 'queue' => ['default', 'discovery', 'intake', 'crawl', 'intelligence', 'scoring', 'campaigns', 'outbound', 'conversations', 'workflow', 'lead-validation'], 'balance' => 'simple', 'processes' => 2, 'tries' => 1000, 'timeout' => 390],
             'supervisor-candidate-discovery' => ['connection' => 'redis', 'queue' => ['candidate-discovery'], 'balance' => 'simple', 'processes' => 1, 'tries' => 1, 'timeout' => 65],
-            'supervisor-lead-discovery' => ['connection' => 'redis', 'queue' => ['lead-discovery'], 'balance' => 'simple', 'processes' => config('lead_discovery.live_worker_concurrency', 1), 'tries' => 3, 'timeout' => 35],
+            'supervisor-lead-discovery' => ['connection' => 'redis', 'queue' => ['lead-discovery'], 'balance' => 'simple', 'processes' => 1, 'tries' => 3, 'timeout' => 45],
             'supervisor-web-index' => ['connection' => 'redis', 'queue' => ['web-index'], 'balance' => 'simple', 'processes' => 1, 'tries' => 10, 'timeout' => 390],
         ],
     ],
