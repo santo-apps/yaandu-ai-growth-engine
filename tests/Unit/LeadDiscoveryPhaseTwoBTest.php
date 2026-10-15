@@ -79,6 +79,74 @@ class LeadDiscoveryPhaseTwoBTest extends TestCase
         });
     }
 
+    public function test_wikidata_accepts_only_http_or_https_trusted_entity_uris_and_canonicalizes_provenance(): void
+    {
+        $binding = static fn (string $item, string $headquarters = 'http://www.wikidata.org/entity/Q1353'): array => [
+            'item' => ['value' => $item], 'label' => ['value' => 'Synthetic Retailer'],
+            'country' => ['value' => 'https://www.wikidata.org/entity/Q668'],
+            'industry' => ['value' => 'https://www.wikidata.org/entity/Q484847'],
+            'website' => ['value' => 'https://retailer.example'],
+            'headquarters' => ['value' => $headquarters], 'headquartersLabel' => ['value' => 'Dubai'],
+        ];
+        $bindings = [
+            $binding('http://www.wikidata.org/entity/Q122575'),
+            $binding('https://www.wikidata.org/entity/Q122575', 'https://www.wikidata.org/entity/Q1353'),
+            $binding('http://www.wikidata.org.evil.com/entity/Q122575'),
+            $binding('https://wikidata.org/entity/Q122575'),
+            $binding('https://evil.example/entity/Q122575'),
+            $binding('ftp://www.wikidata.org/entity/Q122575'),
+            $binding('https://www.wikidata.org/wiki/Q122575'),
+            $binding('https://www.wikidata.org/entity/Q0'),
+            $binding('https://www.wikidata.org/entity/Q0122575'),
+            $binding('https://www.wikidata.org/entity/Q122575?query=1'),
+            $binding('https://www.wikidata.org/entity/Q122575#fragment'),
+            $binding('https://www.wikidata.org:443/entity/Q122575'),
+            $binding('122575'),
+        ];
+        Http::fake(['query.wikidata.org/*' => Http::response(['results' => ['bindings' => $bindings]], 200)]);
+        $query = new DiscoveryQuery('campaign', 'tenant', 'E-commerce & Retail', 'IN', null, null, 'industry-ecommerce_retail', '', 10, null,
+            ['country_code' => 'IN'], 'ecommerce_retail');
+
+        $page = app(WikidataLeadSourceAdapter::class)->search($query, $this->approvedSource());
+
+        self::assertCount(2, $page->candidates, 'Only the exact trusted HTTP and HTTPS entity URI forms should produce candidates.');
+        foreach ($page->candidates as $candidate) {
+            self::assertSame('Q122575', $candidate['wikidata_qid']);
+            self::assertSame('https://www.wikidata.org/wiki/Q122575', $candidate['source_url']);
+            self::assertSame('IN', $candidate['country_code']);
+            self::assertSame('E-commerce & Retail', $candidate['industry']);
+            self::assertSame('e-commerce', $candidate['source_industry']);
+            self::assertSame('https://www.wikidata.org/entity/Q668', $candidate['raw_metadata']['binding']['country']['value']);
+            self::assertSame('https://www.wikidata.org/entity/Q484847', $candidate['raw_metadata']['binding']['industry']['value']);
+            self::assertSame('Q1353', $candidate['raw_metadata']['binding']['headquarters_qid']);
+            self::assertSame('Dubai', $candidate['city']);
+        }
+        self::assertSame('Q1353', $page->candidates[0]['raw_metadata']['binding']['headquarters_qid'],
+            'Headquarters QID extraction accepts the WDQS HTTP entity URI.');
+        self::assertSame('Q1353', $page->candidates[1]['raw_metadata']['binding']['headquarters_qid'],
+            'Headquarters QID extraction also accepts the HTTPS entity URI.');
+        self::assertSame('http://www.wikidata.org/entity/Q122575', $page->candidates[0]['raw_metadata']['binding']['item']['value'],
+            'The original provider binding remains available as provenance.');
+        Http::assertSent(fn ($request) => $request->method() === 'GET' && str_contains($request->url(), 'query.wikidata.org'));
+    }
+
+    public function test_wikidata_rejects_foreign_entity_uri_without_inventing_candidate_data(): void
+    {
+        Http::fake(['query.wikidata.org/*' => Http::response(['results' => ['bindings' => [[
+            'item' => ['value' => 'https://wikidata.org.evil.example/entity/Q122575'],
+            'label' => ['value' => 'Should Not Become A Candidate'],
+            'country' => ['value' => 'https://www.wikidata.org/entity/Q668'],
+            'industry' => ['value' => 'https://www.wikidata.org/entity/Q484847'],
+        ]]]], 200)]);
+        $query = new DiscoveryQuery('campaign', 'tenant', 'E-commerce & Retail', 'IN', null, null, 'industry-ecommerce_retail', '', 10, null,
+            ['country_code' => 'IN'], 'ecommerce_retail');
+
+        $page = app(WikidataLeadSourceAdapter::class)->search($query, $this->approvedSource());
+
+        self::assertSame([], $page->candidates);
+        Http::assertSentCount(1);
+    }
+
     public function test_wikidata_unmapped_industry_fails_closed_without_provider_request(): void
     {
         Http::fake();

@@ -92,8 +92,8 @@ final class WikidataLeadSourceAdapter extends AbstractOpenLeadSourceAdapter
         $lastQid = null;
         foreach ($bindings as $binding) {
             $uri = data_get($binding, 'item.value');
-            if (! is_string($uri) || ! preg_match('#^https://www\.wikidata\.org/entity/(Q[1-9][0-9]*)$#D', $uri, $match)) continue;
-            $qid = $match[1];
+            $qid = $this->qidFromEntityUri($uri);
+            if ($qid === null) continue;
             if ($lastQid === null || $this->qidIsGreater($qid, $lastQid)) $lastQid = $qid;
             $label = trim((string) data_get($binding, 'label.value', ''));
             if ($label === '') continue;
@@ -105,7 +105,8 @@ final class WikidataLeadSourceAdapter extends AbstractOpenLeadSourceAdapter
             $rawEvidence = [
                 'item' => data_get($binding, 'item'), 'country' => data_get($binding, 'country'),
                 'industry' => data_get($binding, 'industry'), 'website' => data_get($binding, 'website'),
-                'headquarters' => data_get($binding, 'headquarters'), 'headquartersLabel' => data_get($binding, 'headquartersLabel'),
+                'headquarters' => data_get($binding, 'headquarters'), 'headquarters_qid' => $headquartersQid,
+                'headquartersLabel' => data_get($binding, 'headquartersLabel'),
             ];
             $candidates[] = $this->mapCandidate($this->key(), [
                 'source_record_id' => $qid, 'source_record_type' => 'wikidata_entity',
@@ -143,7 +144,20 @@ final class WikidataLeadSourceAdapter extends AbstractOpenLeadSourceAdapter
 
     private function qidFromEntityUri(mixed $uri): ?string
     {
-        return is_string($uri) && preg_match('#^https://www\.wikidata\.org/entity/(Q[1-9][0-9]*)$#D', $uri, $match) ? $match[1] : null;
+        if (! is_string($uri) || $uri === '') return null;
+
+        $parts = parse_url($uri);
+        if (! is_array($parts)
+            || ! in_array($parts['scheme'] ?? null, ['http', 'https'], true)
+            || ($parts['host'] ?? null) !== 'www.wikidata.org'
+            || isset($parts['port']) || isset($parts['user']) || isset($parts['pass'])
+            || isset($parts['query']) || isset($parts['fragment'])) {
+            return null;
+        }
+
+        return isset($parts['path']) && preg_match('#^/entity/(Q[1-9][0-9]*)$#D', $parts['path'], $match) === 1
+            ? $match[1]
+            : null;
     }
 
     private function qidIsGreater(string $left, string $right): bool
