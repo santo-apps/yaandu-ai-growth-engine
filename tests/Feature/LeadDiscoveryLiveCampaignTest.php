@@ -6,6 +6,7 @@ use App\Jobs\DiscoverLeadSourcePageJob;
 use App\Jobs\StartLeadDiscoveryCampaignJob;
 use App\LeadDiscovery\LeadDiscoveryQueryTaxonomy;
 use App\LeadDiscovery\LeadSourceAdapterRegistry;
+use App\LeadDiscovery\LeadDiscoverySourcePlanner;
 use App\LeadDiscovery\LiveCandidateStager;
 use App\Models\Tenant;
 use App\Models\User;
@@ -51,10 +52,10 @@ class LeadDiscoveryLiveCampaignTest extends TestCase
             ->assertAccepted()->assertJsonPath('status', 'queued')->assertJsonPath('auto_promotion', false);
         Queue::assertPushed(StartLeadDiscoveryCampaignJob::class, 1);
 
-        (new StartLeadDiscoveryCampaignJob($tenant->id, $campaign['id'], [$source['id']]))->handle(app(LeadDiscoveryQueryTaxonomy::class), app(LeadSourceAdapterRegistry::class));
+        (new StartLeadDiscoveryCampaignJob($tenant->id, $campaign['id'], [$source['id']]))->handle(app(LeadDiscoveryQueryTaxonomy::class), app(LeadSourceAdapterRegistry::class), app(LeadDiscoverySourcePlanner::class));
         $run = DB::table('lead_discovery_runs')->where('tenant_id', $tenant->id)->where('campaign_id', $campaign['id'])->first();
         self::assertNotNull($run);
-        self::assertSame(11, DB::table('lead_discovery_checkpoints')->where('tenant_id', $tenant->id)->where('run_id', $run->id)->count());
+        self::assertSame(2, DB::table('lead_discovery_checkpoints')->where('tenant_id', $tenant->id)->where('run_id', $run->id)->count());
         $checkpoint = DB::table('lead_discovery_checkpoints')->where('tenant_id', $tenant->id)->where('run_id', $run->id)->orderBy('query_key')->first();
         $results = [];
         for ($index = 1; $index <= 10; $index++) $results[] = ['title' => 'Synthetic Retail Business '.$index, 'url' => 'https://synthetic-retailer-'.$index.'.example.com/', 'description' => 'Synthetic public search snippet '.$index];
@@ -68,7 +69,7 @@ class LeadDiscoveryLiveCampaignTest extends TestCase
         (new DiscoverLeadSourcePageJob($tenant->id, $checkpoint->id))->handle(app(LeadSourceAdapterRegistry::class), app(LiveCandidateStager::class));
         $checkpoint = DB::table('lead_discovery_checkpoints')->where('tenant_id', $tenant->id)->where('id', $checkpoint->id)->first();
         self::assertSame('1', $checkpoint->cursor, 'Checkpoint error: '.$checkpoint->error_code.'; source error: '.DB::table('lead_discovery_sources')->where('id', $source['id'])->value('last_error_code'));
-        Queue::assertPushed(DiscoverLeadSourcePageJob::class, 12); // 11 initial query pages plus the scheduled next cursor page.
+        Queue::assertPushed(DiscoverLeadSourcePageJob::class, 3); // 2 bounded industry queries plus the scheduled next cursor page.
         self::assertSame(10, DB::table('lead_discovery_candidates')->where('tenant_id', $tenant->id)->where('campaign_id', $campaign['id'])->count());
         self::assertSame(10, DB::table('lead_discovery_candidate_evidence')->where('tenant_id', $tenant->id)->where('campaign_id', $campaign['id'])->where('field_name', 'search_snippet')->count());
         Http::assertSent(fn ($request) => $request->method() === 'POST'

@@ -126,6 +126,9 @@ Route::prefix('v1')->group(function (): void {
     Route::post('/discovery/import/preview', [DiscoveryController::class, 'previewImport']);
     Route::post('/discovery/import', [DiscoveryController::class, 'import']);
     Route::get('/lead-discovery/sources', [LeadDiscoveryController::class, 'sources']);
+    Route::get('/lead-discovery/source-catalog', [LeadDiscoveryController::class, 'sourceCatalog']);
+    Route::get('/lead-discovery/industries', [LeadDiscoveryController::class, 'industries']);
+    Route::get('/lead-discovery/countries', [LeadDiscoveryController::class, 'countries']);
     Route::get('/lead-discovery/source-health', [LeadDiscoveryController::class, 'sourceHealth']);
     Route::post('/lead-discovery/sources', [LeadDiscoveryController::class, 'createSource']);
     Route::patch('/lead-discovery/sources/{source}', [LeadDiscoveryController::class, 'updateSource']);

@@ -19,10 +19,16 @@ final class DiscoveryEligibilityService
         if (($candidate['official_domain_status'] ?? null) !== 'verified') {
             return $this->result('needs_review', 'WEBSITE_UNVERIFIED', 'The official website identity has not been verified.', 0.35);
         }
-        if (strtoupper((string) ($candidate['country_code'] ?? '')) !== strtoupper((string) ($campaign['country_code'] ?? ''))) {
+        if (! empty($campaign['country_code']) && strtoupper((string) ($candidate['country_code'] ?? '')) !== strtoupper((string) $campaign['country_code'])) {
             return $this->result('needs_review', 'GEOGRAPHY_UNCONFIRMED', 'Candidate geography does not match the campaign target.', 0.5);
         }
-        if (mb_strtolower(trim((string) ($candidate['industry'] ?? ''))) !== mb_strtolower(trim((string) ($campaign['industry'] ?? '')))) {
+        foreach (['region', 'city'] as $geographyField) {
+            $requested = trim((string) ($campaign[$geographyField] ?? ''));
+            if ($requested !== '' && mb_strtolower(trim((string) ($candidate[$geographyField] ?? ''))) !== mb_strtolower($requested)) {
+                return $this->result('needs_review', 'GEOGRAPHY_UNCONFIRMED', 'Candidate regional location does not match the campaign target.', 0.5);
+            }
+        }
+        if (! empty($campaign['industry']) && mb_strtolower(trim((string) ($candidate['industry'] ?? ''))) !== mb_strtolower(trim((string) $campaign['industry']))) {
             return $this->result('needs_review', 'INDUSTRY_UNCONFIRMED', 'Candidate industry does not match the campaign target.', 0.5);
         }
         return $this->result('eligible', 'VERIFIED_TARGET_MATCH', 'Authorized source, verified official website, target geography, and target industry are supported by candidate evidence.', 0.9);

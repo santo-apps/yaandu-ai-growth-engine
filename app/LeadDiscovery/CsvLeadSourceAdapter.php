@@ -8,6 +8,13 @@ final class CsvLeadSourceAdapter implements LeadSourceAdapterInterface
 {
     public function key(): string { return 'csv_upload'; }
 
+    public function capabilities(): LeadSourceCapabilities
+    {
+        return new LeadSourceCapabilities('csv_upload', 'licensed_manual_dataset', false, true, false, false, true, true, true, true, true,
+            false, [], ['company_name', 'website', 'email', 'phone', 'industry', 'address'], true, true, true, false,
+            'Operator-supplied dataset license', null, 'Retain the dataset license and attribution recorded by the tenant.', 0, 'manual_import', 'LICENSED_PERSISTABLE');
+    }
+
     public function validateConfiguration(array $configuration): void
     {
         if (trim((string) ($configuration['license_or_authorization'] ?? '')) === '') {
