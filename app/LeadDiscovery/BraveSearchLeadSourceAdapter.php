@@ -64,9 +64,11 @@ final class BraveSearchLeadSourceAdapter implements SearchLeadSourceAdapterInter
         if ($response->status() === 429) {
             $providerCode = strtoupper((string) data_get($response->json(), 'error.code', ''));
             if ($providerCode === 'QUOTA_LIMITED') throw new LiveLeadSourceException('SOURCE_QUOTA_EXHAUSTED', 'The live search provider quota is unavailable.');
-            throw new LiveLeadSourceException('SOURCE_RATE_LIMITED', 'The live search provider rate limit was reached.', max(1, min(3600, (int) $response->header('Retry-After', 5))));
+            throw new LiveLeadSourceException('SOURCE_RATE_LIMITED', 'The live search provider rate limit was reached.', LiveLeadSourceException::retryAfterSeconds($response->header('Retry-After'), 5));
         }
         if ($response->status() === 402) throw new LiveLeadSourceException('SOURCE_QUOTA_EXHAUSTED', 'The live search provider quota is unavailable.');
+        if (in_array($response->status(), [408, 504], true)) throw new LiveLeadSourceException('SOURCE_TIMEOUT', 'The live search provider timed out.');
+        if ($response->serverError()) throw new LiveLeadSourceException('SOURCE_TEMPORARILY_UNAVAILABLE', 'The live search provider is temporarily unavailable.');
         if (! $response->successful()) throw new LiveLeadSourceException('SOURCE_RESPONSE_INVALID', 'The live search provider returned an unsuccessful response.');
 
         $payload = $response->json();

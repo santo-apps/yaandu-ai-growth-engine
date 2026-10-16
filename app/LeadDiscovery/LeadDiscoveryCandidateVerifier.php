@@ -80,15 +80,19 @@ final class LeadDiscoveryCandidateVerifier
             ]);
         } catch (Throwable $error) {
             $code = $this->failureCode($error);
+            $candidateFailure = $this->isCandidateWebsiteFailure($code);
             DB::table('lead_discovery_candidates')->where('tenant_id', $tenantId)->where('id', $candidateId)->update([
-                'processing_status' => 'failed', 'validation_status' => 'failed', 'eligibility_status' => 'needs_review',
+                'processing_status' => $candidateFailure ? 'needs_review' : 'failed',
+                'validation_status' => $candidateFailure ? 'needs_review' : 'failed',
+                'official_domain_status' => $candidateFailure ? 'needs_review' : $candidate->official_domain_status,
+                'eligibility_status' => 'needs_review', 'eligibility_confidence' => null,
                 'validation_reason_code' => $code, 'validation_reason' => $this->safeReason($code), 'updated_at' => now(),
             ]);
-            Log::warning('Lead discovery website verification failed safely.', [
-                'operation' => 'lead_discovery_candidate_verification', 'tenant_id' => $tenantId, 'run_id' => $candidate->run_id,
-                'candidate_id' => $candidateId, 'safe_domain' => $candidate->normalized_domain,
-                'failure_code' => $code, 'exception_class' => $error::class,
-                'exception_file' => basename($error->getFile()), 'exception_line' => $error->getLine(),
+            Log::warning($candidateFailure ? 'Lead discovery candidate website could not be verified.' : 'Lead discovery candidate processing failed safely.', [
+                'operation' => $candidateFailure ? 'lead_discovery_candidate_unverifiable' : 'lead_discovery_processing_error',
+                'tenant_id' => $tenantId, 'run_id' => $candidate->run_id, 'candidate_id' => $candidateId,
+                'safe_domain' => $candidate->normalized_domain, 'failure_code' => $code,
+                'exception_class' => $error::class, 'exception_file' => basename($error->getFile()), 'exception_line' => $error->getLine(),
             ]);
             report_if(app()->environment('local', 'testing'), $error);
         } finally {
@@ -150,21 +154,58 @@ final class LeadDiscoveryCandidateVerifier
 
     private function failureCode(Throwable $error): string
     {
-        $message = mb_strtoupper($error->getMessage());
-        foreach (['ROBOTS', 'DNS_FAILURE', 'UNSAFE_URL', 'UNSAFE_REDIRECT', 'HTTP_FAILURE', 'NON_HTML', 'OVERSIZED', 'TIMEOUT'] as $code) if (str_contains($message, $code)) return $code;
-        return $error instanceof \InvalidArgumentException ? 'INVALID_CANDIDATE_URL' : 'VERIFICATION_FAILED';
+        $message = mb_strtoupper(trim($error->getMessage()));
+        $codes = ['ROBOTS', 'ROBOTS_DENIED', 'ROBOTS_UNAVAILABLE', 'ROBOTS_DNS_FAILURE', 'ROBOTS_TIMEOUT', 'ROBOTS_CONNECT_TIMEOUT',
+            'ROBOTS_TLS_FAILURE', 'ROBOTS_CONNECTION_FAILED', 'ROBOTS_UNSAFE_REDIRECT', 'DNS_FAILURE', 'UNSAFE_URL',
+            'UNSAFE_REDIRECT', 'HTTP_FAILURE', 'HTTP_UNREACHABLE', 'NON_HTML', 'OVERSIZED', 'TIMEOUT', 'CONNECT_TIMEOUT',
+            'TLS_FAILURE', 'CONNECTION_FAILED', 'TRANSPORT_FAILURE', 'CANDIDATE_WEBSITE_MISSING', 'PARSE_FAILURE', 'DIRECTORY_EVIDENCE'];
+        if (in_array($message, $codes, true)) {
+            if ($message === 'TRANSPORT_FAILURE') return $this->transportFailureCode($error);
+            if ($message === 'ROBOTS_TRANSPORT_FAILURE') return 'ROBOTS_UNAVAILABLE';
+            return $message;
+        }
+        if ($message === 'ROBOTS_TRANSPORT_FAILURE'
+            || (str_starts_with($message, 'ROBOTS_') && in_array(substr($message, 7), ['DNS_FAILURE', 'TIMEOUT', 'CONNECT_TIMEOUT', 'TLS_FAILURE', 'CONNECTION_FAILED', 'TRANSPORT_FAILURE'], true))) {
+            return 'ROBOTS_UNAVAILABLE';
+        }
+
+        return 'VERIFICATION_FAILED';
+    }
+
+    private function transportFailureCode(Throwable $error): string
+    {
+        for ($current = $error->getPrevious(); $current; $current = $current->getPrevious()) {
+            $message = mb_strtolower($current->getMessage());
+            if (str_contains($message, 'ssl') || str_contains($message, 'tls') || str_contains($message, 'certificate')) return 'TLS_FAILURE';
+            if (str_contains($message, 'timeout') && str_contains($message, 'connect')) return 'CONNECT_TIMEOUT';
+            if (str_contains($message, 'timeout')) return 'TIMEOUT';
+        }
+
+        return 'CONNECTION_FAILED';
+    }
+
+    private function isCandidateWebsiteFailure(string $code): bool
+    {
+        return in_array($code, ['ROBOTS', 'ROBOTS_DENIED', 'ROBOTS_UNAVAILABLE', 'ROBOTS_DNS_FAILURE', 'ROBOTS_TIMEOUT',
+            'ROBOTS_CONNECT_TIMEOUT', 'ROBOTS_TLS_FAILURE', 'ROBOTS_CONNECTION_FAILED', 'ROBOTS_UNSAFE_REDIRECT',
+            'DNS_FAILURE', 'UNSAFE_URL', 'UNSAFE_REDIRECT', 'HTTP_FAILURE', 'HTTP_UNREACHABLE', 'NON_HTML', 'OVERSIZED',
+            'TIMEOUT', 'CONNECT_TIMEOUT', 'TLS_FAILURE', 'CONNECTION_FAILED', 'CANDIDATE_WEBSITE_MISSING', 'INVALID_CANDIDATE_URL',
+            'PARSE_FAILURE', 'DIRECTORY_EVIDENCE'], true);
     }
 
     private function safeReason(string $code): string
     {
         return match ($code) {
-            'ROBOTS', 'ROBOTS_DENIED', 'ROBOTS_UNAVAILABLE' => 'Website crawl permission could not be verified.',
-            'UNSAFE_URL', 'UNSAFE_REDIRECT' => 'The website URL did not pass public URL safety checks.',
+            'ROBOTS', 'ROBOTS_DENIED', 'ROBOTS_UNAVAILABLE', 'ROBOTS_DNS_FAILURE', 'ROBOTS_TIMEOUT', 'ROBOTS_CONNECT_TIMEOUT',
+            'ROBOTS_TLS_FAILURE', 'ROBOTS_CONNECTION_FAILED' => 'Website crawl permission could not be verified.',
+            'UNSAFE_URL', 'UNSAFE_REDIRECT', 'ROBOTS_UNSAFE_REDIRECT', 'INVALID_CANDIDATE_URL' => 'The website URL did not pass public URL safety checks.',
             'DNS_FAILURE' => 'The website host could not be resolved safely.',
-            'HTTP_FAILURE' => 'The website did not return a successful page response.',
+            'HTTP_FAILURE', 'HTTP_UNREACHABLE', 'CONNECTION_FAILED', 'TLS_FAILURE' => 'The public website could not be reached safely.',
             'NON_HTML' => 'The public website response was not HTML.',
             'OVERSIZED' => 'The website response exceeded the configured size limit.',
-            'TIMEOUT' => 'The website response exceeded the configured timeout.',
+            'TIMEOUT', 'CONNECT_TIMEOUT' => 'The website response exceeded the configured timeout.',
+            'CANDIDATE_WEBSITE_MISSING' => 'No public website was provided for this candidate.',
+            'PARSE_FAILURE', 'DIRECTORY_EVIDENCE' => 'The public website could not be verified as an official business website.',
             default => 'The website could not be verified safely.',
         };
     }

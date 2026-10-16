@@ -35,7 +35,9 @@ final class GleifLeadSourceAdapter extends AbstractOpenLeadSourceAdapter
         if (trim($query->keywords) !== '') $params['filter[entity.legalName]'] = mb_substr($query->keywords, 0, 100);
         try { $response = Http::acceptJson()->connectTimeout(4)->timeout(20)->get((string) config('lead_discovery.endpoints.gleif'), $params); }
         catch (\Throwable) { throw new LiveLeadSourceException('SOURCE_TIMEOUT', 'GLEIF did not respond within its bounded timeout.'); }
-        if ($response->status() === 429 || $response->status() >= 500) throw new LiveLeadSourceException('SOURCE_RATE_LIMITED', 'GLEIF is busy or rate limited.', max(5, (int) $response->header('Retry-After', 10)));
+        if ($response->status() === 429) throw new LiveLeadSourceException('SOURCE_RATE_LIMITED', 'GLEIF is rate limited.', LiveLeadSourceException::retryAfterSeconds($response->header('Retry-After')));
+        if (in_array($response->status(), [408, 504], true)) throw new LiveLeadSourceException('SOURCE_TIMEOUT', 'GLEIF timed out.');
+        if ($response->serverError()) throw new LiveLeadSourceException('SOURCE_TEMPORARILY_UNAVAILABLE', 'GLEIF is temporarily unavailable.');
         if (! $response->successful()) throw new LiveLeadSourceException('SOURCE_RESPONSE_INVALID', 'GLEIF returned an unsuccessful response.');
         $rows = data_get($response->json(), 'data');
         if (! is_array($rows)) throw new LiveLeadSourceException('SOURCE_RESPONSE_INVALID', 'GLEIF returned an invalid entity list.');

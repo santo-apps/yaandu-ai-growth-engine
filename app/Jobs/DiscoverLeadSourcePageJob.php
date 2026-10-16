@@ -22,7 +22,7 @@ final class DiscoverLeadSourcePageJob implements ShouldQueue, ShouldBeUniqueUnti
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
 
     public int $tries = 3;
-    public array $backoff = [5, 15];
+    public array $backoff = [5, 15, 30];
     public int $timeout = 45;
     public int $uniqueFor = 3600;
 
@@ -77,15 +77,17 @@ final class DiscoverLeadSourcePageJob implements ShouldQueue, ShouldBeUniqueUnti
         if ($pacingInterval !== null && RateLimiter::tooManyAttempts($rateKey, 1)) {
             // Local pacing is not a provider failure. Reschedule a fresh queued
             // execution so it does not consume the current job's retry budget.
+            $this->queueCheckpointForLocalPacing($checkpoint);
             self::dispatch($this->tenantId, $this->checkpointId)
                 ->delay(now()->addSeconds(max(1, RateLimiter::availableIn($rateKey))));
             return;
         }
         if ($pacingInterval === null && RateLimiter::tooManyAttempts($rateKey, max(1, min((int) config('lead_discovery.live_rate_per_minute'), $capability->defaultRateLimit ?: (int) config('lead_discovery.live_rate_per_minute'))))) {
-            DB::table('lead_discovery_checkpoints')->where('tenant_id', $this->tenantId)->where('id', $checkpoint->id)->increment('attempts');
-            $freshCheckpoint = DB::table('lead_discovery_checkpoints')->where('tenant_id', $this->tenantId)->where('id', $checkpoint->id)->first();
-            if ((int) $freshCheckpoint->attempts >= 3) { $this->fail($checkpoint, $run, $source, 'SOURCE_RATE_LIMITED'); return; }
-            $this->release(3); return;
+            // Application-local pacing does not count as a provider attempt.
+            $this->queueCheckpointForLocalPacing($checkpoint);
+            self::dispatch($this->tenantId, $this->checkpointId)
+                ->delay(now()->addSeconds(max(1, RateLimiter::availableIn($rateKey))));
+            return;
         }
         $claimed = DB::transaction(function () use ($checkpoint, $campaign, $run, $limits): string {
             DB::table('lead_discovery_campaigns')->where('tenant_id', $this->tenantId)->where('id', $campaign->id)->lockForUpdate()->first();
@@ -179,7 +181,19 @@ final class DiscoverLeadSourcePageJob implements ShouldQueue, ShouldBeUniqueUnti
             elseif (! $page->exhausted && $freshCampaign->status !== 'paused' && $campaignCandidateCount >= $limits['candidates']) { $this->stopRun($campaign, $freshRun, $checkpoint, 'CAMPAIGN_LIMIT_REACHED'); return; }
             $this->finishIfDone($campaign, $freshRun);
         } catch (LiveLeadSourceException $error) {
-            if ($error->errorCode === 'SOURCE_RATE_LIMITED' && (int) $checkpoint->attempts + 1 < 3) { $this->release(max(1, $error->retryAfter ?? 5)); return; }
+            if (in_array($error->errorCode, ['SOURCE_TIMEOUT', 'SOURCE_TEMPORARILY_UNAVAILABLE', 'SOURCE_RATE_LIMITED'], true)
+                && ((int) $checkpoint->attempts - (int) $checkpoint->pages_completed + 1) < 3) {
+                // `attempts` is cumulative over the cursor chain. Subtracting
+                // successful pages gives the retry number for this page only.
+                $failedAttempt = (int) $checkpoint->attempts - (int) $checkpoint->pages_completed + 1;
+                $backoff = [5, 15, 30];
+                $delay = $backoff[min($failedAttempt - 1, count($backoff) - 1)];
+                if ($error->errorCode === 'SOURCE_RATE_LIMITED' && $error->retryAfter !== null) {
+                    $delay = max($delay, min(3600, max(1, $error->retryAfter)));
+                }
+                $this->release($delay);
+                return;
+            }
             $this->fail($checkpoint, $run, $source, $error->errorCode);
         } catch (\Throwable $error) {
             $this->fail($checkpoint, $run, $source, 'SOURCE_RESPONSE_INVALID');
@@ -196,6 +210,12 @@ final class DiscoverLeadSourcePageJob implements ShouldQueue, ShouldBeUniqueUnti
             'candidates' => min((int) config('lead_discovery.live_max_raw_candidates'), (int) data_get($config, 'limits.candidates', config('lead_discovery.max_candidates_per_run'))),
             'processing' => min((int) config('lead_discovery.live_max_raw_candidates'), (int) data_get($config, 'limits.processing', config('lead_discovery.max_candidate_processing'))),
         ];
+    }
+
+    private function queueCheckpointForLocalPacing(object $checkpoint): void
+    {
+        DB::table('lead_discovery_checkpoints')->where('tenant_id', $this->tenantId)->where('id', $checkpoint->id)
+            ->where('status', 'running')->update(['status' => 'queued', 'updated_at' => now()]);
     }
 
     private function withinLimits(object $campaign, object $run): bool

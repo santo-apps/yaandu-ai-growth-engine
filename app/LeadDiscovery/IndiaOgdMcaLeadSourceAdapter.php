@@ -37,7 +37,9 @@ final class IndiaOgdMcaLeadSourceAdapter extends AbstractOpenLeadSourceAdapter
         try {
             $response = Http::acceptJson()->connectTimeout(4)->timeout(20)->get('https://api.data.gov.in/resource/'.$resource, $params);
         } catch (\Throwable) { throw new LiveLeadSourceException('SOURCE_TIMEOUT', 'The official OGD catalog did not respond within its bounded timeout.'); }
-        if ($response->status() === 429 || $response->status() >= 500) throw new LiveLeadSourceException('SOURCE_RATE_LIMITED', 'The official OGD catalog is busy or rate limited.', max(5, (int) $response->header('Retry-After', 10)));
+        if ($response->status() === 429) throw new LiveLeadSourceException('SOURCE_RATE_LIMITED', 'The official OGD catalog is rate limited.', LiveLeadSourceException::retryAfterSeconds($response->header('Retry-After')));
+        if (in_array($response->status(), [408, 504], true)) throw new LiveLeadSourceException('SOURCE_TIMEOUT', 'The official OGD catalog timed out.');
+        if ($response->serverError()) throw new LiveLeadSourceException('SOURCE_TEMPORARILY_UNAVAILABLE', 'The official OGD catalog is temporarily unavailable.');
         if (! $response->successful()) throw new LiveLeadSourceException('SOURCE_RESPONSE_INVALID', 'The official OGD catalog returned an unsuccessful response.');
         $payload = $response->json(); $rows = data_get($payload, 'records');
         if (! is_array($rows)) throw new LiveLeadSourceException('SOURCE_RESPONSE_INVALID', 'The official OGD catalog returned an invalid record list.');

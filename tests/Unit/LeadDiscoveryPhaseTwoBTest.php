@@ -272,6 +272,38 @@ class LeadDiscoveryPhaseTwoBTest extends TestCase
         Http::assertSent(fn ($request) => $request->method() === 'GET' && str_contains($request->url(), 'api.data.gov.in/resource/'));
     }
 
+    #[\PHPUnit\Framework\Attributes\DataProvider('officialSourceAvailabilityFailures')]
+    public function test_official_sources_classify_transient_statuses_and_honor_http_date_retry_after(string $source, int $status, string $expected): void
+    {
+        $url = $source === 'india_ogd_mca' ? 'api.data.gov.in/*' : 'api.gleif.org/*';
+        $headers = $status === 429 ? ['Retry-After' => gmdate(DATE_RFC7231, time() + 90)] : [];
+        Http::fake([$url => Http::response(['temporary' => true], $status, $headers)]);
+        $query = $source === 'india_ogd_mca'
+            ? new DiscoveryQuery('campaign', 'tenant', '', 'IN', null, null, 'mca', '', 10, null, ['country_code' => 'IN'])
+            : new DiscoveryQuery('campaign', 'tenant', '', 'AE', null, null, 'gleif', '', 10, null, ['country_code' => 'AE']);
+        $adapter = $source === 'india_ogd_mca' ? app(IndiaOgdMcaLeadSourceAdapter::class) : app(GleifLeadSourceAdapter::class);
+
+        try {
+            $adapter->search($query, $this->approvedSource());
+            self::fail('Expected provider availability failure.');
+        } catch (\App\LeadDiscovery\LiveLeadSourceException $error) {
+            self::assertSame($expected, $error->errorCode);
+            if ($status === 429) self::assertGreaterThanOrEqual(60, $error->retryAfter);
+        }
+    }
+
+    public static function officialSourceAvailabilityFailures(): array
+    {
+        return [
+            'MCA rate limit' => ['india_ogd_mca', 429, 'SOURCE_RATE_LIMITED'],
+            'MCA temporary outage' => ['india_ogd_mca', 503, 'SOURCE_TEMPORARILY_UNAVAILABLE'],
+            'MCA gateway timeout' => ['india_ogd_mca', 504, 'SOURCE_TIMEOUT'],
+            'GLEIF rate limit' => ['gleif', 429, 'SOURCE_RATE_LIMITED'],
+            'GLEIF temporary outage' => ['gleif', 503, 'SOURCE_TEMPORARILY_UNAVAILABLE'],
+            'GLEIF gateway timeout' => ['gleif', 504, 'SOURCE_TIMEOUT'],
+        ];
+    }
+
     public function test_gleif_maps_lei_address_and_cc0_provenance(): void
     {
         Http::fake(['api.gleif.org/*' => Http::response(['data' => [[
