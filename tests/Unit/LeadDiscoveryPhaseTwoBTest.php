@@ -3,6 +3,7 @@
 namespace Tests\Unit;
 
 use App\LeadDiscovery\DiscoveryQuery;
+use App\LeadDiscovery\BraveSearchLeadSourceAdapter;
 use App\LeadDiscovery\GleifLeadSourceAdapter;
 use App\LeadDiscovery\IndiaOgdMcaLeadSourceAdapter;
 use App\LeadDiscovery\LeadDiscoveryQueryTaxonomy;
@@ -41,10 +42,30 @@ class LeadDiscoveryPhaseTwoBTest extends TestCase
         self::assertSame('node/123', $page->candidates[0]['osm_object_id']);
         self::assertSame('Healthcare', $page->candidates[0]['industry']);
         self::assertSame('clinic', $page->candidates[0]['source_category']);
+        self::assertNull($page->candidates[0]['country_code'], 'Campaign country must not be copied into candidate evidence.');
+        self::assertNull($page->candidates[0]['city'], 'Campaign city must not be copied into candidate evidence.');
+        self::assertNull($page->candidates[0]['region'], 'Campaign region must not be copied into candidate evidence.');
         self::assertSame('© OpenStreetMap contributors', $page->candidates[0]['attribution']['attribution_text']);
         self::assertTrue($page->exhausted);
         Http::assertSent(fn ($request) => $request->method() === 'POST' && str_contains($request->url(), 'overpass-api.de')
             && str_contains(urldecode($request->body()), '25,55,25.2,55.4') && str_contains(urldecode($request->body()), 'out center tags 10;'));
+    }
+
+    public function test_brave_campaign_location_is_not_copied_to_search_result_candidate(): void
+    {
+        config(['services.brave_search.key' => 'synthetic-key']);
+        Http::fake(['api.search.brave.com/*' => Http::response(['web' => ['results' => [[
+            'url' => 'https://business.example/', 'title' => 'Synthetic Retailer', 'description' => 'Public search snippet',
+        ]]]], 200)]);
+        $query = new DiscoveryQuery('campaign', 'tenant', 'E-commerce & Retail', 'IN', 'Tamil Nadu', 'Chennai', 'retail', 'retail Chennai', 10, null,
+            ['country_code' => 'IN', 'region' => 'Tamil Nadu', 'city' => 'Chennai'], 'ecommerce_retail');
+        $page = app(BraveSearchLeadSourceAdapter::class)->search($query, $this->approvedSource());
+
+        self::assertCount(1, $page->candidates);
+        self::assertNull($page->candidates[0]['country_code'] ?? null);
+        self::assertNull($page->candidates[0]['city'] ?? null);
+        self::assertNull($page->candidates[0]['region'] ?? null);
+        self::assertSame([], $page->candidates[0]['geographic_evidence_fields'] ?? []);
     }
 
     public function test_wikidata_uses_bounded_country_sparql_and_maps_qid_and_cc0(): void
@@ -52,6 +73,7 @@ class LeadDiscoveryPhaseTwoBTest extends TestCase
         Http::fake(['query.wikidata.org/*' => Http::response(['results' => ['bindings' => [[
             'item' => ['value' => 'https://www.wikidata.org/entity/Q123'], 'label' => ['value' => 'Synthetic Company'],
             'country' => ['value' => 'https://www.wikidata.org/entity/Q902'],
+            'countryCode' => ['value' => 'AE'],
             'industry' => ['value' => 'https://www.wikidata.org/entity/Q484847'],
             'website' => ['value' => 'https://company.example'],
             'headquarters' => ['value' => 'https://www.wikidata.org/entity/Q1353'],
@@ -72,7 +94,7 @@ class LeadDiscoveryPhaseTwoBTest extends TestCase
         self::assertTrue($page->exhausted);
         Http::assertSent(function ($request): bool {
             $sparql = (string) $request['query'];
-            return $request->method() === 'GET' && str_contains($sparql, 'wdt:P297 "AE"')
+            return $request->method() === 'GET' && str_contains($sparql, '?country wdt:P297 ?countryCode') && str_contains($sparql, 'FILTER(?countryCode = "AE")')
                 && str_contains($sparql, 'wdt:P452 ?industry') && str_contains($sparql, 'VALUES ?industry { wd:Q484847 wd:Q126793 }')
                 && str_contains($sparql, 'LIMIT 10') && ! str_contains($sparql, 'P31/P279')
                 && ! str_contains($sparql, 'SERVICE wikibase:label') && ! str_contains(strtoupper($sparql), 'ORDER BY');
@@ -84,6 +106,7 @@ class LeadDiscoveryPhaseTwoBTest extends TestCase
         $binding = static fn (string $item, string $headquarters = 'http://www.wikidata.org/entity/Q1353'): array => [
             'item' => ['value' => $item], 'label' => ['value' => 'Synthetic Retailer'],
             'country' => ['value' => 'https://www.wikidata.org/entity/Q668'],
+            'countryCode' => ['value' => 'IN'],
             'industry' => ['value' => 'https://www.wikidata.org/entity/Q484847'],
             'website' => ['value' => 'https://retailer.example'],
             'headquarters' => ['value' => $headquarters], 'headquartersLabel' => ['value' => 'Dubai'],
@@ -165,7 +188,7 @@ class LeadDiscoveryPhaseTwoBTest extends TestCase
     {
         Http::fake(['query.wikidata.org/*' => Http::response(['results' => ['bindings' => [[
             'item' => ['value' => 'https://www.wikidata.org/entity/Q321'], 'label' => ['value' => 'Synthetic Retailer'],
-            'country' => ['value' => 'https://www.wikidata.org/entity/Q668'], 'industry' => ['value' => 'https://www.wikidata.org/entity/Q126793'],
+            'country' => ['value' => 'https://www.wikidata.org/entity/Q668'], 'countryCode' => ['value' => 'IN'], 'industry' => ['value' => 'https://www.wikidata.org/entity/Q126793'],
         ]]]], 200)]);
         $query = new DiscoveryQuery('campaign', 'tenant', 'E-commerce & Retail', 'IN', 'Tamil Nadu', 'Chennai', 'industry-ecommerce_retail', '', 10, null,
             ['country_code' => 'IN'], 'ecommerce_retail');
@@ -270,6 +293,38 @@ class LeadDiscoveryPhaseTwoBTest extends TestCase
         self::assertNull($page->candidates[0]['website']);
         self::assertSame('India OGD / NDSAP', $page->candidates[0]['attribution']['license_name']);
         Http::assertSent(fn ($request) => $request->method() === 'GET' && str_contains($request->url(), 'api.data.gov.in/resource/'));
+    }
+
+    #[\PHPUnit\Framework\Attributes\DataProvider('officialSourceAvailabilityFailures')]
+    public function test_official_sources_classify_transient_statuses_and_honor_http_date_retry_after(string $source, int $status, string $expected): void
+    {
+        $url = $source === 'india_ogd_mca' ? 'api.data.gov.in/*' : 'api.gleif.org/*';
+        $headers = $status === 429 ? ['Retry-After' => gmdate(DATE_RFC7231, time() + 90)] : [];
+        Http::fake([$url => Http::response(['temporary' => true], $status, $headers)]);
+        $query = $source === 'india_ogd_mca'
+            ? new DiscoveryQuery('campaign', 'tenant', '', 'IN', null, null, 'mca', '', 10, null, ['country_code' => 'IN'])
+            : new DiscoveryQuery('campaign', 'tenant', '', 'AE', null, null, 'gleif', '', 10, null, ['country_code' => 'AE']);
+        $adapter = $source === 'india_ogd_mca' ? app(IndiaOgdMcaLeadSourceAdapter::class) : app(GleifLeadSourceAdapter::class);
+
+        try {
+            $adapter->search($query, $this->approvedSource());
+            self::fail('Expected provider availability failure.');
+        } catch (\App\LeadDiscovery\LiveLeadSourceException $error) {
+            self::assertSame($expected, $error->errorCode);
+            if ($status === 429) self::assertGreaterThanOrEqual(60, $error->retryAfter);
+        }
+    }
+
+    public static function officialSourceAvailabilityFailures(): array
+    {
+        return [
+            'MCA rate limit' => ['india_ogd_mca', 429, 'SOURCE_RATE_LIMITED'],
+            'MCA temporary outage' => ['india_ogd_mca', 503, 'SOURCE_TEMPORARILY_UNAVAILABLE'],
+            'MCA gateway timeout' => ['india_ogd_mca', 504, 'SOURCE_TIMEOUT'],
+            'GLEIF rate limit' => ['gleif', 429, 'SOURCE_RATE_LIMITED'],
+            'GLEIF temporary outage' => ['gleif', 503, 'SOURCE_TEMPORARILY_UNAVAILABLE'],
+            'GLEIF gateway timeout' => ['gleif', 504, 'SOURCE_TIMEOUT'],
+        ];
     }
 
     public function test_gleif_maps_lei_address_and_cc0_provenance(): void

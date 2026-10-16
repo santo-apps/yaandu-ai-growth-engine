@@ -35,7 +35,9 @@ final class GleifLeadSourceAdapter extends AbstractOpenLeadSourceAdapter
         if (trim($query->keywords) !== '') $params['filter[entity.legalName]'] = mb_substr($query->keywords, 0, 100);
         try { $response = Http::acceptJson()->connectTimeout(4)->timeout(20)->get((string) config('lead_discovery.endpoints.gleif'), $params); }
         catch (\Throwable) { throw new LiveLeadSourceException('SOURCE_TIMEOUT', 'GLEIF did not respond within its bounded timeout.'); }
-        if ($response->status() === 429 || $response->status() >= 500) throw new LiveLeadSourceException('SOURCE_RATE_LIMITED', 'GLEIF is busy or rate limited.', max(5, (int) $response->header('Retry-After', 10)));
+        if ($response->status() === 429) throw new LiveLeadSourceException('SOURCE_RATE_LIMITED', 'GLEIF is rate limited.', LiveLeadSourceException::retryAfterSeconds($response->header('Retry-After')));
+        if (in_array($response->status(), [408, 504], true)) throw new LiveLeadSourceException('SOURCE_TIMEOUT', 'GLEIF timed out.');
+        if ($response->serverError()) throw new LiveLeadSourceException('SOURCE_TEMPORARILY_UNAVAILABLE', 'GLEIF is temporarily unavailable.');
         if (! $response->successful()) throw new LiveLeadSourceException('SOURCE_RESPONSE_INVALID', 'GLEIF returned an unsuccessful response.');
         $rows = data_get($response->json(), 'data');
         if (! is_array($rows)) throw new LiveLeadSourceException('SOURCE_RESPONSE_INVALID', 'GLEIF returned an invalid entity list.');
@@ -47,11 +49,16 @@ final class GleifLeadSourceAdapter extends AbstractOpenLeadSourceAdapter
             $name = $this->firstString((array) ($entity['legalName'] ?? []), ['name']);
             if (! $lei || ! $name) continue;
             $address = (array) ($entity['legalAddress'] ?? []);
-            $attributes = ['lei' => $lei, 'legal_name' => $name, 'country_code' => $address['country'] ?? $country,
+            $geographicFields = [];
+            if (! empty($address['country'])) $geographicFields['country_code'] = 'legalAddress.country';
+            if (! empty($address['region'])) $geographicFields['region'] = 'legalAddress.region';
+            if (! empty($address['city'])) $geographicFields['city'] = 'legalAddress.city';
+            $attributes = ['lei' => $lei, 'legal_name' => $name, 'country_code' => $address['country'] ?? null,
                 'city' => $address['city'] ?? null, 'region' => $address['region'] ?? null, 'postal_code' => $address['postalCode'] ?? null,
                 'address' => implode(', ', array_filter([$address['addressLines'][0] ?? null, $address['city'] ?? null, $address['region'] ?? null, $address['country'] ?? null])),
                 'entity_status' => $entity['status'] ?? null, 'raw_metadata' => $attr];
             $candidates[] = $this->mapCandidate($this->key(), ['source_record_id' => $lei, 'source_record_type' => 'gleif_lei',
+                'geographic_evidence_fields' => $geographicFields,
                 'source_url' => 'https://api.gleif.org/api/v1/lei-records/'.rawurlencode($lei), 'raw_metadata' => $attr], $attributes,
                 ['license_key' => 'cc0', 'license_name' => 'CC0 1.0', 'license_url' => 'https://www.gleif.org/en/lei-data/access-and-use-lei-data']);
         }

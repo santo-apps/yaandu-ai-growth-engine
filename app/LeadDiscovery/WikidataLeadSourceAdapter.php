@@ -56,12 +56,12 @@ final class WikidataLeadSourceAdapter extends AbstractOpenLeadSourceAdapter
         // curated industry properties. The outer query enriches that bounded
         // set with direct English labels and stored facts; no label SERVICE or
         // transitive organization-class traversal is involved.
-        $sparql = 'SELECT ?item (SAMPLE(?labelValue) AS ?label) (SAMPLE(?country) AS ?country) '
+        $sparql = 'SELECT ?item (SAMPLE(?labelValue) AS ?label) (SAMPLE(?country) AS ?country) (SAMPLE(?countryCode) AS ?countryCode) '
             .'(SAMPLE(?industry) AS ?industry) (SAMPLE(?website) AS ?website) '
             .'(SAMPLE(?headquarters) AS ?headquarters) (SAMPLE(?headquartersLabelValue) AS ?headquartersLabel) WHERE { '
-            .'{ SELECT DISTINCT ?item WHERE { ?country wdt:P297 "'.$country.'". '
+            .'{ SELECT DISTINCT ?item WHERE { ?country wdt:P297 ?countryCode. FILTER(?countryCode = "'.$country.'") '
             .'?item wdt:P17 ?country; wdt:P452 ?industry. VALUES ?industry { '.$industryValues.' }'.$keyset.' } LIMIT '.$limit.' } '
-            .'?country wdt:P297 "'.$country.'". ?item wdt:P17 ?country; wdt:P452 ?industry. '
+            .'?country wdt:P297 ?countryCode. FILTER(?countryCode = "'.$country.'") ?item wdt:P17 ?country; wdt:P452 ?industry. '
             .'VALUES ?industry { '.$industryValues.' } '
             .'?item rdfs:label ?labelValue. FILTER(LANG(?labelValue) = "en") '
             .'OPTIONAL { ?item wdt:P856 ?website. } '
@@ -104,18 +104,22 @@ final class WikidataLeadSourceAdapter extends AbstractOpenLeadSourceAdapter
             $normalizedIndustry = (string) data_get(config('lead_discovery.industries', []), $industryKey, '');
             $rawEvidence = [
                 'item' => data_get($binding, 'item'), 'country' => data_get($binding, 'country'),
+                'country_code' => data_get($binding, 'countryCode'),
                 'industry' => data_get($binding, 'industry'), 'website' => data_get($binding, 'website'),
                 'headquarters' => data_get($binding, 'headquarters'), 'headquarters_qid' => $headquartersQid,
                 'headquartersLabel' => data_get($binding, 'headquartersLabel'),
             ];
+            $geographicFields = ['country_code' => 'P297'];
+            if ($headquartersLabel !== '') $geographicFields['city'] = 'P159';
             $candidates[] = $this->mapCandidate($this->key(), [
                 'source_record_id' => $qid, 'source_record_type' => 'wikidata_entity',
+                'geographic_evidence_fields' => $geographicFields,
                 'source_url' => 'https://www.wikidata.org/wiki/'.$qid,
                 'raw_metadata' => ['binding' => $rawEvidence, 'discovery_scope' => $headquartersLabel !== '' ? 'country_industry_headquarters_evidence' : 'country_industry',
                     'country_code' => $country, 'industry_key' => $industryKey],
             ], [
                 'official_name' => $label, 'website' => is_string($website) && $website !== '' ? $website : null,
-                'country_code' => $country, 'normalized_industry' => $normalizedIndustry !== '' ? $normalizedIndustry : null,
+                'country_code' => data_get($binding, 'countryCode.value'), 'normalized_industry' => $normalizedIndustry !== '' ? $normalizedIndustry : null,
                 'source_industry' => $industryLabel !== '' ? $industryLabel : null,
                 'city' => $headquartersLabel !== '' ? $headquartersLabel : null, 'wikidata_qid' => $qid,
                 'headquarters_qid' => $headquartersQid,

@@ -37,7 +37,9 @@ final class IndiaOgdMcaLeadSourceAdapter extends AbstractOpenLeadSourceAdapter
         try {
             $response = Http::acceptJson()->connectTimeout(4)->timeout(20)->get('https://api.data.gov.in/resource/'.$resource, $params);
         } catch (\Throwable) { throw new LiveLeadSourceException('SOURCE_TIMEOUT', 'The official OGD catalog did not respond within its bounded timeout.'); }
-        if ($response->status() === 429 || $response->status() >= 500) throw new LiveLeadSourceException('SOURCE_RATE_LIMITED', 'The official OGD catalog is busy or rate limited.', max(5, (int) $response->header('Retry-After', 10)));
+        if ($response->status() === 429) throw new LiveLeadSourceException('SOURCE_RATE_LIMITED', 'The official OGD catalog is rate limited.', LiveLeadSourceException::retryAfterSeconds($response->header('Retry-After')));
+        if (in_array($response->status(), [408, 504], true)) throw new LiveLeadSourceException('SOURCE_TIMEOUT', 'The official OGD catalog timed out.');
+        if ($response->serverError()) throw new LiveLeadSourceException('SOURCE_TEMPORARILY_UNAVAILABLE', 'The official OGD catalog is temporarily unavailable.');
         if (! $response->successful()) throw new LiveLeadSourceException('SOURCE_RESPONSE_INVALID', 'The official OGD catalog returned an unsuccessful response.');
         $payload = $response->json(); $rows = data_get($payload, 'records');
         if (! is_array($rows)) throw new LiveLeadSourceException('SOURCE_RESPONSE_INVALID', 'The official OGD catalog returned an invalid record list.');
@@ -47,11 +49,15 @@ final class IndiaOgdMcaLeadSourceAdapter extends AbstractOpenLeadSourceAdapter
             $cin = $this->firstString($row, ['CIN', 'cin', 'Corporate Identification Number']);
             $name = $this->firstString($row, ['Company Name', 'company_name', 'CompanyName']);
             if (! $cin || ! $name) continue;
-            $row = [...$row, 'cin' => $cin, 'legal_name' => $name, 'country_code' => 'IN',
+            $registeredState = $this->firstString($row, ['Registered State', 'registered_state']);
+            $row = [...$row, 'cin' => $cin, 'legal_name' => $name, 'country_code' => 'IN', 'region' => $registeredState,
                 'registration_identifier_jurisdiction' => 'IN', 'registration_identifier_registry' => 'MCA', 'registration_identifier_type' => 'CIN',
                 'entity_status' => $this->firstString($row, ['Company Status', 'company_status']),
                 'registered_state' => $this->firstString($row, ['Registered State', 'registered_state']), 'source_industry' => $this->firstString($row, ['Company Category', 'Company Class'])];
+            $geographicFields = ['country_code' => 'dataset_jurisdiction'];
+            if ($registeredState !== null) $geographicFields['region'] = 'Registered State';
             $candidates[] = $this->mapCandidate($this->key(), ['source_record_id' => $cin, 'source_record_type' => 'mca_company',
+                'geographic_evidence_fields' => $geographicFields,
                 'source_url' => 'https://www.data.gov.in/catalog/company-master-data', 'raw_metadata' => $row], $row,
                 ['license_key' => 'india_ogd_ndsap', 'license_name' => 'India OGD / NDSAP', 'license_url' => 'https://www.data.gov.in/catalog/company-master-data',
                     'attribution_text' => 'Ministry of Corporate Affairs, Government of India via data.gov.in']);

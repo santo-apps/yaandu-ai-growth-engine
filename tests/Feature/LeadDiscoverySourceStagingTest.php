@@ -2,17 +2,79 @@
 
 namespace Tests\Feature;
 
+use App\Crawling\PublicAddressResolverInterface;
+use App\Jobs\VerifyLeadDiscoveryCandidateJob;
 use App\LeadDiscovery\CandidateIdentityResolver;
+use App\LeadDiscovery\LeadDiscoveryCandidateVerifier;
 use App\LeadDiscovery\LiveCandidateStager;
 use App\Models\Tenant;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Str;
 use Tests\TestCase;
 
 class LeadDiscoverySourceStagingTest extends TestCase
 {
     use RefreshDatabase;
+
+    public function test_location_classification_uses_only_field_attributed_source_evidence_and_retains_mismatches(): void
+    {
+        [$tenant, $campaign, $source, $run, $checkpoint] = $this->records('osm_overpass');
+        DB::table('lead_discovery_campaigns')->where('tenant_id', $tenant)->where('id', $campaign->id)->update([
+            'country_code' => 'IN', 'region' => 'Tamil Nadu', 'city' => 'Chennai',
+        ]);
+        $campaign = DB::table('lead_discovery_campaigns')->where('tenant_id', $tenant)->where('id', $campaign->id)->first();
+        $result = app(LiveCandidateStager::class)->stage($tenant, $campaign, $run, $source, $checkpoint, [
+            'company_name' => 'Source-confirmed Chennai Business', 'country_code' => 'India', 'region' => 'TN', 'city' => 'Madras',
+            'website' => 'https://source-chennai.example/',
+            'geographic_evidence_fields' => ['country_code' => 'addr:country', 'region' => 'addr:state', 'city' => 'addr:city'],
+            'source_record_id' => 'node/321', 'source_record_type' => 'node', 'osm_object_id' => 'node/321',
+        ], 1);
+        $candidate = DB::table('lead_discovery_candidates')->where('tenant_id', $tenant)->where('id', $result['verification_id'])->first();
+        self::assertSame('city_match', $candidate->geographic_relevance);
+        $cityEvidence = DB::table('lead_discovery_candidate_evidence')->where('tenant_id', $tenant)->where('candidate_id', $candidate->id)->where('field_name', 'city')->first();
+        self::assertSame('addr:city', json_decode((string) $cityEvidence->attribution, true)['geographic_evidence_field']);
+
+        [$tenant, $campaign, $source, $run, $checkpoint] = $this->records('osm_overpass', $tenant);
+        DB::table('lead_discovery_campaigns')->where('tenant_id', $tenant)->where('id', $campaign->id)->update([
+            'country_code' => 'IN', 'region' => 'Tamil Nadu', 'city' => 'Chennai',
+        ]);
+        $campaign = DB::table('lead_discovery_campaigns')->where('tenant_id', $tenant)->where('id', $campaign->id)->first();
+        $staged = app(LiveCandidateStager::class)->stage($tenant, $campaign, $run, $source, $checkpoint, [
+            'company_name' => 'Campaign-only location must not count', 'country_code' => 'IN', 'region' => 'Tamil Nadu', 'city' => 'Chennai',
+            'website' => 'https://campaign-only.example/',
+            'source_record_id' => 'result-2', 'source_record_type' => 'search_result',
+        ], 1);
+        $candidate = DB::table('lead_discovery_candidates')->where('tenant_id', $tenant)->where('id', $staged['verification_id'])->first();
+        self::assertSame('location_unknown', $candidate->geographic_relevance);
+
+        [$tenant, $campaign, $source, $run, $checkpoint] = $this->records('osm_overpass', $tenant);
+        DB::table('lead_discovery_campaigns')->where('tenant_id', $tenant)->where('id', $campaign->id)->update([
+            'country_code' => 'IN', 'region' => 'Tamil Nadu', 'city' => 'Chennai',
+        ]);
+        $campaign = DB::table('lead_discovery_campaigns')->where('tenant_id', $tenant)->where('id', $campaign->id)->first();
+        $mismatch = app(LiveCandidateStager::class)->stage($tenant, $campaign, $run, $source, $checkpoint, [
+            'company_name' => 'Source-confirmed Bengaluru Business', 'country_code' => 'IN', 'region' => 'Tamil Nadu', 'city' => 'Bengaluru',
+            'website' => 'https://source-bengaluru.example/',
+            'geographic_evidence_fields' => ['country_code' => 'addr:country', 'region' => 'addr:state', 'city' => 'addr:city'],
+            'source_record_id' => 'node/322', 'source_record_type' => 'node', 'osm_object_id' => 'node/322',
+        ], 1);
+        $candidate = DB::table('lead_discovery_candidates')->where('tenant_id', $tenant)->where('id', $mismatch['verification_id'])->first();
+        self::assertSame('location_mismatch', $candidate->geographic_relevance);
+        self::assertSame('rejected', $candidate->eligibility_status);
+        self::assertSame('not_promoted', $candidate->promotion_status, 'Mismatch remains available for human audit and is never auto-promoted.');
+        $this->app->instance(PublicAddressResolverInterface::class, new class implements PublicAddressResolverInterface {
+            public function resolve(string $host): array { return ['93.184.216.34']; }
+        });
+        Http::fake();
+        (new VerifyLeadDiscoveryCandidateJob($tenant, (string) $candidate->id))->handle(app(LeadDiscoveryCandidateVerifier::class));
+        self::assertSame('rejected', DB::table('lead_discovery_candidates')->where('tenant_id', $tenant)->where('id', $candidate->id)->value('eligibility_status'));
+        self::assertSame('rejected', DB::table('lead_discovery_candidates')->where('tenant_id', $tenant)->where('id', $candidate->id)->value('processing_status'));
+        Http::assertNothingSent();
+        self::assertSame(0, DB::table('campaign_recipients')->where('tenant_id', $tenant)->count());
+        self::assertSame(0, DB::table('outbound_messages')->where('tenant_id', $tenant)->count());
+    }
 
     public function test_legal_entity_without_website_is_staged_without_guessing_and_preserves_attribution(): void
     {
