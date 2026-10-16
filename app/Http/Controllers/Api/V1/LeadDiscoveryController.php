@@ -13,6 +13,8 @@ use App\LeadDiscovery\LeadSourceAdapterRegistry;
 use App\LeadDiscovery\LeadSourceCapabilityCatalog;
 use App\LeadDiscovery\LeadDiscoveryCountryCatalog;
 use App\LeadDiscovery\LeadDiscoveryIndustryTaxonomy;
+use App\LeadDiscovery\GeographicRelevanceClassifier;
+use App\LeadDiscovery\LiveCandidateStager;
 use App\Models\Contact;
 use App\Models\ContactMethod;
 use App\Models\Company;
@@ -307,7 +309,7 @@ final class LeadDiscoveryController extends Controller
             'checkpoints' => DB::table('lead_discovery_checkpoints')->where('tenant_id', $tenant)->where('campaign_id', $campaign)->orderBy('query_key')->get()]);
     }
 
-    public function import(Request $request, string $campaign, LeadSourceAdapterRegistry $registry)
+    public function import(Request $request, string $campaign, LeadSourceAdapterRegistry $registry, LiveCandidateStager $stager, GeographicRelevanceClassifier $geography)
     {
         abort_unless(config('lead_discovery.enabled'), 503, 'Lead Discovery is disabled by configuration.');
         $this->requireManager($request, ['owner', 'admin', 'manager']);
@@ -348,7 +350,7 @@ final class LeadDiscoveryController extends Controller
             409, 'The verified eligible-lead target has been reached.');
         $rows = $registry->get($source->source_key)->readCsv((string) $file->getRealPath(), $rowLimit);
         $runId = (string) Str::uuid(); $now = now(); $jobs = []; $csvHash = hash_file('sha256', (string) $file->getRealPath());
-        DB::transaction(function () use ($tenant, $campaignRow, $source, $rows, $runId, $key, $now, $csvHash, &$jobs): void {
+        DB::transaction(function () use ($tenant, $campaignRow, $source, $rows, $runId, $key, $now, $csvHash, &$jobs, $stager, $geography): void {
         DB::table('lead_discovery_runs')->insert(['id' => $runId, 'tenant_id' => $tenant, 'campaign_id' => $campaignRow->id, 'source_id' => $source->id,
                 'run_status' => 'running', 'started_at' => $now, 'candidates_found' => count($rows), 'idempotency_key' => $key,
                 'cost_metrics' => json_encode(['csv_sha256' => $csvHash, 'rows' => count($rows), 'ai_calls' => 0, 'provider_spend_minor' => 0]),
@@ -365,8 +367,8 @@ final class LeadDiscoveryController extends Controller
                 $existingCompany = $domain ? DB::table('companies')->where('tenant_id', $tenant)->where('normalized_domain', $domain)->first(['id']) : null;
                 $existingCandidate = $domain ? DB::table('lead_discovery_candidates')->where('tenant_id', $tenant)->where('normalized_domain', $domain)->first(['id']) : null;
                 $id = (string) Str::uuid();
-                $countryValue = strtoupper(trim((string) ($row['country_code'] ?? '')));
-                $country = match ($countryValue) { 'INDIA' => 'IN', 'UAE', 'UNITED ARAB EMIRATES' => 'AE', default => preg_match('/^[A-Z]{2}$/', $countryValue) ? $countryValue : null };
+                $rawCountry = trim((string) ($row['country_code'] ?? ''));
+                $country = $geography->normalizeCountry($rawCountry);
                 $location = trim(implode(', ', array_filter([(string) ($row['city'] ?? ''), (string) ($row['region'] ?? ''), $country ?? ''])));
                 $dup = (bool) ($existingCompany || $existingCandidate);
                 DB::table('lead_discovery_candidates')->insert([
@@ -388,14 +390,24 @@ final class LeadDiscoveryController extends Controller
                 $sourceUrl = $this->safeSourceUrl((string) ($row['source_url'] ?? ''));
                 foreach ([
                     'company_name' => [$name, $name, 0.8], 'industry' => [trim((string) ($row['industry'] ?? '')), trim((string) ($row['industry'] ?? '')), 0.7],
-                    'country_code' => [$country, $country, 0.8], 'city' => [trim((string) ($row['city'] ?? '')), trim((string) ($row['city'] ?? '')), 0.7],
+                    'country_code' => [$rawCountry, $country, 0.8], 'region' => [trim((string) ($row['region'] ?? '')), trim((string) ($row['region'] ?? '')), 0.7],
+                    'city' => [trim((string) ($row['city'] ?? '')), trim((string) ($row['city'] ?? '')), 0.7],
                 ] as $field => [$raw, $norm, $confidence]) {
-                    if ($raw !== '') $this->insertEvidence($tenant, $id, $campaignRow->id, $source->id, $field, 'licensed_source_row', $sourceUrl, $raw, $norm, $confidence, $attribution, $now);
+                    if (is_string($raw) && $raw !== '') {
+                        $fieldAttribution = $attribution;
+                        if (in_array($field, ['country_code', 'region', 'city'], true)) {
+                            $fieldAttribution['geographic_evidence_field'] = match ($field) {
+                                'country_code' => 'country', 'region' => 'region', 'city' => 'city',
+                            };
+                        }
+                        $this->insertEvidence($tenant, $id, $campaignRow->id, $source->id, $field, 'licensed_source_row', $sourceUrl, $raw, $norm, $confidence, $fieldAttribution, $now);
+                    }
                 }
                 if ($domain) $this->insertEvidence($tenant, $id, $campaignRow->id, $source->id, 'claimed_website', 'licensed_source_row', $sourceUrl, $website, $domain, 0.75, $attribution, $now);
                 if ($sourceUrl) foreach ($this->safeContactValues($row, (string) $domain) as [$field, $value]) {
                     $this->insertEvidence($tenant, $id, $campaignRow->id, $source->id, $field, 'licensed_public_business_contact', $sourceUrl, $value, $value, 0.7, $attribution, $now);
                 }
+                $stager->classifyAndPersistGeography($tenant, $id);
                 if (! $invalidWebsite && (! $dup || $existingCompany)) $jobs[] = [$tenant, $id];
             }
             DB::table('lead_discovery_campaigns')->where('tenant_id', $tenant)->where('id', $campaignRow->id)->update(['status' => 'running', 'started_at' => $campaignRow->started_at ?? $now, 'updated_at' => $now]);
@@ -467,28 +479,68 @@ final class LeadDiscoveryController extends Controller
         return response()->json(['campaign_id' => $campaign, 'status' => 'running', 'retry_count' => $ids->count()]);
     }
 
-    public function candidates(Request $request)
+    public function candidates(Request $request, GeographicRelevanceClassifier $geography)
     {
-        $request->validate(['campaign_id' => ['nullable', 'uuid'], 'eligibility_status' => ['nullable', 'in:eligible,needs_review,rejected'], 'promotion_status' => ['nullable', 'string', 'max:32'], 'country_code' => ['nullable', 'string', 'size:2'], 'industry' => ['nullable', 'string', 'max:150']]);
-        return DB::table('lead_discovery_candidates')->where('tenant_id', app('tenant.id'))
+        $request->validate(['campaign_id' => ['nullable', 'uuid'], 'eligibility_status' => ['nullable', 'in:eligible,needs_review,rejected'], 'promotion_status' => ['nullable', 'string', 'max:32'], 'country_code' => ['nullable', 'string', 'size:2'], 'industry' => ['nullable', 'string', 'max:150'],
+            'geographic_relevance' => ['nullable', 'in:city_match,region_match,country_match,location_unknown,location_mismatch']]);
+        $tenant = app('tenant.id');
+        $page = DB::table('lead_discovery_candidates')->where('tenant_id', $tenant)
             ->when($request->filled('campaign_id'), fn ($q) => $q->where('campaign_id', $request->input('campaign_id')))
             ->when($request->filled('eligibility_status'), fn ($q) => $q->where('eligibility_status', $request->input('eligibility_status')))
             ->when($request->filled('promotion_status'), fn ($q) => $q->where('promotion_status', $request->input('promotion_status')))
             ->when($request->filled('country_code'), fn ($q) => $q->where('country_code', strtoupper((string) $request->input('country_code'))))
+            ->when($request->input('geographic_relevance') === 'location_unknown', fn ($q) => $q->where(function ($nested): void {
+                $nested->whereNull('geographic_relevance')->orWhere('geographic_relevance', 'location_unknown');
+            }))
+            ->when($request->filled('geographic_relevance') && $request->input('geographic_relevance') !== 'location_unknown', fn ($q) => $q->where('geographic_relevance', $request->input('geographic_relevance')))
             ->when($request->filled('industry'), fn ($q) => $q->where('industry', $request->input('industry')))
+            ->orderByRaw("CASE geographic_relevance WHEN 'city_match' THEN 0 WHEN 'region_match' THEN 1 WHEN 'country_match' THEN 2 WHEN 'location_unknown' THEN 3 WHEN 'location_mismatch' THEN 4 ELSE 3 END")
             ->orderByDesc('created_at')->paginate(50);
+
+        $items = $page->getCollection();
+        $campaigns = DB::table('lead_discovery_campaigns')->where('tenant_id', $tenant)->whereIn('id', $items->pluck('campaign_id')->unique())->get()->keyBy('id');
+        $evidence = DB::table('lead_discovery_candidate_evidence as evidence')
+            ->join('lead_discovery_candidates as candidates', function ($join): void {
+                $join->on('candidates.tenant_id', '=', 'evidence.tenant_id')
+                    ->on('candidates.id', '=', 'evidence.candidate_id')
+                    ->on('candidates.campaign_id', '=', 'evidence.campaign_id');
+            })
+            ->where('evidence.tenant_id', $tenant)->where('candidates.tenant_id', $tenant)
+            ->whereIn('evidence.candidate_id', $items->pluck('id'))
+            ->whereIn('evidence.field_name', ['country_code', 'region', 'city'])
+            ->select('evidence.*')->get()->groupBy('candidate_id');
+        $page->setCollection($items->map(function ($candidate) use ($campaigns, $evidence, $geography): object {
+            $campaign = $campaigns->get($candidate->campaign_id);
+            $candidate->geographic_relevance = $campaign
+                ? $geography->classify($campaign, $evidence->get($candidate->id, collect()))
+                : $this->unknownGeography();
+            return $candidate;
+        }));
+
+        return $page;
     }
 
-    public function candidate(string $candidate)
+    public function candidate(string $candidate, GeographicRelevanceClassifier $geography)
     {
         $tenant = app('tenant.id');
         $row = DB::table('lead_discovery_candidates')->where('tenant_id', $tenant)->where('id', $candidate)->first();
         abort_unless($row, 404);
+        $campaign = DB::table('lead_discovery_campaigns')->where('tenant_id', $tenant)->where('id', $row->campaign_id)->first();
+        $evidence = DB::table('lead_discovery_candidate_evidence')->where('tenant_id', $tenant)->where('campaign_id', $row->campaign_id)
+            ->where('candidate_id', $row->id)->orderBy('field_name')->get();
+        $row->geographic_relevance = $campaign ? $geography->classify($campaign, $evidence) : $this->unknownGeography();
         return response()->json(['candidate' => $row,
-            'campaign' => DB::table('lead_discovery_campaigns')->where('tenant_id', $tenant)->where('id', $row->campaign_id)->first(),
+            'campaign' => $campaign,
             'source' => $this->sourcePayload(DB::table('lead_discovery_sources')->where('tenant_id', $tenant)->where('id', $row->source_id)->first()),
-            'evidence' => DB::table('lead_discovery_candidate_evidence')->where('tenant_id', $tenant)->where('candidate_id', $row->id)->orderBy('field_name')->get(),
+            'evidence' => $evidence,
             'matched_company' => $row->matched_company_id ? Company::where('tenant_id', $tenant)->where('id', $row->matched_company_id)->first() : null]);
+    }
+
+    private function unknownGeography(): array
+    {
+        return ['classification' => 'location_unknown', 'requested_location' => ['city' => null, 'region' => null, 'country' => null],
+            'evidence_location' => ['city' => null, 'region' => null, 'country' => null], 'evidence_source' => null,
+            'explanation' => 'No reliable source location evidence is available.'];
     }
 
     public function promote(Request $request, string $candidate)

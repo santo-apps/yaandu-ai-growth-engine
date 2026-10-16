@@ -49,11 +49,15 @@ final class IndiaOgdMcaLeadSourceAdapter extends AbstractOpenLeadSourceAdapter
             $cin = $this->firstString($row, ['CIN', 'cin', 'Corporate Identification Number']);
             $name = $this->firstString($row, ['Company Name', 'company_name', 'CompanyName']);
             if (! $cin || ! $name) continue;
-            $row = [...$row, 'cin' => $cin, 'legal_name' => $name, 'country_code' => 'IN',
+            $registeredState = $this->firstString($row, ['Registered State', 'registered_state']);
+            $row = [...$row, 'cin' => $cin, 'legal_name' => $name, 'country_code' => 'IN', 'region' => $registeredState,
                 'registration_identifier_jurisdiction' => 'IN', 'registration_identifier_registry' => 'MCA', 'registration_identifier_type' => 'CIN',
                 'entity_status' => $this->firstString($row, ['Company Status', 'company_status']),
                 'registered_state' => $this->firstString($row, ['Registered State', 'registered_state']), 'source_industry' => $this->firstString($row, ['Company Category', 'Company Class'])];
+            $geographicFields = ['country_code' => 'dataset_jurisdiction'];
+            if ($registeredState !== null) $geographicFields['region'] = 'Registered State';
             $candidates[] = $this->mapCandidate($this->key(), ['source_record_id' => $cin, 'source_record_type' => 'mca_company',
+                'geographic_evidence_fields' => $geographicFields,
                 'source_url' => 'https://www.data.gov.in/catalog/company-master-data', 'raw_metadata' => $row], $row,
                 ['license_key' => 'india_ogd_ndsap', 'license_name' => 'India OGD / NDSAP', 'license_url' => 'https://www.data.gov.in/catalog/company-master-data',
                     'attribution_text' => 'Ministry of Corporate Affairs, Government of India via data.gov.in']);

@@ -77,12 +77,20 @@ final class OpenStreetMapOverpassLeadSourceAdapter extends AbstractOpenLeadSourc
             if (empty($elementTags['name'])) continue;
             $lat = $element['lat'] ?? data_get($element, 'center.lat'); $lon = $element['lon'] ?? data_get($element, 'center.lon');
             $sourceCategory = $this->firstString($elementTags, ['shop', 'office', 'craft', 'amenity', 'tourism', 'healthcare', 'industrial', 'company']);
-            $attributes = [...$elementTags, 'latitude' => $lat, 'longitude' => $lon, 'country_code' => strtoupper((string) ($query->partition['country_code'] ?? '')),
-                'city' => $query->partition['city'] ?? null, 'region' => $query->partition['region'] ?? null,
+            $locationFields = [];
+            $countryTag = $this->firstString($elementTags, ['addr:country']);
+            $regionTag = $this->firstString($elementTags, ['addr:state']);
+            $cityTag = $this->firstString($elementTags, ['addr:city']);
+            if ($countryTag !== null) $locationFields['country_code'] = 'addr:country';
+            if ($regionTag !== null) $locationFields['region'] = 'addr:state';
+            if ($cityTag !== null) $locationFields['city'] = 'addr:city';
+            $attributes = [...$elementTags, 'latitude' => $lat, 'longitude' => $lon, 'country_code' => $countryTag,
+                'city' => $cityTag, 'region' => $regionTag,
                 'source_category' => $sourceCategory, 'source_industry' => $sourceCategory,
                 'normalized_industry' => config('lead_discovery.industries.'.$query->industryKey),
                 'osm_object_id' => $element['type'].'/'.$element['id']];
             $candidates[] = $this->mapCandidate($this->key(), ['source_record_id' => $element['type'].'/'.$element['id'], 'source_record_type' => $element['type'],
+                'geographic_evidence_fields' => $locationFields,
                 'source_url' => 'https://www.openstreetmap.org/'.$element['type'].'/'.$element['id'], 'raw_metadata' => ['tags' => $elementTags]], $attributes,
                 ['license_key' => 'odbl', 'license_name' => 'ODbL', 'license_url' => 'https://www.openstreetmap.org/copyright', 'attribution_text' => '© OpenStreetMap contributors']);
         }

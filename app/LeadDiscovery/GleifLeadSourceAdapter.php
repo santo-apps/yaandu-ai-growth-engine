@@ -49,11 +49,16 @@ final class GleifLeadSourceAdapter extends AbstractOpenLeadSourceAdapter
             $name = $this->firstString((array) ($entity['legalName'] ?? []), ['name']);
             if (! $lei || ! $name) continue;
             $address = (array) ($entity['legalAddress'] ?? []);
-            $attributes = ['lei' => $lei, 'legal_name' => $name, 'country_code' => $address['country'] ?? $country,
+            $geographicFields = [];
+            if (! empty($address['country'])) $geographicFields['country_code'] = 'legalAddress.country';
+            if (! empty($address['region'])) $geographicFields['region'] = 'legalAddress.region';
+            if (! empty($address['city'])) $geographicFields['city'] = 'legalAddress.city';
+            $attributes = ['lei' => $lei, 'legal_name' => $name, 'country_code' => $address['country'] ?? null,
                 'city' => $address['city'] ?? null, 'region' => $address['region'] ?? null, 'postal_code' => $address['postalCode'] ?? null,
                 'address' => implode(', ', array_filter([$address['addressLines'][0] ?? null, $address['city'] ?? null, $address['region'] ?? null, $address['country'] ?? null])),
                 'entity_status' => $entity['status'] ?? null, 'raw_metadata' => $attr];
             $candidates[] = $this->mapCandidate($this->key(), ['source_record_id' => $lei, 'source_record_type' => 'gleif_lei',
+                'geographic_evidence_fields' => $geographicFields,
                 'source_url' => 'https://api.gleif.org/api/v1/lei-records/'.rawurlencode($lei), 'raw_metadata' => $attr], $attributes,
                 ['license_key' => 'cc0', 'license_name' => 'CC0 1.0', 'license_url' => 'https://www.gleif.org/en/lei-data/access-and-use-lei-data']);
         }

@@ -36,6 +36,7 @@ const capabilities = [
 let campaign = null
 let started = false
 let campaignCreatePayload = null
+const geographyFilterRequests = []
 const server = spawn('npm', ['run', 'dev', '--', '--host', '127.0.0.1', '--port', '5181', '--strictPort'], { stdio: 'ignore', env: { ...process.env, BROWSER: 'none' } })
 let browser
 try {
@@ -72,8 +73,30 @@ try {
     else if (path === `/lead-discovery/campaigns/${campaignId}`) body = { campaign, counts: { discovered: started ? 1 : 0, verified: 0, eligible: 0, needs_review: 1, rejected: 0, duplicates: 0, invalid: 0, promoted: 0, processing_errors: 0 }, contacts_enriched: 0, source_errors: 0,
       providers: started ? [{ source_id: sourceRows[0].id, source_key: 'osm_overpass', source: sourceRows[0].provider_name, status: 'running', partitions_completed: 1, partitions_total: 4, requests: 1, raw_records: 1, unique_candidates: 1, duplicates: 0, eligible: 0, errors: 0 }] : [],
       runs: started ? [{ source_requests: 1, raw_candidates: 1 }] : [], checkpoints: started ? [{ id: 'checkpoint', partition_key: 'IN:TN:Chennai', query_key: 'ecommerce_retail-retail', status: 'completed' }] : [] }
-    else if (path === '/lead-discovery/candidates') body = { data: started ? [{ id: candidateId, source_id: sourceRows[0].id, campaign_id: campaignId, company_name: 'Synthetic Retail Company', normalized_domain: 'synthetic-retail.example.com', industry: null, country_code: null, city: null, eligibility_status: 'eligible', official_domain_status: 'verified', promotion_status: 'not_promoted', processing_status: 'eligible', raw_metadata: { query: 'retail business', rank: 1 } }] : [] }
-    else if (path === `/lead-discovery/candidates/${candidateId}`) body = { candidate: { id: candidateId, company_name: 'Synthetic Retail Company', claimed_website: 'https://synthetic-retail.example.com/', official_domain_status: 'verified', eligibility_status: 'eligible', validation_reason: 'Synthetic website match', validation_reason_code: 'VERIFIED_TARGET_MATCH', promotion_status: 'not_promoted' }, campaign, source: sourceRows[0], evidence: [{ id: 'ev1', field_name: 'company_name', evidence_type: 'open_source_record', normalized_value: 'Synthetic Retail Company', confidence_score: 0.8, collected_at: '2026-10-14T00:00:00Z', source_url: 'https://www.openstreetmap.org/node/123', attribution: '{"license_name":"ODbL","attribution_text":"© OpenStreetMap contributors"}' }], matched_company: null }
+    else if (path === '/lead-discovery/candidates') {
+      const filter = new URL(route.request().url()).searchParams.get('geographic_relevance')
+      if (filter) geographyFilterRequests.push(filter)
+      const states = [
+        ['city_match', 'Synthetic Retail Company', 'Chennai, Tamil Nadu, India'],
+        ['region_match', 'Regional Retailer', 'Tamil Nadu, India'],
+        ['country_match', 'Country Retailer', 'India'],
+        ['location_unknown', 'Unknown Location Retailer', 'Unknown'],
+        ['location_mismatch', 'Mismatch Retailer', 'Bengaluru, Karnataka, India'],
+      ]
+      const rows = states.map(([classification, name, location], index) => ({
+        id: index === 0 ? candidateId : `74000000-0000-4000-8000-${String(index + 1).padStart(12, '0')}`,
+        source_id: sourceRows[0].id, campaign_id: campaignId, company_name: name,
+        normalized_domain: `synthetic-retail-${index + 1}.example.com`, industry: null, country_code: null, city: null,
+        eligibility_status: classification === 'location_mismatch' ? 'rejected' : 'needs_review', official_domain_status: 'verified',
+        promotion_status: 'not_promoted', processing_status: 'needs_review',
+        geographic_relevance: { classification, requested_location: { city: 'Chennai', region: 'Tamil Nadu', country: 'India' },
+          evidence_location: { city: location === 'Unknown' ? null : location.split(', ')[0], region: location.includes('Karnataka') ? 'Karnataka' : location.includes('Tamil Nadu') ? 'Tamil Nadu' : null, country: location === 'Unknown' ? null : 'India' },
+          evidence_source: 'osm_overpass', explanation: classification === 'location_unknown' ? 'No reliable source location evidence is available.' : `Source evidence indicates ${location}.` },
+        raw_metadata: { query: 'retail business', rank: index + 1 },
+      }))
+      body = { data: started ? (filter ? rows.filter((row) => row.geographic_relevance.classification === filter) : rows) : [] }
+    }
+    else if (path === `/lead-discovery/candidates/${candidateId}`) body = { candidate: { id: candidateId, company_name: 'Synthetic Retail Company', claimed_website: 'https://synthetic-retail.example.com/', official_domain_status: 'verified', eligibility_status: 'eligible', validation_reason: 'Synthetic website match', validation_reason_code: 'VERIFIED_TARGET_MATCH', promotion_status: 'not_promoted', geographic_relevance: { classification: 'city_match', requested_location: { city: 'Chennai', region: 'Tamil Nadu', country: 'India' }, evidence_location: { city: 'Chennai', region: 'Tamil Nadu', country: 'India' }, evidence_source: 'osm_overpass', explanation: 'Source evidence confirms Chennai, Tamil Nadu, India.' } }, campaign, source: sourceRows[0], evidence: [{ id: 'ev1', field_name: 'company_name', evidence_type: 'open_source_record', normalized_value: 'Synthetic Retail Company', confidence_score: 0.8, collected_at: '2026-10-14T00:00:00Z', source_url: 'https://www.openstreetmap.org/node/123', attribution: '{"license_name":"ODbL","attribution_text":"© OpenStreetMap contributors"}' }], matched_company: null }
     await route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body) })
   })
   await page.goto(baseUrl, { waitUntil: 'networkidle' })
@@ -111,8 +134,27 @@ try {
   await page.getByText('Discovery queued.', { exact: false }).waitFor()
   await page.getByText(/Partitions 1\/4/).waitFor()
   await page.getByText('Synthetic Retail Company', { exact: true }).waitFor()
+  await page.locator('.candidate-table-wrap').getByText('City match', { exact: true }).waitFor()
+  await page.locator('.candidate-table-wrap').getByText('Requested: Chennai, Tamil Nadu, India').first().waitFor()
+  await page.locator('.candidate-table-wrap').getByText('Evidence: Chennai, Tamil Nadu, India').first().waitFor()
+  for (const [filter, label, candidateName] of [
+    ['city_match', 'City match', 'Synthetic Retail Company'],
+    ['region_match', 'Region match', 'Regional Retailer'],
+    ['country_match', 'Country match', 'Country Retailer'],
+    ['location_unknown', 'Location unknown', 'Unknown Location Retailer'],
+    ['location_mismatch', 'Location mismatch', 'Mismatch Retailer'],
+  ]) {
+    await page.getByLabel('Geography').selectOption(filter)
+    await page.locator('.candidate-table-wrap').getByText(label, { exact: true }).waitFor()
+    await page.getByRole('button', { name: candidateName, exact: true }).waitFor()
+    assert.ok(geographyFilterRequests.includes(filter), `The ${filter} filter is sent to the API.`)
+  }
+  await page.getByLabel('Geography').selectOption('')
+  await page.getByText('Synthetic Retail Company', { exact: true }).waitFor()
   await page.getByRole('button', { name: 'Synthetic Retail Company' }).click()
   await page.getByRole('heading', { name: 'Synthetic Retail Company' }).waitFor()
+  await page.getByText('Requested campaign location').waitFor()
+  await page.getByText('Location from source evidence').waitFor()
   await page.getByRole('button', { name: 'Promote to Prospect' }).waitFor()
   await page.getByRole('button', { name: 'Close', exact: true }).click()
   await page.getByText('Manual / advanced import · CSV fallback').click()

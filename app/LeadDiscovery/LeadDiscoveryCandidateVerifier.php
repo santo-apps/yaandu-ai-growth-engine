@@ -19,6 +19,15 @@ final class LeadDiscoveryCandidateVerifier
     {
         $candidate = DB::table('lead_discovery_candidates')->where('tenant_id', $tenantId)->where('id', $candidateId)->first();
         if (! $candidate || in_array($candidate->promotion_status, ['promoted', 'rejected'], true)) return;
+        if (($candidate->geographic_relevance ?? null) === 'location_mismatch') {
+            DB::table('lead_discovery_candidates')->where('tenant_id', $tenantId)->where('id', $candidateId)->update([
+                'processing_status' => 'rejected', 'validation_status' => 'rejected', 'eligibility_status' => 'rejected',
+                'validation_reason_code' => 'GEOGRAPHIC_LOCATION_MISMATCH',
+                'validation_reason' => 'Reliable source location evidence conflicts with the campaign geography.', 'updated_at' => now(),
+            ]);
+            $this->refreshRun($tenantId, (string) $candidate->run_id);
+            return;
+        }
         $source = DB::table('lead_discovery_sources')->where('tenant_id', $tenantId)->where('id', $candidate->source_id)->first();
         $campaign = DB::table('lead_discovery_campaigns')->where('tenant_id', $tenantId)->where('id', $candidate->campaign_id)->first();
         if (! $source || ! $campaign) return;
@@ -66,6 +75,7 @@ final class LeadDiscoveryCandidateVerifier
             $candidateData = (array) $candidate;
             $candidateData['official_domain_status'] = $verified ? 'verified' : 'needs_review';
             $candidateData['country_code'] = strtoupper((string) $candidate->country_code);
+            $candidateData['geographic_relevance'] = $candidate->geographic_relevance ?? 'location_unknown';
             $candidateData['duplicate_status'] = $candidate->matched_company_id ? 'duplicate' : 'new';
             $decision = $this->eligibility->evaluate($candidateData, (array) $campaign, (array) $source);
             DB::table('lead_discovery_candidates')->where('tenant_id', $tenantId)->where('id', $candidateId)->update([

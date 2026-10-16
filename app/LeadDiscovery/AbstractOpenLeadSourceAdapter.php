@@ -50,6 +50,7 @@ abstract class AbstractOpenLeadSourceAdapter implements SearchLeadSourceAdapterI
             'industry' => $this->firstString($attributes, ['normalized_industry', 'industry']),
             'source_industry' => $this->firstString($attributes, ['source_industry']),
             'source_category' => $this->firstString($attributes, ['source_category', 'category']),
+            'geographic_evidence_fields' => is_array($record['geographic_evidence_fields'] ?? null) ? $record['geographic_evidence_fields'] : [],
             'email' => $email, 'phone' => $phone,
             'registration_identifier' => $this->firstString($attributes, ['cin', 'registration_id', 'company_number']),
             'registration_identifier_jurisdiction' => $this->firstString($attributes, ['registration_identifier_jurisdiction']),

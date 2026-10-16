@@ -4,11 +4,16 @@ namespace App\LeadDiscovery;
 
 use App\Discovery\DomainNormalizer;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
 
 final class LiveCandidateStager
 {
-    public function __construct(private readonly DomainNormalizer $domains, private readonly CandidateIdentityResolver $identities) {}
+    public function __construct(
+        private readonly DomainNormalizer $domains,
+        private readonly CandidateIdentityResolver $identities,
+        private readonly GeographicRelevanceClassifier $geography,
+    ) {}
 
     /** @return array{created:bool,duplicate:bool,verification_id:?string} */
     public function stage(string $tenantId, object $campaign, object $run, object $source, object $checkpoint, array $result, int $rank): array
@@ -73,6 +78,7 @@ final class LiveCandidateStager
             ]);
             $this->storeEvidence($tenantId, (string) $existing->id, (string) $campaign->id, (string) $source->id, $sourceUrl, $result, $attribution, $now);
             $this->mergeCanonicalFields($tenantId, (string) $existing->id);
+            $this->classifyAndPersistGeography($tenantId, (string) $existing->id);
             return ['created' => false, 'duplicate' => true, 'verification_id' => $attachWebsite ? (string) $existing->id : null];
         }
 
@@ -102,6 +108,7 @@ final class LiveCandidateStager
         ]);
         $this->storeEvidence($tenantId, $id, (string) $campaign->id, (string) $source->id, $sourceUrl, $result, $attribution, $now);
         $this->mergeCanonicalFields($tenantId, $id);
+        $this->classifyAndPersistGeography($tenantId, $id);
         DB::table('audit_logs')->insert(['id' => (string) Str::uuid(), 'tenant_id' => $tenantId, 'actor_user_id' => null,
             'action' => 'lead_discovery.candidate_discovered', 'subject_type' => 'lead_discovery', 'subject_id' => $id,
             'metadata' => json_encode(['campaign_id' => $campaign->id, 'run_id' => $run->id, 'source_id' => $source->id,
@@ -125,6 +132,7 @@ final class LiveCandidateStager
             'wikidata_qid' => $result['wikidata_qid'] ?? null, 'osm_object_id' => $result['osm_object_id'] ?? null,
             'entity_status' => $result['entity_status'] ?? null, 'source_category' => $result['source_category'] ?? null,
         ];
+        $geographicFields = is_array($result['geographic_evidence_fields'] ?? null) ? $result['geographic_evidence_fields'] : [];
         foreach ($fields as $field => $value) {
             if (! is_scalar($value) || trim((string) $value) === '') continue;
             $raw = mb_substr(trim((string) $value), 0, 2000);
@@ -136,12 +144,16 @@ final class LiveCandidateStager
                 'osm_object_id' => $this->typedOsmObjectId($result) ?? $raw,
                 default => $raw,
             };
+            $fieldAttribution = $attribution;
+            if (isset($geographicFields[$field]) && is_string($geographicFields[$field])) {
+                $fieldAttribution['geographic_evidence_field'] = mb_substr($geographicFields[$field], 0, 80);
+            }
             DB::table('lead_discovery_candidate_evidence')->insertOrIgnore([
                 'id' => (string) Str::uuid(), 'tenant_id' => $tenantId, 'candidate_id' => $candidateId, 'campaign_id' => $campaignId, 'source_id' => $sourceId,
                 'field_name' => $field, 'evidence_type' => 'open_source_record', 'source_url' => $sourceUrl,
                 'raw_value' => $evidenceRaw, 'normalized_value' => $normalizedEvidence,
                 'confidence_score' => in_array($field, ['legal_name', 'registration_identifier', 'namespaced_registration_identifier', 'lei'], true) ? 0.95 : 0.75,
-                'collected_at' => $now, 'attribution' => json_encode($attribution, JSON_INVALID_UTF8_SUBSTITUTE), 'created_at' => $now, 'updated_at' => $now,
+                'collected_at' => $now, 'attribution' => json_encode($fieldAttribution, JSON_INVALID_UTF8_SUBSTITUTE), 'created_at' => $now, 'updated_at' => $now,
             ]);
         }
     }
@@ -162,9 +174,39 @@ final class LiveCandidateStager
 
     private function countryCode(mixed $country): ?string
     {
-        if (! is_scalar($country)) return null;
-        $code = strtoupper(trim((string) $country));
-        return preg_match('/^[A-Z]{2}$/', $code) ? $code : null;
+        return $this->geography->normalizeCountry($country);
+    }
+
+    public function classifyAndPersistGeography(string $tenantId, string $candidateId): ?array
+    {
+        $candidate = DB::table('lead_discovery_candidates')->where('tenant_id', $tenantId)->where('id', $candidateId)->first();
+        if (! $candidate) return null;
+        $campaign = DB::table('lead_discovery_campaigns')->where('tenant_id', $tenantId)->where('id', $candidate->campaign_id)->first();
+        if (! $campaign) return null;
+
+        $classification = $this->geography->forCandidate($tenantId, $candidate, $campaign);
+        $updates = ['geographic_relevance' => $classification['classification'], 'updated_at' => now()];
+        if ($classification['classification'] === 'location_mismatch' && $candidate->promotion_status === 'not_promoted'
+            && $candidate->eligibility_status !== 'rejected') {
+            $updates += ['eligibility_status' => 'rejected', 'validation_reason_code' => 'GEOGRAPHIC_LOCATION_MISMATCH',
+                'validation_reason' => $classification['explanation']];
+        }
+        DB::table('lead_discovery_candidates')->where('tenant_id', $tenantId)->where('id', $candidateId)->update($updates);
+
+        Log::info('Lead discovery candidate geography classified.', [
+            'operation' => 'lead_discovery_geographic_relevance_classified',
+            'tenant_id' => $tenantId, 'campaign_id' => $candidate->campaign_id, 'run_id' => $candidate->run_id,
+            'candidate_id' => $candidateId, 'source_id' => $candidate->source_id,
+            'classification' => $classification['classification'],
+            'requested_country' => $classification['requested_location']['country'] ?? null,
+            'requested_region_present' => filled($classification['requested_location']['region'] ?? null),
+            'requested_city_present' => filled($classification['requested_location']['city'] ?? null),
+            'evidence_country_present' => filled($classification['evidence_location']['country'] ?? null),
+            'evidence_region_present' => filled($classification['evidence_location']['region'] ?? null),
+            'evidence_city_present' => filled($classification['evidence_location']['city'] ?? null),
+        ]);
+
+        return $classification;
     }
 
     private function namespacedRegistrationIdentifier(array $result, ?string $country): ?string

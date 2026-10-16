@@ -57,6 +57,10 @@ class LeadDiscoveryPhaseOneTest extends TestCase
         $candidate = DB::table('lead_discovery_candidates')->where('tenant_id', $tenant->id)->first();
         self::assertSame('discovered', $candidate->processing_status);
         self::assertSame('northstar.example', $candidate->normalized_domain);
+        self::assertSame('country_match', $candidate->geographic_relevance, 'CSV Mumbai evidence does not imply a city-targeted campaign match.');
+        self::assertSame('Mumbai', DB::table('lead_discovery_candidate_evidence')->where('tenant_id', $tenant->id)->where('candidate_id', $candidate->id)->where('field_name', 'city')->value('normalized_value'));
+        $cityAttribution = json_decode((string) DB::table('lead_discovery_candidate_evidence')->where('tenant_id', $tenant->id)->where('candidate_id', $candidate->id)->where('field_name', 'city')->value('attribution'), true);
+        self::assertSame('city', $cityAttribution['geographic_evidence_field']);
         self::assertSame(0, DB::table('companies')->where('tenant_id', $tenant->id)->count(), 'Import keeps candidates out of the company master.');
         self::assertGreaterThanOrEqual(5, DB::table('lead_discovery_candidate_evidence')->where('tenant_id', $tenant->id)->where('candidate_id', $candidate->id)->count());
         Queue::assertPushed(VerifyLeadDiscoveryCandidateJob::class, 1);

@@ -87,10 +87,7 @@ final class BraveSearchLeadSourceAdapter implements SearchLeadSourceAdapterInter
                 'source_url' => mb_substr($url, 0, 2048),
                 'source_reference' => 'brave:'.($offset * $limit + $index + 1),
                 'rank' => $offset * $limit + $index + 1,
-                'country_code' => $country,
                 'industry' => $query->industry,
-                'city' => $query->city,
-                'region' => $query->region,
             ];
         }
         $nextOffset = $offset + 1;
