@@ -13,6 +13,7 @@ use App\LeadDiscovery\LeadSourceAdapterRegistry;
 use App\LeadDiscovery\LeadSourceCapabilityCatalog;
 use App\LeadDiscovery\LeadDiscoveryCountryCatalog;
 use App\LeadDiscovery\LeadDiscoveryIndustryTaxonomy;
+use App\LeadDiscovery\LeadDiscoveryPilotSummary;
 use App\LeadDiscovery\GeographicRelevanceClassifier;
 use App\LeadDiscovery\LiveCandidateStager;
 use App\Models\Contact;
@@ -204,6 +205,7 @@ final class LeadDiscoveryController extends Controller
             // work remains bounded by the stricter per-run candidate/request
             // limits below; the default target remains intentionally small.
             'keywords' => ['nullable', 'string', 'max:150'], 'target_leads' => ['sometimes', 'integer', 'min:1', 'max:5000'],
+            'pilot_mode' => ['sometimes', 'boolean'],
             'source_mode' => ['sometimes', 'in:all_eligible,selected'], 'source_ids' => ['sometimes', 'array', 'max:6'], 'source_ids.*' => ['required', 'uuid'], 'limits' => ['sometimes', 'array'],
             'limits.source_requests' => ['sometimes', 'integer', 'min:1', 'max:500'], 'limits.candidates' => ['sometimes', 'integer', 'min:1', 'max:500'],
             'limits.processing' => ['sometimes', 'integer', 'min:1', 'max:500'], 'limits.enrichment' => ['sometimes', 'integer', 'min:0', 'max:500'],
@@ -234,15 +236,18 @@ final class LeadDiscoveryController extends Controller
         $industryInput = (string) ($data['industry'] ?? '');
         $industry = trim($industryInput) === '' ? null : $industryInput;
         $normalizedIndustryKey = app(LeadDiscoveryIndustryTaxonomy::class)->keyFor($industry);
-        DB::transaction(function () use ($id, $tenant, $data, $limits, $request, $selectedSources, $target, $industry, $normalizedIndustryKey): void {
+        $pilotMode = (bool) ($data['pilot_mode'] ?? false);
+        DB::transaction(function () use ($id, $tenant, $data, $limits, $request, $selectedSources, $target, $industry, $normalizedIndustryKey, $pilotMode): void {
             DB::table('lead_discovery_campaigns')->insert([
                 'id' => $id, 'tenant_id' => $tenant, 'name' => $data['name'], 'industry' => $industry, 'normalized_industry_key' => $normalizedIndustryKey,
                 'country_code' => isset($data['country_code']) ? strtoupper($data['country_code']) : null, 'region' => $data['region'] ?? null, 'city' => $data['city'] ?? null,
-                'configuration' => json_encode(['limits' => $limits, 'keywords' => trim((string) ($data['keywords'] ?? '')), 'source_mode' => $data['source_mode'] ?? ($selectedSources ? 'selected' : 'all_eligible'), 'website_verification' => true, 'contact_enrichment' => true, 'deduplication' => true, 'discovery_source_ids' => $selectedSources]),
+                'configuration' => json_encode(['limits' => $limits, 'pilot_mode' => $pilotMode, 'pilot_target' => $pilotMode ? LeadDiscoveryPilotSummary::TARGET : null,
+                    'keywords' => trim((string) ($data['keywords'] ?? '')), 'source_mode' => $data['source_mode'] ?? ($selectedSources ? 'selected' : 'all_eligible'),
+                    'website_verification' => true, 'contact_enrichment' => true, 'deduplication' => true, 'discovery_source_ids' => $selectedSources]),
                 'target_leads' => $target, 'auto_promotion_enabled' => false, 'created_by' => $request->user()->id,
                 'status' => 'draft', 'created_at' => now(), 'updated_at' => now(),
             ]);
-            $this->audit('lead_discovery_campaign_created', $id, ['auto_promotion' => false, 'target_leads' => $target]);
+            $this->audit('lead_discovery_campaign_created', $id, ['auto_promotion' => false, 'target_leads' => $target, 'pilot_mode' => $pilotMode]);
         });
         $campaign = DB::table('lead_discovery_campaigns')->where('tenant_id', $tenant)->where('id', $id)->first();
         $campaign->auto_promotion_enabled = (bool) $campaign->auto_promotion_enabled;
@@ -260,26 +265,41 @@ final class LeadDiscoveryController extends Controller
         abort_unless($row->status === 'draft', 409, 'Only a draft campaign can be started.');
         $config = json_decode((string) $row->configuration, true) ?: [];
         $sourceIds = array_values(array_unique($request->input('source_ids', data_get($config, 'discovery_source_ids', []))));
+        $skippedSources = [];
         if ($sourceIds) {
             $selected = DB::table('lead_discovery_sources')->where('tenant_id', $tenant)->whereIn('id', $sourceIds)->get();
             abort_unless($selected->count() === count($sourceIds), 422, 'One or more selected sources are not configured for this tenant.');
+            $readyIds = [];
             foreach ($selected as $source) {
+                $adapter = app(LeadSourceAdapterRegistry::class)->get((string) $source->source_key);
+                abort_unless($adapter instanceof \App\LeadDiscovery\SearchLeadSourceAdapterInterface
+                    && $adapter->capabilities()->governanceClass !== 'PROHIBITED_FOR_BULK_STORAGE', 422, 'This provider is not approved for persistent discovery.');
                 $reason = $this->sourceBlockReason($source);
-                if ($reason !== null) return response()->json(['message' => $this->sourceBlockMessage($reason), 'reason_code' => $reason], 422);
+                if ($reason === null && in_array((string) $source->health_state, ['degraded', 'auth_error', 'not_configured', 'disabled'], true)) $reason = 'SOURCE_TEMPORARILY_UNAVAILABLE';
+                if ($reason !== null) { $skippedSources[] = ['source_id' => $source->id, 'reason_code' => $reason]; continue; }
+                $readyIds[] = (string) $source->id;
             }
+            if ($readyIds === []) {
+                $reason = (string) ($skippedSources[0]['reason_code'] ?? 'SOURCE_DISABLED');
+                return response()->json(['message' => $this->sourceBlockMessage($reason), 'reason_code' => $reason, 'skipped_sources' => $skippedSources], 422);
+            }
+            $sourceIds = $readyIds;
         } else {
             $eligibleOpenSources = DB::table('lead_discovery_sources')->where('tenant_id', $tenant)->whereIn('source_key', ['osm_overpass', 'wikidata', 'india_ogd_mca', 'gleif'])
                 ->where('enabled', true)->where('authorization_status', 'authorized')->where('storage_rights_status', 'confirmed')->exists();
             abort_unless($eligibleOpenSources, 422, 'No enabled, authorized and storage-approved open source is configured for this tenant.');
         }
-        DB::table('lead_discovery_campaigns')->where('tenant_id', $tenant)->where('id', $campaign)->update(['status' => 'queued', 'updated_at' => now()]);
-        $this->audit('lead_discovery_campaign_started', $campaign, ['source_ids' => $sourceIds, 'target_leads' => (int) $row->target_leads, 'automatic_promotion' => false]);
-        $this->audit('lead_discovery.campaign_started', $campaign, ['source_ids' => $sourceIds, 'target_leads' => (int) $row->target_leads, 'automatic_promotion' => false]);
+        $config['pilot_skipped_sources'] = $skippedSources;
+        DB::table('lead_discovery_campaigns')->where('tenant_id', $tenant)->where('id', $campaign)->update([
+            'configuration' => json_encode($config), 'status' => 'queued', 'updated_at' => now(),
+        ]);
+        $this->audit('lead_discovery_campaign_started', $campaign, ['source_ids' => $sourceIds, 'skipped_sources' => $skippedSources, 'target_leads' => (int) $row->target_leads, 'automatic_promotion' => false]);
+        $this->audit('lead_discovery.campaign_started', $campaign, ['source_ids' => $sourceIds, 'skipped_sources' => $skippedSources, 'target_leads' => (int) $row->target_leads, 'automatic_promotion' => false]);
         StartLeadDiscoveryCampaignJob::dispatch($tenant, $campaign, $sourceIds)->afterCommit();
-        return response()->json(['campaign_id' => $campaign, 'status' => 'queued', 'auto_promotion' => false], 202);
+        return response()->json(['campaign_id' => $campaign, 'status' => 'queued', 'auto_promotion' => false, 'skipped_sources' => $skippedSources], 202);
     }
 
-    public function campaign(string $campaign)
+    public function campaign(string $campaign, LeadDiscoveryPilotSummary $pilotSummary)
     {
         $tenant = app('tenant.id');
         $row = DB::table('lead_discovery_campaigns')->where('tenant_id', $tenant)->where('id', $campaign)->first();
@@ -298,7 +318,9 @@ final class LeadDiscoveryController extends Controller
                 'unique_candidates' => (int) $providerRuns->sum('candidates_found'), 'duplicates' => (int) $providerRuns->sum('duplicates_found'),
                 'eligible' => (int) $providerRuns->sum('eligible_candidates'), 'errors' => (int) $providerRuns->sum('source_errors')];
         })->values();
+        $campaignConfiguration = is_array($row->configuration) ? $row->configuration : (json_decode((string) $row->configuration, true) ?: []);
         return response()->json(['campaign' => $row, 'providers' => $providers,
+            ...((bool) data_get($campaignConfiguration, 'pilot_mode') ? ['pilot_summary' => $pilotSummary->build($tenant, $campaign)] : []),
             'counts' => DB::table('lead_discovery_candidates')->where('tenant_id', $tenant)->where('campaign_id', $campaign)
                 ->selectRaw("count(*) as discovered, sum(case when official_domain_status = 'verified' then 1 else 0 end) as verified, sum(case when eligibility_status = 'eligible' then 1 else 0 end) as eligible, sum(case when eligibility_status = 'needs_review' then 1 else 0 end) as needs_review, sum(case when eligibility_status = 'rejected' then 1 else 0 end) as rejected, sum(case when processing_status = 'duplicate' then 1 else 0 end) as duplicates, sum(case when processing_status = 'invalid' then 1 else 0 end) as invalid, sum(case when promotion_status = 'promoted' then 1 else 0 end) as promoted, sum(case when processing_status = 'failed' then 1 else 0 end) as processing_errors")
                 ->first(),
@@ -309,7 +331,8 @@ final class LeadDiscoveryController extends Controller
             'checkpoints' => DB::table('lead_discovery_checkpoints')->where('tenant_id', $tenant)->where('campaign_id', $campaign)->orderBy('query_key')->get()]);
     }
 
-    public function import(Request $request, string $campaign, LeadSourceAdapterRegistry $registry, LiveCandidateStager $stager, GeographicRelevanceClassifier $geography)
+    public function import(Request $request, string $campaign, LeadSourceAdapterRegistry $registry, LiveCandidateStager $stager,
+        GeographicRelevanceClassifier $geography, LeadDiscoveryPilotSummary $pilotSummary)
     {
         abort_unless(config('lead_discovery.enabled'), 503, 'Lead Discovery is disabled by configuration.');
         $this->requireManager($request, ['owner', 'admin', 'manager']);
@@ -331,6 +354,8 @@ final class LeadDiscoveryController extends Controller
                 'candidate_count' => DB::table('lead_discovery_candidates')->where('tenant_id', $tenant)->where('run_id', $existing->id)->count(), 'replayed' => true]);
         }
         $campaignConfig = is_array($campaignRow->configuration) ? $campaignRow->configuration : (json_decode((string) $campaignRow->configuration, true) ?: []);
+        $pilotMode = (bool) data_get($campaignConfig, 'pilot_mode', false);
+        $pilotRemaining = $pilotMode ? max(0, LeadDiscoveryPilotSummary::TARGET - $pilotSummary->targetCount($tenant, $campaign)) : PHP_INT_MAX;
         $campaignLimit = (int) data_get($campaignConfig, 'limits.candidates', config('lead_discovery.max_candidates_per_run'));
         $processingLimit = (int) data_get($campaignConfig, 'limits.processing', config('lead_discovery.max_candidate_processing'));
         $stagedCandidates = (int) DB::table('lead_discovery_candidates')->where('tenant_id', $tenant)->where('campaign_id', $campaign)->count();
@@ -341,7 +366,7 @@ final class LeadDiscoveryController extends Controller
                 $query->whereNotIn('processing_status', ['invalid', 'duplicate'])->orWhereNotNull('matched_company_id');
             })->count();
         $rowLimit = min((int) config('lead_discovery.max_rows_per_import'), max(0, $campaignLimit - $stagedCandidates),
-            max(0, $processingLimit - $processingConsumed));
+            max(0, $processingLimit - $processingConsumed), $pilotRemaining);
         abort_unless($rowLimit > 0, 429, 'The campaign candidate or processing budget has been reached.');
         $maximumSourceRequests = (int) data_get($campaignConfig, 'limits.source_requests', config('lead_discovery.max_source_requests_per_run'));
         $existingSourceRequests = DB::table('lead_discovery_runs')->where('tenant_id', $tenant)->where('campaign_id', $campaign)->count();
@@ -350,12 +375,18 @@ final class LeadDiscoveryController extends Controller
             409, 'The verified eligible-lead target has been reached.');
         $rows = $registry->get($source->source_key)->readCsv((string) $file->getRealPath(), $rowLimit);
         $runId = (string) Str::uuid(); $now = now(); $jobs = []; $csvHash = hash_file('sha256', (string) $file->getRealPath());
-        DB::transaction(function () use ($tenant, $campaignRow, $source, $rows, $runId, $key, $now, $csvHash, &$jobs, $stager, $geography): void {
+        DB::transaction(function () use ($tenant, $campaignRow, $source, $rows, $runId, $key, $now, $csvHash, &$jobs, $stager, $geography, $pilotMode, $pilotSummary): void {
+        $lockedCampaign = DB::table('lead_discovery_campaigns')->where('tenant_id', $tenant)->where('id', $campaignRow->id)->lockForUpdate()->first();
+        abort_unless($lockedCampaign, 404);
+        if ($pilotMode && $pilotSummary->targetCount($tenant, (string) $campaignRow->id) >= LeadDiscoveryPilotSummary::TARGET) {
+            throw ValidationException::withMessages(['campaign' => ['The controlled pilot has reached its 25 unique-candidate limit.']]);
+        }
         DB::table('lead_discovery_runs')->insert(['id' => $runId, 'tenant_id' => $tenant, 'campaign_id' => $campaignRow->id, 'source_id' => $source->id,
                 'run_status' => 'running', 'started_at' => $now, 'candidates_found' => count($rows), 'idempotency_key' => $key,
                 'cost_metrics' => json_encode(['csv_sha256' => $csvHash, 'rows' => count($rows), 'ai_calls' => 0, 'provider_spend_minor' => 0]),
                 'created_at' => $now, 'updated_at' => $now]);
             foreach ($rows as $index => $row) {
+                if ($pilotMode && $pilotSummary->targetCount($tenant, (string) $campaignRow->id) >= LeadDiscoveryPilotSummary::TARGET) break;
                 $name = trim((string) ($row['company_name'] ?? ''));
                 if ($name === '') continue;
                 $normalized = null; $website = null; $domain = null; $invalidWebsite = false;

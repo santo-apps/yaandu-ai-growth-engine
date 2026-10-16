@@ -83,7 +83,7 @@ class LeadDiscoveryPhaseOneTest extends TestCase
         self::assertSame(1, DB::table('company_websites')->where('tenant_id', $tenant->id)->where('company_id', $company->id)->count());
         self::assertSame(1, DB::table('contacts')->where('tenant_id', $tenant->id)->where('company_id', $company->id)->count());
         self::assertSame(2, DB::table('contact_methods')->where('tenant_id', $tenant->id)->count());
-        self::assertDatabaseHas('audit_logs', ['tenant_id' => $tenant->id, 'action' => 'lead_discovery_candidate_promoted', 'subject_id' => $candidate->id]);
+        self::assertDatabaseHas('audit_logs', ['tenant_id' => $tenant->id, 'action' => 'lead_discovery_candidate_promoted', 'subject_id' => $candidate->id, 'actor_user_id' => $owner->id]);
         Queue::assertPushed(ScanWebsiteJob::class, 1);
         $this->withHeader('X-Tenant-ID', $tenant->id)->getJson('/api/v1/lead-discovery/campaigns/'.$campaign['id'])
             ->assertOk()->assertJsonPath('counts.discovered', 1)->assertJsonPath('counts.promoted', 1)->assertJsonPath('contacts_enriched', 1);

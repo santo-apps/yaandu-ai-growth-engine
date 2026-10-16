@@ -50,6 +50,7 @@ final class StartLeadDiscoveryCampaignJob implements ShouldQueue
 
         $approvedSources = [];
         foreach ($sources as $source) {
+            if (in_array((string) $source->health_state, ['degraded', 'auth_error', 'not_configured', 'disabled'], true)) continue;
             $configuration = json_decode((string) $source->configuration, true) ?: [];
             try {
                 $adapter = $registry->get((string) $source->source_key);
@@ -101,8 +102,14 @@ final class StartLeadDiscoveryCampaignJob implements ShouldQueue
         if ($jobs === []) { $this->failCampaign($campaign, 'SOURCE_NOT_CONFIGURED'); return; }
         DB::table('lead_discovery_campaigns')->where('tenant_id', $this->tenantId)->where('id', $campaign->id)->update(['status' => 'running', 'started_at' => now(), 'updated_at' => now()]);
         foreach ($jobs as [$tenant, $checkpoint]) DiscoverLeadSourcePageJob::dispatch($tenant, $checkpoint);
+        $pilotMode = (bool) data_get($campaignConfig, 'pilot_mode', false);
         Log::info('Lead discovery campaign started.', ['operation' => 'lead_discovery_campaign_started', 'tenant_id' => $this->tenantId,
             'campaign_id' => $campaign->id, 'source_count' => count($approvedSources), 'query_count' => count($tasks), 'checkpoint_count' => count($jobs)]);
+        if ($pilotMode) Log::info('Lead discovery 25-candidate pilot started.', [
+            'operation' => 'lead_discovery_pilot_started', 'tenant_id' => $this->tenantId, 'campaign_id' => $campaign->id,
+            'target' => (int) data_get($campaignConfig, 'pilot_target', 25), 'unique_staged' => 0, 'duplicates' => 0,
+            'reviewable' => 0, 'rejected' => 0, 'source_count' => count($approvedSources), 'source_errors' => 0, 'processing_errors' => 0,
+        ]);
     }
 
     private function failCampaign(object $campaign, string $code): void
