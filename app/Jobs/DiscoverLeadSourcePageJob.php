@@ -191,6 +191,7 @@ final class DiscoverLeadSourcePageJob implements ShouldQueue, ShouldBeUniqueUnti
                 if ($error->errorCode === 'SOURCE_RATE_LIMITED' && $error->retryAfter !== null) {
                     $delay = max($delay, min(3600, max(1, $error->retryAfter)));
                 }
+                $this->logProviderRetry($checkpoint, $error, $failedAttempt, $delay);
                 $this->release($delay);
                 return;
             }
@@ -216,6 +217,55 @@ final class DiscoverLeadSourcePageJob implements ShouldQueue, ShouldBeUniqueUnti
     {
         DB::table('lead_discovery_checkpoints')->where('tenant_id', $this->tenantId)->where('id', $checkpoint->id)
             ->where('status', 'running')->update(['status' => 'queued', 'updated_at' => now()]);
+    }
+
+    private function logProviderRetry(object $checkpoint, LiveLeadSourceException $error, int $attempt, int $delay): void
+    {
+        $metadata = [
+            'operation' => 'lead_discovery_provider_retry',
+            'tenant_id' => $this->tenantId,
+            'campaign_id' => $checkpoint->campaign_id,
+            'run_id' => $checkpoint->run_id,
+            'source_id' => $checkpoint->source_id,
+            'checkpoint_id' => $checkpoint->id,
+            'query_key' => $checkpoint->query_key,
+            'error_code' => $error->errorCode,
+            'attempt' => $attempt,
+            'max_attempts' => 3,
+            'retry_delay' => $delay,
+            // A page number is safe to log; provider cursors may contain
+            // arbitrary source-specific state and are intentionally omitted.
+            'page_identifier' => 'page:'.((int) $checkpoint->pages_completed + 1),
+        ];
+
+        if ($error->errorCode === 'SOURCE_RATE_LIMITED') {
+            $metadata['retry_after_honored'] = $error->retryAfter !== null && $delay >= $error->retryAfter;
+        }
+
+        Log::warning('Lead discovery provider attempt will be retried.', $metadata);
+
+        // Retry audit events follow the same tenant-scoped convention as the
+        // source-request, page-completed, and source-failed audit records.
+        try {
+            DB::table('audit_logs')->insert([
+                'id' => (string) Str::uuid(),
+                'tenant_id' => $this->tenantId,
+                'actor_user_id' => null,
+                'action' => 'lead_discovery.provider_retry',
+                'subject_type' => 'lead_discovery',
+                'subject_id' => $checkpoint->id,
+                'metadata' => json_encode($metadata),
+                'created_at' => now(),
+            ]);
+        } catch (\Throwable) {
+            // Audit persistence is secondary to safely scheduling the bounded
+            // provider retry. Keep its failure diagnostic bounded and safe.
+            Log::warning('Lead discovery provider retry audit could not be persisted.', [
+                'operation' => 'lead_discovery_provider_retry_audit_failed',
+                'tenant_id' => $this->tenantId,
+                'checkpoint_id' => $checkpoint->id,
+            ]);
+        }
     }
 
     private function withinLimits(object $campaign, object $run): bool

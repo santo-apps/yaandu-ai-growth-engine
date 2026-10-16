@@ -419,6 +419,7 @@ class LeadDiscoveryLiveCampaignTest extends TestCase
     {
         [$tenant] = $this->tenantAndUser('live-lead-discovery-page-retry');
         Queue::fake();
+        \Illuminate\Support\Facades\Log::spy();
         [, $runs] = $this->campaignWithSourceRuns($tenant->id, 1);
         $results = [];
         for ($index = 1; $index <= 10; $index++) {
@@ -463,6 +464,16 @@ class LeadDiscoveryLiveCampaignTest extends TestCase
         self::assertSame(0, DB::table('campaign_recipients')->where('tenant_id', $tenant->id)->count());
         self::assertSame(0, DB::table('outbound_messages')->where('tenant_id', $tenant->id)->count());
         Queue::assertNotPushed(\App\Jobs\SendOutboundMessage::class);
+        \Illuminate\Support\Facades\Log::shouldHaveReceived('warning')->withArgs(fn ($message, $context) =>
+            ($context['operation'] ?? null) === 'lead_discovery_provider_retry'
+            && $context['tenant_id'] === $tenant->id
+            && $context['checkpoint_id'] === $runs[0]['checkpoint']
+            && $context['attempt'] === 1
+            && $context['max_attempts'] === 3
+            && $context['retry_delay'] === 5
+            && $context['page_identifier'] === 'page:2'
+        )->once();
+        self::assertDatabaseHas('audit_logs', ['tenant_id' => $tenant->id, 'action' => 'lead_discovery.provider_retry', 'subject_id' => $runs[0]['checkpoint']]);
     }
 
     public function test_transient_provider_failure_is_bounded_to_three_attempts_and_permanent_auth_failure_is_not_retried(): void
@@ -502,6 +513,7 @@ class LeadDiscoveryLiveCampaignTest extends TestCase
     {
         [$tenant] = $this->tenantAndUser('live-lead-discovery-no-auth-retry');
         Queue::fake();
+        \Illuminate\Support\Facades\Log::spy();
         [, $runs] = $this->campaignWithSourceRuns($tenant->id, 1);
         RateLimiter::clear('lead-discovery-provider:brave_search');
         Http::fake(['api.search.brave.com/*' => Http::response(['error' => ['detail' => 'unauthorized']], 401)]);
@@ -511,6 +523,10 @@ class LeadDiscoveryLiveCampaignTest extends TestCase
         self::assertSame('SOURCE_AUTH_FAILED', DB::table('lead_discovery_checkpoints')->where('tenant_id', $tenant->id)->where('id', $runs[0]['checkpoint'])->value('error_code'));
         self::assertSame(1, (int) DB::table('lead_discovery_checkpoints')->where('id', $runs[0]['checkpoint'])->value('attempts'));
         self::assertSame(1, Http::recorded()->count());
+        \Illuminate\Support\Facades\Log::shouldHaveReceived('warning')->withArgs(fn ($message, $context) =>
+            ($context['operation'] ?? null) === 'lead_discovery_source_failed'
+        )->once();
+        self::assertDatabaseMissing('audit_logs', ['tenant_id' => $tenant->id, 'action' => 'lead_discovery.provider_retry']);
     }
 
     public function test_rate_limited_retry_respects_retry_after_without_changing_cursor_or_candidates(): void
@@ -549,10 +565,95 @@ class LeadDiscoveryLiveCampaignTest extends TestCase
         self::assertSame(3, Http::recorded()->count());
     }
 
+    public function test_retryable_provider_failures_emit_safe_tenant_scoped_retry_logs_and_audit_events(): void
+    {
+        Queue::fake();
+        $loggedContexts = [];
+        \Illuminate\Support\Facades\Log::shouldReceive('warning')->times(3)->withArgs(function ($message, $context) use (&$loggedContexts): bool {
+            $loggedContexts[] = $context;
+            return true;
+        });
+        Http::fakeSequence('api.search.brave.com/*')
+            ->push(['error' => ['detail' => 'private-timeout-response']], 504)
+            ->push(['error' => ['detail' => 'private-unavailable-response']], 503)
+            ->push(['error' => ['detail' => 'private-rate-limit-response']], 429, ['Retry-After' => '90']);
+
+        $expected = [
+            ['SOURCE_TIMEOUT', 5, false],
+            ['SOURCE_TEMPORARILY_UNAVAILABLE', 5, false],
+            ['SOURCE_RATE_LIMITED', 90, true],
+        ];
+        $identities = [];
+
+        foreach ($expected as $index => [$errorCode, $delay, $retryAfterHonored]) {
+            [$tenant] = $this->tenantAndUser('provider-retry-observability-'.$index);
+            [, $runs] = $this->campaignWithSourceRuns($tenant->id, 1);
+            $checkpoint = DB::table('lead_discovery_checkpoints')->where('tenant_id', $tenant->id)->where('id', $runs[0]['checkpoint'])->first();
+            $sourceId = $this->sourceForRun($runs[0]['id']);
+            RateLimiter::clear('lead-discovery-provider:brave_search');
+
+            $queueJob = new FakeJob;
+            (new DiscoverLeadSourcePageJob($tenant->id, $checkpoint->id))->setJob($queueJob)
+                ->handle(app(LeadSourceAdapterRegistry::class), app(LiveCandidateStager::class));
+
+            self::assertTrue($queueJob->isReleased());
+            self::assertSame($delay, $queueJob->releaseDelay);
+            self::assertSame(1, (int) DB::table('lead_discovery_checkpoints')->where('tenant_id', $tenant->id)->where('id', $checkpoint->id)->value('attempts'));
+            self::assertSame(1, (int) DB::table('lead_discovery_runs')->where('tenant_id', $tenant->id)->where('id', $runs[0]['id'])->value('source_requests'));
+            self::assertSame(0, (int) DB::table('lead_discovery_runs')->where('tenant_id', $tenant->id)->where('id', $runs[0]['id'])->value('source_errors'));
+
+            $identities[] = [
+                'tenant_id' => $tenant->id,
+                'campaign_id' => $checkpoint->campaign_id,
+                'run_id' => $checkpoint->run_id,
+                'source_id' => $sourceId,
+                'checkpoint_id' => $checkpoint->id,
+                'query_key' => $checkpoint->query_key,
+                'error_code' => $errorCode,
+                'retry_delay' => $delay,
+                'retry_after_honored' => $retryAfterHonored,
+            ];
+        }
+
+        self::assertCount(3, $loggedContexts);
+        foreach ($identities as $identity) {
+            $context = collect($loggedContexts)->firstWhere('checkpoint_id', $identity['checkpoint_id']);
+            self::assertNotNull($context);
+            foreach ($identity as $key => $value) {
+                if ($key === 'retry_after_honored' && $identity['error_code'] !== 'SOURCE_RATE_LIMITED') continue;
+                self::assertSame($value, $context[$key] ?? null, 'Retry log metadata mismatch for '.$key);
+            }
+            self::assertSame(1, $context['attempt']);
+            self::assertSame(3, $context['max_attempts']);
+            self::assertSame('page:1', $context['page_identifier']);
+            if ($identity['error_code'] === 'SOURCE_RATE_LIMITED') self::assertTrue($context['retry_after_honored']);
+        }
+
+        $auditRows = DB::table('audit_logs')->where('action', 'lead_discovery.provider_retry')->get();
+        self::assertCount(3, $auditRows);
+        foreach ($identities as $identity) {
+            $row = $auditRows->firstWhere('subject_id', $identity['checkpoint_id']);
+            self::assertNotNull($row);
+            self::assertSame($identity['tenant_id'], $row->tenant_id);
+            self::assertSame($identity['error_code'], json_decode((string) $row->metadata, true)['error_code']);
+        }
+
+        $diagnostics = json_encode([
+            'logs' => $loggedContexts,
+            'metadata' => $auditRows->pluck('metadata')->all(),
+        ]);
+        self::assertStringNotContainsString('private-timeout-response', (string) $diagnostics);
+        self::assertStringNotContainsString('private-unavailable-response', (string) $diagnostics);
+        self::assertStringNotContainsString('private-rate-limit-response', (string) $diagnostics);
+        self::assertStringNotContainsString('synthetic-secret', (string) $diagnostics);
+        self::assertSame(3, Http::recorded()->count());
+    }
+
     public function test_application_local_rate_limit_reschedules_without_provider_attempt_or_error_accounting(): void
     {
         [$tenant] = $this->tenantAndUser('live-lead-discovery-local-rate-limit');
         Queue::fake();
+        \Illuminate\Support\Facades\Log::spy();
         [, $runs] = $this->campaignWithSourceRuns($tenant->id, 1);
         $rateKey = 'lead-discovery-provider:brave_search';
         RateLimiter::clear($rateKey);
@@ -571,6 +672,8 @@ class LeadDiscoveryLiveCampaignTest extends TestCase
         self::assertSame(0, (int) DB::table('lead_discovery_runs')->where('id', $runs[0]['id'])->value('source_errors'));
         Queue::assertPushed(DiscoverLeadSourcePageJob::class, 1);
         Http::assertNothingSent();
+        \Illuminate\Support\Facades\Log::shouldNotHaveReceived('warning');
+        self::assertDatabaseMissing('audit_logs', ['tenant_id' => $tenant->id, 'action' => 'lead_discovery.provider_retry']);
     }
 
     public function test_local_pacing_after_a_transient_failure_requeues_running_checkpoint_for_a_fresh_job(): void
