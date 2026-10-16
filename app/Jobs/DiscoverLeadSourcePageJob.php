@@ -6,6 +6,7 @@ use App\LeadDiscovery\DiscoveryQuery;
 use App\LeadDiscovery\LeadSourceAdapterRegistry;
 use App\LeadDiscovery\LiveCandidateStager;
 use App\LeadDiscovery\LiveLeadSourceException;
+use App\LeadDiscovery\LeadDiscoveryPilotSummary;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Contracts\Queue\ShouldBeUniqueUntilProcessing;
@@ -33,8 +34,9 @@ final class DiscoverLeadSourcePageJob implements ShouldQueue, ShouldBeUniqueUnti
 
     public function uniqueId(): string { return $this->tenantId.':'.$this->checkpointId; }
 
-    public function handle(LeadSourceAdapterRegistry $registry, LiveCandidateStager $stager): void
+    public function handle(LeadSourceAdapterRegistry $registry, LiveCandidateStager $stager, ?LeadDiscoveryPilotSummary $pilotSummary = null): void
     {
+        $pilotSummary ??= app(LeadDiscoveryPilotSummary::class);
         $checkpoint = DB::table('lead_discovery_checkpoints')->where('tenant_id', $this->tenantId)->where('id', $this->checkpointId)->first();
         if (! $checkpoint || in_array($checkpoint->status, ['completed', 'failed', 'stopped'], true)) return;
         // A second queued copy must not process the page concurrently. Queue
@@ -45,6 +47,10 @@ final class DiscoverLeadSourcePageJob implements ShouldQueue, ShouldBeUniqueUnti
         $run = DB::table('lead_discovery_runs')->where('tenant_id', $this->tenantId)->where('id', $checkpoint->run_id)->first();
         $source = DB::table('lead_discovery_sources')->where('tenant_id', $this->tenantId)->where('id', $checkpoint->source_id)->first();
         if (! $campaign || ! $run || ! $source) return;
+        if ($this->isPilot($campaign) && $pilotSummary->targetCount($this->tenantId, (string) $campaign->id) >= (int) $this->pilotTarget($campaign)) {
+            $this->stopPilotCheckpoints($campaign, $pilotSummary);
+            return;
+        }
         if ($campaign->status === 'paused' || $run->run_status === 'paused') return;
         if ($campaign->status === 'cancelled' || $run->run_status === 'cancelled') { $this->checkpointStatus($checkpoint, 'stopped', 'CAMPAIGN_CANCELLED'); $this->finishIfDone($campaign, $run); return; }
         $configuration = json_decode((string) $source->configuration, true) ?: [];
@@ -57,7 +63,12 @@ final class DiscoverLeadSourcePageJob implements ShouldQueue, ShouldBeUniqueUnti
         } catch (LiveLeadSourceException $error) {
             $this->fail($checkpoint, $run, $source, $error->errorCode); return;
         }
-        if (now()->diffInSeconds($run->started_at) >= (int) config('lead_discovery.live_max_runtime_seconds')) {
+        $runtimeOrigin = $this->isPilot($campaign) && $campaign->started_at ? $campaign->started_at : $run->started_at;
+        if (now()->diffInSeconds($runtimeOrigin) >= (int) config('lead_discovery.live_max_runtime_seconds')) {
+            if ($this->isPilot($campaign)) {
+                $this->stopPilotCheckpoints($campaign, $pilotSummary, 'PILOT_RUNTIME_LIMIT_REACHED');
+                return;
+            }
             $this->stopRun($campaign, $run, $checkpoint, 'CAMPAIGN_LIMIT_REACHED'); return;
         }
         $limits = $this->limits($campaign);
@@ -134,24 +145,41 @@ final class DiscoverLeadSourcePageJob implements ShouldQueue, ShouldBeUniqueUnti
                 $this->finishIfDone($freshCampaign, $run);
                 return;
             }
-            $created = 0; $duplicates = 0;
+            $created = 0; $duplicates = 0; $pilotTargetReached = false;
             foreach ($page->candidates as $index => $candidate) {
                 $currentCount = (int) DB::table('lead_discovery_candidates')->where('tenant_id', $this->tenantId)->where('campaign_id', $campaign->id)->count();
                 $currentProcessing = (int) DB::table('lead_discovery_candidates')->where('tenant_id', $this->tenantId)->where('campaign_id', $campaign->id)
                     ->whereNotIn('processing_status', ['invalid', 'duplicate'])->count();
                 if ($currentCount >= $limits['candidates'] || $currentProcessing >= $limits['processing']) break;
-                $result = DB::transaction(fn () => $stager->stage($this->tenantId, $campaign, $run, $source, $checkpoint,
-                    [...$candidate, '_request_id' => $page->providerRequestId], $index + 1 + ((int) $checkpoint->pages_completed * (int) config('lead_discovery.live_result_count', 10))));
+                $result = DB::transaction(function () use ($campaign, $pilotSummary, $stager, $run, $source, $checkpoint, $candidate, $page, $index): array {
+                    $lockedCampaign = DB::table('lead_discovery_campaigns')->where('tenant_id', $this->tenantId)->where('id', $campaign->id)->lockForUpdate()->first();
+                    if (! $lockedCampaign) return ['created' => false, 'duplicate' => false, 'verification_id' => null, 'target_reached' => true];
+                    if ($this->isPilot($lockedCampaign) && $pilotSummary->targetCount($this->tenantId, (string) $lockedCampaign->id) >= (int) $this->pilotTarget($lockedCampaign)) {
+                        return ['created' => false, 'duplicate' => false, 'verification_id' => null, 'target_reached' => true];
+                    }
+                    $staged = $stager->stage($this->tenantId, $lockedCampaign, $run, $source, $checkpoint,
+                        [...$candidate, '_request_id' => $page->providerRequestId], $index + 1 + ((int) $checkpoint->pages_completed * (int) config('lead_discovery.live_result_count', 10)));
+                    $staged['target_reached'] = $this->isPilot($lockedCampaign)
+                        && $pilotSummary->targetCount($this->tenantId, (string) $lockedCampaign->id) >= (int) $this->pilotTarget($lockedCampaign);
+                    return $staged;
+                });
                 if ($result['created']) {
                     $created++;
                     if ($result['verification_id']) VerifyLeadDiscoveryCandidateJob::dispatch($this->tenantId, (string) $result['verification_id'])->afterCommit();
                 }
                 if ($result['duplicate']) $duplicates++;
+                if ($result['target_reached'] ?? false) { $pilotTargetReached = true; break; }
             }
-            DB::transaction(function () use ($checkpoint, $run, $created, $duplicates, $page): void {
+            DB::transaction(function () use ($checkpoint, $run, $created, $duplicates, $page, $pilotTargetReached): void {
+                if ($pilotTargetReached) {
+                    DB::table('lead_discovery_checkpoints')->where('tenant_id', $this->tenantId)->where('campaign_id', $checkpoint->campaign_id)
+                        ->whereIn('status', ['queued', 'running'])->update(['status' => 'stopped', 'error_code' => 'PILOT_TARGET_REACHED', 'completed_at' => now(), 'updated_at' => now()]);
+                }
                 DB::table('lead_discovery_checkpoints')->where('tenant_id', $this->tenantId)->where('id', $checkpoint->id)->update([
                     'cursor' => $page->nextCursor, 'pages_completed' => DB::raw('pages_completed + 1'), 'raw_results' => DB::raw('raw_results + '.count($page->candidates)),
-                    'status' => $page->exhausted ? 'completed' : 'queued', 'completed_at' => $page->exhausted ? now() : null,
+                    'status' => $pilotTargetReached ? 'stopped' : ($page->exhausted ? 'completed' : 'queued'),
+                    'error_code' => $pilotTargetReached ? 'PILOT_TARGET_REACHED' : null,
+                    'completed_at' => ($pilotTargetReached || $page->exhausted) ? now() : null,
                     'updated_at' => now(),
                 ]);
                 DB::table('lead_discovery_runs')->where('tenant_id', $this->tenantId)->where('id', $run->id)->update([
@@ -169,6 +197,15 @@ final class DiscoverLeadSourcePageJob implements ShouldQueue, ShouldBeUniqueUnti
             Log::info('Lead discovery source page staged.', ['operation' => 'lead_discovery_source_page_completed', 'tenant_id' => $this->tenantId,
                 'campaign_id' => $campaign->id, 'run_id' => $run->id, 'source_id' => $source->id, 'query_key' => $checkpoint->query_key,
                 'request_count' => 1, 'candidate_count' => $created, 'duplicate_count' => $duplicates, ...$providerAuditData]);
+            if ($this->isPilot($campaign)) {
+                $summary = $pilotSummary->build($this->tenantId, (string) $campaign->id);
+                Log::info('Lead discovery pilot progress.', ['operation' => 'lead_discovery_pilot_progress', 'tenant_id' => $this->tenantId,
+                    'campaign_id' => $campaign->id, 'target' => (int) $summary['target'], 'unique_staged' => (int) $summary['unique_staged'],
+                    'duplicates' => (int) $summary['duplicates'], 'reviewable' => (int) $summary['eligible_reviewable'],
+                    'rejected' => (int) $summary['rejected'], 'source_count' => count($summary['source_contribution']),
+                    'source_errors' => (int) DB::table('lead_discovery_runs')->where('tenant_id', $this->tenantId)->where('campaign_id', $campaign->id)->sum('source_errors'),
+                    'processing_errors' => (int) DB::table('lead_discovery_runs')->where('tenant_id', $this->tenantId)->where('campaign_id', $campaign->id)->sum('processing_errors')]);
+            }
             DB::table('audit_logs')->insert(['id' => (string) Str::uuid(), 'tenant_id' => $this->tenantId, 'actor_user_id' => null,
                 'action' => 'lead_discovery.source_page_completed', 'subject_type' => 'lead_discovery', 'subject_id' => $checkpoint->id,
                 'metadata' => json_encode(['campaign_id' => $campaign->id, 'run_id' => $run->id, 'source_id' => $source->id, 'query_key' => $checkpoint->query_key,
@@ -177,6 +214,10 @@ final class DiscoverLeadSourcePageJob implements ShouldQueue, ShouldBeUniqueUnti
                     ...$providerAuditData]), 'created_at' => now()]);
             $freshRun = DB::table('lead_discovery_runs')->where('tenant_id', $this->tenantId)->where('id', $run->id)->first();
             $campaignCandidateCount = (int) DB::table('lead_discovery_candidates')->where('tenant_id', $this->tenantId)->where('campaign_id', $campaign->id)->count();
+            if ($pilotTargetReached) {
+                $this->stopPilotCheckpoints($campaign, $pilotSummary);
+                return;
+            }
             if (! $page->exhausted && $freshCampaign->status !== 'paused' && $campaignCandidateCount < $limits['candidates'] && $this->withinLimits($campaign, $freshRun)) self::dispatch($this->tenantId, $this->checkpointId)->delay(now()->addSeconds(2));
             elseif (! $page->exhausted && $freshCampaign->status !== 'paused' && $campaignCandidateCount >= $limits['candidates']) { $this->stopRun($campaign, $freshRun, $checkpoint, 'CAMPAIGN_LIMIT_REACHED'); return; }
             $this->finishIfDone($campaign, $freshRun);
@@ -211,6 +252,26 @@ final class DiscoverLeadSourcePageJob implements ShouldQueue, ShouldBeUniqueUnti
             'candidates' => min((int) config('lead_discovery.live_max_raw_candidates'), (int) data_get($config, 'limits.candidates', config('lead_discovery.max_candidates_per_run'))),
             'processing' => min((int) config('lead_discovery.live_max_raw_candidates'), (int) data_get($config, 'limits.processing', config('lead_discovery.max_candidate_processing'))),
         ];
+    }
+
+    private function isPilot(object $campaign): bool
+    {
+        $configuration = is_array($campaign->configuration ?? null) ? $campaign->configuration : (json_decode((string) ($campaign->configuration ?? '{}'), true) ?: []);
+        return (bool) data_get($configuration, 'pilot_mode', false);
+    }
+
+    private function pilotTarget(object $campaign): int
+    {
+        $configuration = is_array($campaign->configuration ?? null) ? $campaign->configuration : (json_decode((string) ($campaign->configuration ?? '{}'), true) ?: []);
+        return min(LeadDiscoveryPilotSummary::TARGET, max(1, (int) data_get($configuration, 'pilot_target', LeadDiscoveryPilotSummary::TARGET)));
+    }
+
+    private function stopPilotCheckpoints(object $campaign, LeadDiscoveryPilotSummary $summary, string $reason = 'PILOT_TARGET_REACHED'): void
+    {
+        DB::table('lead_discovery_checkpoints')->where('tenant_id', $this->tenantId)->where('campaign_id', $campaign->id)
+            ->whereIn('status', ['queued', 'running'])->update(['status' => 'stopped', 'error_code' => $reason, 'completed_at' => now(), 'updated_at' => now()]);
+        $runs = DB::table('lead_discovery_runs')->where('tenant_id', $this->tenantId)->where('campaign_id', $campaign->id)->get();
+        foreach ($runs as $run) $this->finishIfDone($campaign, $run);
     }
 
     private function queueCheckpointForLocalPacing(object $checkpoint): void
@@ -332,9 +393,18 @@ final class DiscoverLeadSourcePageJob implements ShouldQueue, ShouldBeUniqueUnti
         if ($runs->whereNotIn('run_status', $terminalStatuses)->exists()) return;
         $hasErrors = DB::table('lead_discovery_runs')->where('tenant_id', $this->tenantId)->where('campaign_id', $campaign->id)
             ->whereIn('run_status', ['completed_with_errors', 'failed', 'cancelled'])->exists();
-        DB::table('lead_discovery_campaigns')->where('tenant_id', $this->tenantId)->where('id', $campaign->id)
+        $updated = DB::table('lead_discovery_campaigns')->where('tenant_id', $this->tenantId)->where('id', $campaign->id)
             ->whereNotIn('status', ['paused', 'cancelled'])->update([
                 'status' => $hasErrors ? 'completed_with_errors' : 'completed', 'completed_at' => now(), 'updated_at' => now(),
             ]);
+        if ($updated > 0 && $this->isPilot($campaign)) {
+            $summary = app(LeadDiscoveryPilotSummary::class)->build($this->tenantId, (string) $campaign->id);
+            Log::info('Lead discovery pilot completed.', ['operation' => 'lead_discovery_pilot_completed', 'tenant_id' => $this->tenantId,
+                'campaign_id' => $campaign->id, 'target' => (int) $summary['target'], 'unique_staged' => (int) $summary['unique_staged'],
+                'duplicates' => (int) $summary['duplicates'], 'reviewable' => (int) $summary['eligible_reviewable'],
+                'rejected' => (int) $summary['rejected'], 'source_count' => count($summary['source_contribution']),
+                'source_errors' => (int) DB::table('lead_discovery_runs')->where('tenant_id', $this->tenantId)->where('campaign_id', $campaign->id)->sum('source_errors'),
+                'processing_errors' => (int) DB::table('lead_discovery_runs')->where('tenant_id', $this->tenantId)->where('campaign_id', $campaign->id)->sum('processing_errors')]);
+        }
     }
 }

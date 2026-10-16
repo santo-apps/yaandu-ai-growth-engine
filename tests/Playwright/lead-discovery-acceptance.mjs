@@ -64,13 +64,13 @@ try {
     else if (path === '/lead-discovery/campaigns' && route.request().method() === 'GET') body = { data: campaign ? [campaign] : [] }
     else if (path === '/lead-discovery/campaigns' && route.request().method() === 'POST') {
       campaignCreatePayload = route.request().postDataJSON()
-      campaign = { id: campaignId, name: 'Synthetic Open Business Search', industry: null, country_code: null, target_leads: 5, status: 'draft', auto_promotion_enabled: false }
+      campaign = { id: campaignId, name: 'Synthetic Open Business Search', industry: null, country_code: null, target_leads: 5, status: 'draft', auto_promotion_enabled: false, pilot_mode: campaignCreatePayload.pilot_mode, pilot_target: campaignCreatePayload.pilot_target, configuration: { pilot_mode: campaignCreatePayload.pilot_mode, pilot_target: campaignCreatePayload.pilot_target } }
       status = 201; body = campaign
     }
     else if (path === `/lead-discovery/campaigns/${campaignId}/start` && route.request().method() === 'POST') {
       started = true; campaign = { ...campaign, status: 'running' }; status = 202; body = { campaign_id: campaignId, status: 'queued', auto_promotion: false }
     }
-    else if (path === `/lead-discovery/campaigns/${campaignId}`) body = { campaign, counts: { discovered: started ? 1 : 0, verified: 0, eligible: 0, needs_review: 1, rejected: 0, duplicates: 0, invalid: 0, promoted: 0, processing_errors: 0 }, contacts_enriched: 0, source_errors: 0,
+    else if (path === `/lead-discovery/campaigns/${campaignId}`) body = { campaign, pilot_summary: { target: 25, target_counting_rule: 'Count unique candidates; duplicates and location mismatch are excluded. Unverifiable website outcomes remain reviewable.', unique_staged: started ? 1 : 0, total_raw_candidates: started ? 5 : 0, duplicates: started ? 1 : 0, verified_candidates: 1, unverifiable_candidates: 0, no_website: 0, eligible_reviewable: 1, rejected: 0, geographic_mismatches: 0, skipped_sources: [{ source_id: 'skipped-source', source_key: 'gleif', source: 'GLEIF', reason_code: 'SOURCE_TEMPORARILY_UNAVAILABLE' }], geographic_distribution: { city_match: 1, region_match: 0, country_match: 0, location_unknown: 0, location_mismatch: 0 }, verification_distribution: { verified: 1, robots_blocked: 0, dns_failure: 0, timeout: 0, connection_unavailable: 0, redirect_policy_blocked: 0, no_website: 0, other_unverifiable: 0 }, human_review: { not_reviewed: 1, promoted: 0, manually_rejected: 0 }, deduplication: { cross_source_matched_candidates: 1, matched_existing_companies: 0, possible_identity_matches_for_review: 0, automatic_merge: false }, source_contribution: started ? [{ source_id: sourceRows[0].id, source: sourceRows[0].provider_name, raw_results: 5, staged_candidates: 1, duplicates: 1, verified: 1, reviewable: 1, rejected: 0, geographic_mismatches: 0, unverifiable_websites: 0, provider_requests: 1, retries: 0, source_errors: 0, processing_errors: 0, elapsed_seconds: 2 }] : [], auto_promotion: false, outreach_created: false }, counts: { discovered: started ? 1 : 0, verified: 0, eligible: 0, needs_review: 1, rejected: 0, duplicates: 0, invalid: 0, promoted: 0, processing_errors: 0 }, contacts_enriched: 0, source_errors: 0,
       providers: started ? [{ source_id: sourceRows[0].id, source_key: 'osm_overpass', source: sourceRows[0].provider_name, status: 'running', partitions_completed: 1, partitions_total: 4, requests: 1, raw_records: 1, unique_candidates: 1, duplicates: 0, eligible: 0, errors: 0 }] : [],
       runs: started ? [{ source_requests: 1, raw_candidates: 1 }] : [], checkpoints: started ? [{ id: 'checkpoint', partition_key: 'IN:TN:Chennai', query_key: 'ecommerce_retail-retail', status: 'completed' }] : [] }
     else if (path === '/lead-discovery/candidates') {
@@ -126,13 +126,25 @@ try {
   await page.getByText('Google Maps', { exact: true }).waitFor()
   await page.getByText('Not available for bulk persistent discovery.').waitFor()
   await page.getByLabel('Campaign name').fill('Synthetic Open Business Search')
+  assert.equal(await page.getByRole('checkbox', { name: 'Controlled pilot mode' }).isChecked(), false, 'Pilot mode requires an explicit choice')
+  await page.getByRole('checkbox', { name: 'Controlled pilot mode' }).check()
+  await page.getByLabel('Pilot target').fill('25')
+  await page.getByText('Stops after this many unique reviewable candidates. Duplicates and location mismatches do not count.').waitFor()
   await page.getByRole('button', { name: 'Create campaign' }).click()
   await page.getByText('Campaign created.', { exact: false }).waitFor()
   assert.ok(Array.isArray(campaignCreatePayload?.source_ids), 'Campaign submits the compatible selected source IDs')
+  assert.equal(campaignCreatePayload?.pilot_mode, true, 'The explicit controlled-pilot choice is sent to the API')
+  assert.equal(campaignCreatePayload?.pilot_target, 25, 'The UI sends the selected 25-candidate cap')
   assert.ok(!campaignCreatePayload.source_ids.includes(sourceRows.find((source) => source.source_key === 'brave_search').id), 'Brave remains excluded from the default campaign selection')
   await page.getByRole('button', { name: 'Start Discovery' }).click()
   await page.getByText('Discovery queued.', { exact: false }).waitFor()
   await page.getByText(/Partitions 1\/4/).waitFor()
+  await page.getByRole('heading', { name: 'Pilot quality summary' }).waitFor()
+  await page.getByText('1 / 25 unique').waitFor()
+  await page.getByLabel('Sources skipped safely').getByText('GLEIF · SOURCE_TEMPORARILY_UNAVAILABLE').waitFor()
+  await page.getByRole('columnheader', { name: 'Retries' }).waitFor()
+  await page.getByText('Manually rejected').waitFor()
+  await page.getByText('Cross-source matches').waitFor()
   await page.getByText('Synthetic Retail Company', { exact: true }).waitFor()
   await page.locator('.candidate-table-wrap').getByText('City match', { exact: true }).waitFor()
   await page.locator('.candidate-table-wrap').getByText('Requested: Chennai, Tamil Nadu, India').first().waitFor()

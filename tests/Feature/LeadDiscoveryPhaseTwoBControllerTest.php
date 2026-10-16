@@ -57,6 +57,39 @@ class LeadDiscoveryPhaseTwoBControllerTest extends TestCase
         }
     }
 
+    public function test_pilot_mode_requires_a_bounded_explicit_target_and_is_not_inferred_from_campaign_target(): void
+    {
+        [$tenant, $owner] = $this->tenantOwner();
+        Sanctum::actingAs($owner);
+        $headers = ['X-Tenant-ID' => $tenant->id];
+
+        $normal = $this->withHeaders($headers)->postJson('/api/v1/lead-discovery/campaigns', [
+            'name' => 'Normal twenty-five target', 'target_leads' => 25, 'pilot_target' => 99,
+        ])->assertCreated()->assertJsonPath('pilot_mode', false)->assertJsonPath('pilot_target', null)->json();
+        $normalConfiguration = json_decode((string) DB::table('lead_discovery_campaigns')->where('tenant_id', $tenant->id)->where('id', $normal['id'])->value('configuration'), true);
+        self::assertFalse($normalConfiguration['pilot_mode']);
+        self::assertNull($normalConfiguration['pilot_target']);
+        $this->withHeaders($headers)->getJson('/api/v1/lead-discovery/campaigns/'.$normal['id'])->assertOk()
+            ->assertJsonPath('pilot_mode', false)->assertJsonPath('pilot_target', null)->assertJsonMissingPath('pilot_summary');
+
+        $this->withHeaders($headers)->postJson('/api/v1/lead-discovery/campaigns', [
+            'name' => 'Missing explicit pilot target', 'pilot_mode' => true,
+        ])->assertUnprocessable()->assertJsonValidationErrors('pilot_target');
+
+        $this->withHeaders($headers)->postJson('/api/v1/lead-discovery/campaigns', [
+            'name' => 'Pilot target exceeds phase cap', 'pilot_mode' => true, 'pilot_target' => 26,
+        ])->assertUnprocessable()->assertJsonValidationErrors('pilot_target');
+
+        $pilot = $this->withHeaders($headers)->postJson('/api/v1/lead-discovery/campaigns', [
+            'name' => 'Explicit pilot target', 'pilot_mode' => true, 'pilot_target' => 7, 'target_leads' => 25,
+        ])->assertCreated()->assertJsonPath('pilot_mode', true)->assertJsonPath('pilot_target', 7)->json();
+        $pilotConfiguration = json_decode((string) DB::table('lead_discovery_campaigns')->where('tenant_id', $tenant->id)->where('id', $pilot['id'])->value('configuration'), true);
+        self::assertTrue($pilotConfiguration['pilot_mode']);
+        self::assertSame(7, $pilotConfiguration['pilot_target']);
+        $this->withHeaders($headers)->getJson('/api/v1/lead-discovery/campaigns/'.$pilot['id'])->assertOk()
+            ->assertJsonPath('pilot_mode', true)->assertJsonPath('pilot_target', 7)->assertJsonPath('pilot_summary.target', 7);
+    }
+
     public function test_catalog_industries_and_countries_are_tenant_scoped_and_google_maps_is_not_selectable(): void
     {
         [$tenant, $owner] = $this->tenantOwner();
@@ -179,6 +212,62 @@ class LeadDiscoveryPhaseTwoBControllerTest extends TestCase
         $this->withHeaders($headers)->getJson('/api/v1/lead-discovery/candidates?campaign_id='.$otherCampaign['id'])->assertOk()->assertJsonCount(0, 'data');
         $this->withHeaders($headers)->getJson('/api/v1/lead-discovery/candidates/'.(string) Str::uuid())->assertNotFound();
         $this->withHeaders($headers)->getJson('/api/v1/lead-discovery/candidates/'.$otherCandidateId)->assertNotFound();
+    }
+
+    public function test_controlled_pilot_campaign_exposes_tenant_scoped_quality_summary_for_mixed_sources(): void
+    {
+        [$tenant, $owner] = $this->tenantOwner();
+        [$otherTenant, $otherOwner] = $this->tenantOwner();
+        $owner->tenants()->attach($otherTenant->id, ['role' => 'owner', 'status' => 'active']);
+        Sanctum::actingAs($owner);
+        $headers = ['X-Tenant-ID' => $tenant->id];
+        $osm = $this->withHeaders($headers)->postJson('/api/v1/lead-discovery/sources', ['source_key' => 'osm_overpass', 'enabled' => false])->assertCreated()->json();
+        $wikidata = $this->withHeaders($headers)->postJson('/api/v1/lead-discovery/sources', ['source_key' => 'wikidata', 'enabled' => false])->assertCreated()->json();
+        $campaign = $this->withHeaders($headers)->postJson('/api/v1/lead-discovery/campaigns', [
+            'name' => 'Controlled mixed-source pilot', 'industry' => 'Retail', 'country_code' => 'IN', 'pilot_mode' => true,
+            'pilot_target' => 25, 'target_leads' => 500, 'source_mode' => 'selected', 'source_ids' => [$osm['id'], $wikidata['id']],
+        ])->assertCreated()->json();
+        $storedConfig = json_decode((string) DB::table('lead_discovery_campaigns')->where('tenant_id', $tenant->id)->where('id', $campaign['id'])->value('configuration'), true);
+        self::assertSame(25, $storedConfig['pilot_target']);
+        self::assertSame([$osm['id'], $wikidata['id']], $storedConfig['discovery_source_ids']);
+
+        $now = now(); $runId = (string) Str::uuid(); $candidateIds = array_map(fn () => (string) Str::uuid(), range(1, 4));
+        DB::table('lead_discovery_runs')->insert(['id' => $runId, 'tenant_id' => $tenant->id, 'campaign_id' => $campaign['id'], 'source_id' => $osm['id'],
+            'run_status' => 'completed', 'started_at' => $now->copy()->subSeconds(20), 'finished_at' => $now, 'raw_candidates' => 4,
+            'source_requests' => 2, 'duplicates_found' => 1, 'created_at' => $now, 'updated_at' => $now]);
+        DB::table('lead_discovery_checkpoints')->insert(['id' => (string) Str::uuid(), 'tenant_id' => $tenant->id, 'campaign_id' => $campaign['id'],
+            'run_id' => $runId, 'source_id' => $osm['id'], 'query_key' => 'retail:in', 'query_text' => 'retail in India', 'pages_completed' => 2,
+            'attempts' => 3, 'status' => 'completed', 'created_at' => $now, 'updated_at' => $now]);
+        $rows = [
+            ['eligible', 'eligible', 'verified', 'city_match', 'promoted', null],
+            ['needs_review', 'needs_review', 'needs_review', 'location_unknown', 'not_promoted', 'ROBOTS'],
+            ['rejected', 'rejected', 'needs_review', 'location_mismatch', 'not_promoted', 'GEOGRAPHIC_LOCATION_MISMATCH'],
+            ['rejected', 'rejected', 'verified', 'region_match', 'rejected', 'HUMAN_REJECTED'],
+        ];
+        foreach ($rows as $index => [$eligibility, $processing, $official, $geography, $promotion, $reason]) {
+            DB::table('lead_discovery_candidates')->insert(['id' => $candidateIds[$index], 'tenant_id' => $tenant->id, 'campaign_id' => $campaign['id'],
+                'run_id' => $runId, 'source_id' => $osm['id'], 'company_name' => 'Pilot company '.$index, 'normalized_name' => 'pilot company '.$index,
+                'official_domain_status' => $official, 'processing_status' => $processing, 'validation_status' => $official, 'promotion_status' => $promotion,
+                'validation_reason_code' => $reason, 'eligibility_status' => $eligibility, 'geographic_relevance' => $geography,
+                'discovered_at' => $now, 'created_at' => $now, 'updated_at' => $now]);
+        }
+        $response = $this->withHeaders($headers)->getJson('/api/v1/lead-discovery/campaigns/'.$campaign['id'])->assertOk();
+        $response->assertJsonPath('pilot_summary.target', 25)
+            ->assertJsonPath('pilot_summary.unique_staged', 3)
+            ->assertJsonPath('pilot_summary.total_raw_candidates', 4)
+            ->assertJsonPath('pilot_summary.duplicates', 1)
+            ->assertJsonPath('pilot_summary.eligible_reviewable', 2)
+            ->assertJsonPath('pilot_summary.geographic_mismatches', 1)
+            ->assertJsonPath('pilot_summary.geographic_distribution.city_match', 1)
+            ->assertJsonPath('pilot_summary.geographic_distribution.location_unknown', 1)
+            ->assertJsonPath('pilot_summary.verification_distribution.robots_blocked', 1)
+            ->assertJsonPath('pilot_summary.human_review.promoted', 1)
+            ->assertJsonPath('pilot_summary.human_review.manually_rejected', 1)
+            ->assertJsonPath('pilot_summary.auto_promotion', false)
+            ->assertJsonPath('pilot_summary.outreach_created', false);
+        self::assertSame(1, $response->json('pilot_summary.source_contribution.0.retries'));
+        self::assertStringContainsString('Unverifiable website outcomes remain reviewable', $response->json('pilot_summary.target_counting_rule'));
+        $this->withHeaders(['X-Tenant-ID' => $otherTenant->id])->getJson('/api/v1/lead-discovery/campaigns/'.$campaign['id'])->assertNotFound();
     }
 
     private function tenantOwner(): array

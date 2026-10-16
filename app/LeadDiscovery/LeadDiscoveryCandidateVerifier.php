@@ -128,8 +128,23 @@ final class LeadDiscoveryCandidateVerifier
             $campaignId = DB::table('lead_discovery_runs')->where('tenant_id', $tenantId)->where('id', $runId)->value('campaign_id');
             $otherPending = DB::table('lead_discovery_runs')->where('tenant_id', $tenantId)->where('campaign_id', $campaignId)
                 ->whereIn('run_status', ['queued', 'running', 'paused'])->exists();
-            if (! $otherPending) DB::table('lead_discovery_campaigns')->where('tenant_id', $tenantId)->where('id', $campaignId)
-                ->whereNotIn('status', ['paused', 'cancelled'])->update(['status' => ($counts->processing_errors ?? 0) > 0 ? 'completed_with_errors' : 'completed', 'completed_at' => now(), 'updated_at' => now()]);
+            if (! $otherPending) {
+                $campaign = DB::table('lead_discovery_campaigns')->where('tenant_id', $tenantId)->where('id', $campaignId)->first();
+                $configuration = $campaign ? (is_array($campaign->configuration) ? $campaign->configuration : (json_decode((string) $campaign->configuration, true) ?: [])) : [];
+                $nextStatus = ($counts->processing_errors ?? 0) > 0 ? 'completed_with_errors' : 'completed';
+                $completed = DB::table('lead_discovery_campaigns')->where('tenant_id', $tenantId)->where('id', $campaignId)
+                    ->whereNotIn('status', ['paused', 'cancelled', 'completed', 'completed_with_errors', 'failed'])
+                    ->update(['status' => $nextStatus, 'completed_at' => now(), 'updated_at' => now()]);
+                if ($completed > 0 && (bool) data_get($configuration, 'pilot_mode', false)) {
+                    $summary = app(LeadDiscoveryPilotSummary::class)->build($tenantId, (string) $campaignId);
+                    Log::info('Lead discovery pilot completed.', ['operation' => 'lead_discovery_pilot_completed', 'tenant_id' => $tenantId,
+                        'campaign_id' => $campaignId, 'target' => (int) $summary['target'], 'unique_staged' => (int) $summary['unique_staged'],
+                        'duplicates' => (int) $summary['duplicates'], 'reviewable' => (int) $summary['eligible_reviewable'],
+                        'rejected' => (int) $summary['rejected'], 'source_count' => count($summary['source_contribution']),
+                        'source_errors' => (int) DB::table('lead_discovery_runs')->where('tenant_id', $tenantId)->where('campaign_id', $campaignId)->sum('source_errors'),
+                        'processing_errors' => (int) DB::table('lead_discovery_runs')->where('tenant_id', $tenantId)->where('campaign_id', $campaignId)->sum('processing_errors')]);
+                }
+            }
         }
     }
 
