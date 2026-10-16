@@ -105,7 +105,7 @@ final class StartLeadDiscoveryCampaignJob implements ShouldQueue
         $pilotMode = (bool) data_get($campaignConfig, 'pilot_mode', false);
         Log::info('Lead discovery campaign started.', ['operation' => 'lead_discovery_campaign_started', 'tenant_id' => $this->tenantId,
             'campaign_id' => $campaign->id, 'source_count' => count($approvedSources), 'query_count' => count($tasks), 'checkpoint_count' => count($jobs)]);
-        if ($pilotMode) Log::info('Lead discovery 25-candidate pilot started.', [
+        if ($pilotMode) Log::info('Lead discovery controlled pilot started.', [
             'operation' => 'lead_discovery_pilot_started', 'tenant_id' => $this->tenantId, 'campaign_id' => $campaign->id,
             'target' => (int) data_get($campaignConfig, 'pilot_target', 25), 'unique_staged' => 0, 'duplicates' => 0,
             'reviewable' => 0, 'rejected' => 0, 'source_count' => count($approvedSources), 'source_errors' => 0, 'processing_errors' => 0,

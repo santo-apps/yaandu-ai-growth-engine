@@ -64,7 +64,7 @@ try {
     else if (path === '/lead-discovery/campaigns' && route.request().method() === 'GET') body = { data: campaign ? [campaign] : [] }
     else if (path === '/lead-discovery/campaigns' && route.request().method() === 'POST') {
       campaignCreatePayload = route.request().postDataJSON()
-      campaign = { id: campaignId, name: 'Synthetic Open Business Search', industry: null, country_code: null, target_leads: 5, status: 'draft', auto_promotion_enabled: false, configuration: { pilot_mode: true, pilot_target: 25 } }
+      campaign = { id: campaignId, name: 'Synthetic Open Business Search', industry: null, country_code: null, target_leads: 5, status: 'draft', auto_promotion_enabled: false, pilot_mode: campaignCreatePayload.pilot_mode, pilot_target: campaignCreatePayload.pilot_target, configuration: { pilot_mode: campaignCreatePayload.pilot_mode, pilot_target: campaignCreatePayload.pilot_target } }
       status = 201; body = campaign
     }
     else if (path === `/lead-discovery/campaigns/${campaignId}/start` && route.request().method() === 'POST') {
@@ -126,10 +126,15 @@ try {
   await page.getByText('Google Maps', { exact: true }).waitFor()
   await page.getByText('Not available for bulk persistent discovery.').waitFor()
   await page.getByLabel('Campaign name').fill('Synthetic Open Business Search')
+  assert.equal(await page.getByRole('checkbox', { name: 'Controlled pilot mode' }).isChecked(), false, 'Pilot mode requires an explicit choice')
+  await page.getByRole('checkbox', { name: 'Controlled pilot mode' }).check()
+  await page.getByLabel('Pilot target').fill('25')
+  await page.getByText('Stops after this many unique reviewable candidates. Duplicates and location mismatches do not count.').waitFor()
   await page.getByRole('button', { name: 'Create campaign' }).click()
   await page.getByText('Campaign created.', { exact: false }).waitFor()
   assert.ok(Array.isArray(campaignCreatePayload?.source_ids), 'Campaign submits the compatible selected source IDs')
-  assert.equal(campaignCreatePayload?.pilot_mode, true, 'New campaign uses the bounded controlled pilot mode by default')
+  assert.equal(campaignCreatePayload?.pilot_mode, true, 'The explicit controlled-pilot choice is sent to the API')
+  assert.equal(campaignCreatePayload?.pilot_target, 25, 'The UI sends the selected 25-candidate cap')
   assert.ok(!campaignCreatePayload.source_ids.includes(sourceRows.find((source) => source.source_key === 'brave_search').id), 'Brave remains excluded from the default campaign selection')
   await page.getByRole('button', { name: 'Start Discovery' }).click()
   await page.getByText('Discovery queued.', { exact: false }).waitFor()

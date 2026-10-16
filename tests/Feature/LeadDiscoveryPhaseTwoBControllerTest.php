@@ -57,6 +57,39 @@ class LeadDiscoveryPhaseTwoBControllerTest extends TestCase
         }
     }
 
+    public function test_pilot_mode_requires_a_bounded_explicit_target_and_is_not_inferred_from_campaign_target(): void
+    {
+        [$tenant, $owner] = $this->tenantOwner();
+        Sanctum::actingAs($owner);
+        $headers = ['X-Tenant-ID' => $tenant->id];
+
+        $normal = $this->withHeaders($headers)->postJson('/api/v1/lead-discovery/campaigns', [
+            'name' => 'Normal twenty-five target', 'target_leads' => 25, 'pilot_target' => 99,
+        ])->assertCreated()->assertJsonPath('pilot_mode', false)->assertJsonPath('pilot_target', null)->json();
+        $normalConfiguration = json_decode((string) DB::table('lead_discovery_campaigns')->where('tenant_id', $tenant->id)->where('id', $normal['id'])->value('configuration'), true);
+        self::assertFalse($normalConfiguration['pilot_mode']);
+        self::assertNull($normalConfiguration['pilot_target']);
+        $this->withHeaders($headers)->getJson('/api/v1/lead-discovery/campaigns/'.$normal['id'])->assertOk()
+            ->assertJsonPath('pilot_mode', false)->assertJsonPath('pilot_target', null)->assertJsonMissingPath('pilot_summary');
+
+        $this->withHeaders($headers)->postJson('/api/v1/lead-discovery/campaigns', [
+            'name' => 'Missing explicit pilot target', 'pilot_mode' => true,
+        ])->assertUnprocessable()->assertJsonValidationErrors('pilot_target');
+
+        $this->withHeaders($headers)->postJson('/api/v1/lead-discovery/campaigns', [
+            'name' => 'Pilot target exceeds phase cap', 'pilot_mode' => true, 'pilot_target' => 26,
+        ])->assertUnprocessable()->assertJsonValidationErrors('pilot_target');
+
+        $pilot = $this->withHeaders($headers)->postJson('/api/v1/lead-discovery/campaigns', [
+            'name' => 'Explicit pilot target', 'pilot_mode' => true, 'pilot_target' => 7, 'target_leads' => 25,
+        ])->assertCreated()->assertJsonPath('pilot_mode', true)->assertJsonPath('pilot_target', 7)->json();
+        $pilotConfiguration = json_decode((string) DB::table('lead_discovery_campaigns')->where('tenant_id', $tenant->id)->where('id', $pilot['id'])->value('configuration'), true);
+        self::assertTrue($pilotConfiguration['pilot_mode']);
+        self::assertSame(7, $pilotConfiguration['pilot_target']);
+        $this->withHeaders($headers)->getJson('/api/v1/lead-discovery/campaigns/'.$pilot['id'])->assertOk()
+            ->assertJsonPath('pilot_mode', true)->assertJsonPath('pilot_target', 7)->assertJsonPath('pilot_summary.target', 7);
+    }
+
     public function test_catalog_industries_and_countries_are_tenant_scoped_and_google_maps_is_not_selectable(): void
     {
         [$tenant, $owner] = $this->tenantOwner();
@@ -192,7 +225,7 @@ class LeadDiscoveryPhaseTwoBControllerTest extends TestCase
         $wikidata = $this->withHeaders($headers)->postJson('/api/v1/lead-discovery/sources', ['source_key' => 'wikidata', 'enabled' => false])->assertCreated()->json();
         $campaign = $this->withHeaders($headers)->postJson('/api/v1/lead-discovery/campaigns', [
             'name' => 'Controlled mixed-source pilot', 'industry' => 'Retail', 'country_code' => 'IN', 'pilot_mode' => true,
-            'target_leads' => 500, 'source_mode' => 'selected', 'source_ids' => [$osm['id'], $wikidata['id']],
+            'pilot_target' => 25, 'target_leads' => 500, 'source_mode' => 'selected', 'source_ids' => [$osm['id'], $wikidata['id']],
         ])->assertCreated()->json();
         $storedConfig = json_decode((string) DB::table('lead_discovery_campaigns')->where('tenant_id', $tenant->id)->where('id', $campaign['id'])->value('configuration'), true);
         self::assertSame(25, $storedConfig['pilot_target']);

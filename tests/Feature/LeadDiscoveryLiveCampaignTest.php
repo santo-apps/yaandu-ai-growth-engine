@@ -53,12 +53,19 @@ class LeadDiscoveryLiveCampaignTest extends TestCase
         $campaign = $this->withHeaders($headers)->postJson('/api/v1/lead-discovery/campaigns', [
             'name' => 'Synthetic India retail search', 'industry' => 'E-commerce & Retail', 'country_code' => 'IN',
             'target_leads' => 25, 'source_ids' => [$source['id']],
-        ])->assertCreated()->assertJsonPath('target_leads', 25)->assertJsonPath('auto_promotion_enabled', false)->json();
+        ])->assertCreated()->assertJsonPath('target_leads', 25)->assertJsonPath('pilot_mode', false)->assertJsonPath('pilot_target', null)->assertJsonPath('auto_promotion_enabled', false)->json();
+        $campaignConfiguration = json_decode((string) DB::table('lead_discovery_campaigns')->where('tenant_id', $tenant->id)->where('id', $campaign['id'])->value('configuration'), true);
+        self::assertFalse($campaignConfiguration['pilot_mode'], 'A target_leads value of 25 alone must not activate pilot limits.');
+        self::assertNull($campaignConfiguration['pilot_target']);
         $this->withHeaders($headers)->postJson('/api/v1/lead-discovery/campaigns/'.$campaign['id'].'/start', ['source_ids' => [$source['id']]])
             ->assertAccepted()->assertJsonPath('status', 'queued')->assertJsonPath('auto_promotion', false);
         Queue::assertPushed(StartLeadDiscoveryCampaignJob::class, 1);
 
+        \Illuminate\Support\Facades\Log::spy();
         (new StartLeadDiscoveryCampaignJob($tenant->id, $campaign['id'], [$source['id']]))->handle(app(LeadDiscoveryQueryTaxonomy::class), app(LeadSourceAdapterRegistry::class), app(LeadDiscoverySourcePlanner::class));
+        \Illuminate\Support\Facades\Log::shouldHaveReceived('info')->withArgs(fn ($message, $context) =>
+            $message === 'Lead discovery campaign started.' && ($context['operation'] ?? null) === 'lead_discovery_campaign_started')->once();
+        \Illuminate\Support\Facades\Log::shouldHaveReceived('info')->once();
         $run = DB::table('lead_discovery_runs')->where('tenant_id', $tenant->id)->where('campaign_id', $campaign['id'])->first();
         self::assertNotNull($run);
         self::assertDatabaseHas('audit_logs', ['tenant_id' => $tenant->id, 'action' => 'lead_discovery_run_started', 'subject_id' => $run->id, 'actor_user_id' => null]);
@@ -122,7 +129,7 @@ class LeadDiscoveryLiveCampaignTest extends TestCase
         $headers = ['X-Tenant-ID' => $tenant->id];
         $campaign = $this->withHeaders($headers)->postJson('/api/v1/lead-discovery/campaigns', [
             'name' => 'Chennai mixed-source pilot', 'industry' => 'E-commerce & Retail', 'country_code' => 'IN', 'region' => 'Tamil Nadu',
-            'city' => 'Chennai', 'pilot_mode' => true, 'target_leads' => 25, 'source_mode' => 'selected', 'source_ids' => array_values($sourceIds),
+            'city' => 'Chennai', 'pilot_mode' => true, 'pilot_target' => 25, 'target_leads' => 25, 'source_mode' => 'selected', 'source_ids' => array_values($sourceIds),
         ])->assertCreated()->json();
         $start = $this->withHeaders($headers)->postJson('/api/v1/lead-discovery/campaigns/'.$campaign['id'].'/start', ['source_ids' => array_values($sourceIds)])
             ->assertAccepted()->assertJsonPath('skipped_sources.0.source_id', $sourceIds['gleif'])->assertJsonPath('skipped_sources.0.reason_code', 'SOURCE_TEMPORARILY_UNAVAILABLE');
@@ -150,13 +157,13 @@ class LeadDiscoveryLiveCampaignTest extends TestCase
         $run = DB::table('lead_discovery_runs')->where('id', $runs[0]['id'])->first();
         $campaign = DB::table('lead_discovery_campaigns')->where('id', $campaignId)->first();
         $configuration = json_decode((string) $campaign->configuration, true);
-        $configuration['pilot_mode'] = true; $configuration['pilot_target'] = 25;
+        $configuration['pilot_mode'] = true; $configuration['pilot_target'] = 2;
         $configuration['limits']['candidates'] = 100; $configuration['limits']['processing'] = 100;
         $configuration['limits']['raw_candidates'] = 100; $configuration['limits']['source_requests'] = 100;
         DB::table('lead_discovery_campaigns')->where('id', $campaignId)->update(['configuration' => json_encode($configuration), 'target_leads' => 5000]);
         $sourceId = $this->sourceForRun($run->id); $now = now();
-        for ($index = 1; $index <= 24; $index++) {
-            $domain = $index === 1 ? 'duplicate-pilot.example.com' : 'existing-pilot-'.$index.'.example.com';
+        for ($index = 1; $index <= 1; $index++) {
+            $domain = 'duplicate-pilot.example.com';
             DB::table('lead_discovery_candidates')->insert(['id' => (string) Str::uuid(), 'tenant_id' => $tenant->id, 'campaign_id' => $campaignId,
                 'run_id' => $run->id, 'source_id' => $sourceId, 'fingerprint' => hash('sha256', 'domain:'.$domain),
                 'company_name' => 'Existing Pilot '.$index, 'normalized_name' => 'existing pilot '.$index, 'claimed_website' => 'https://'.$domain.'/',
@@ -171,7 +178,7 @@ class LeadDiscoveryLiveCampaignTest extends TestCase
         $checkpoint = DB::table('lead_discovery_checkpoints')->where('id', $runs[0]['checkpoint'])->first();
         (new DiscoverLeadSourcePageJob($tenant->id, $checkpoint->id))->handle(app(LeadSourceAdapterRegistry::class), app(LiveCandidateStager::class));
 
-        self::assertSame(25, DB::table('lead_discovery_candidates')->where('tenant_id', $tenant->id)->where('campaign_id', $campaignId)->count());
+        self::assertSame(2, DB::table('lead_discovery_candidates')->where('tenant_id', $tenant->id)->where('campaign_id', $campaignId)->count());
         self::assertSame(1, DB::table('lead_discovery_runs')->where('tenant_id', $tenant->id)->where('id', $run->id)->value('duplicates_found'));
         self::assertSame(1, DB::table('lead_discovery_runs')->where('tenant_id', $tenant->id)->where('id', $run->id)->value('candidates_found'));
         self::assertSame(2, DB::table('lead_discovery_runs')->where('tenant_id', $tenant->id)->where('id', $run->id)->value('raw_candidates'));
@@ -183,6 +190,58 @@ class LeadDiscoveryLiveCampaignTest extends TestCase
         Queue::assertNotPushed(\App\Jobs\SendOutboundMessage::class);
         self::assertSame(0, DB::table('campaign_recipients')->where('tenant_id', $tenant->id)->count());
         self::assertSame(0, DB::table('outbound_messages')->where('tenant_id', $tenant->id)->count());
+    }
+
+    public function test_normal_discovery_does_not_apply_the_controlled_pilot_cap(): void
+    {
+        [$tenant] = $this->tenantAndUser('normal-discovery-no-pilot-cap');
+        Queue::fake();
+        [$campaignId, $runs] = $this->campaignWithSourceRuns($tenant->id, 1);
+        $run = DB::table('lead_discovery_runs')->where('id', $runs[0]['id'])->first();
+        $campaign = DB::table('lead_discovery_campaigns')->where('id', $campaignId)->first();
+        $configuration = json_decode((string) $campaign->configuration, true);
+        $configuration['limits']['candidates'] = 100; $configuration['limits']['processing'] = 100;
+        $configuration['limits']['raw_candidates'] = 100; $configuration['limits']['source_requests'] = 100;
+        DB::table('lead_discovery_campaigns')->where('id', $campaignId)->update(['configuration' => json_encode($configuration), 'target_leads' => 25]);
+        $sourceId = $this->sourceForRun($run->id); $now = now();
+        for ($index = 1; $index <= 25; $index++) {
+            DB::table('lead_discovery_candidates')->insert(['id' => (string) Str::uuid(), 'tenant_id' => $tenant->id, 'campaign_id' => $campaignId,
+                'run_id' => $run->id, 'source_id' => $sourceId, 'fingerprint' => hash('sha256', 'normal-existing-'.$index),
+                'company_name' => 'Normal Existing '.$index, 'normalized_name' => 'normal existing '.$index,
+                'processing_status' => 'needs_review', 'eligibility_status' => 'needs_review', 'official_domain_status' => 'needs_review',
+                'geographic_relevance' => 'location_unknown', 'promotion_status' => 'not_promoted', 'discovered_at' => $now, 'created_at' => $now, 'updated_at' => $now]);
+        }
+        Http::fake(['api.search.brave.com/*' => Http::response(['web' => ['results' => [
+            ['title' => 'Twenty Sixth Normal Candidate', 'url' => 'https://twenty-sixth-normal.example.com/', 'description' => 'Synthetic result.'],
+        ]]], 200)]);
+        $checkpoint = DB::table('lead_discovery_checkpoints')->where('id', $runs[0]['checkpoint'])->first();
+        (new DiscoverLeadSourcePageJob($tenant->id, $checkpoint->id))->handle(app(LeadSourceAdapterRegistry::class), app(LiveCandidateStager::class));
+
+        self::assertSame(26, DB::table('lead_discovery_candidates')->where('tenant_id', $tenant->id)->where('campaign_id', $campaignId)->count());
+        self::assertNotSame('PILOT_TARGET_REACHED', DB::table('lead_discovery_checkpoints')->where('tenant_id', $tenant->id)->where('id', $checkpoint->id)->value('error_code'));
+        self::assertSame(0, DB::table('campaign_recipients')->where('tenant_id', $tenant->id)->count());
+        self::assertSame(0, DB::table('outbound_messages')->where('tenant_id', $tenant->id)->count());
+    }
+
+    public function test_start_job_emits_pilot_started_only_for_explicit_pilot_mode(): void
+    {
+        [$tenant, $owner] = $this->tenantAndUser('pilot-start-observability');
+        $owner->tenants()->attach($tenant->id, ['role' => 'owner', 'status' => 'active']);
+        Sanctum::actingAs($owner); Queue::fake();
+        [$campaignId, $runs] = $this->campaignWithSourceRuns($tenant->id, 1, 'queued');
+        $sourceId = $this->sourceForRun($runs[0]['id']);
+        $configuration = json_decode((string) DB::table('lead_discovery_campaigns')->where('tenant_id', $tenant->id)->where('id', $campaignId)->value('configuration'), true);
+        $configuration['pilot_mode'] = true; $configuration['pilot_target'] = 3;
+        DB::table('lead_discovery_campaigns')->where('tenant_id', $tenant->id)->where('id', $campaignId)
+            ->update(['configuration' => json_encode($configuration), 'started_at' => now()]);
+        \Illuminate\Support\Facades\Log::spy();
+        (new StartLeadDiscoveryCampaignJob($tenant->id, $campaignId, [$sourceId]))
+            ->handle(app(LeadDiscoveryQueryTaxonomy::class), app(LeadSourceAdapterRegistry::class), app(LeadDiscoverySourcePlanner::class));
+        \Illuminate\Support\Facades\Log::shouldHaveReceived('info')->withArgs(fn ($message, $context) =>
+            $message === 'Lead discovery controlled pilot started.' && ($context['operation'] ?? null) === 'lead_discovery_pilot_started'
+            && ($context['target'] ?? null) === 3)->once();
+        \Illuminate\Support\Facades\Log::shouldHaveReceived('info')->twice();
+        self::assertSame(3, json_decode((string) DB::table('lead_discovery_campaigns')->where('tenant_id', $tenant->id)->where('id', $campaignId)->value('configuration'), true)['pilot_target']);
     }
 
     public function test_campaign_waits_for_all_source_runs_and_finishes_with_errors_when_one_fails(): void

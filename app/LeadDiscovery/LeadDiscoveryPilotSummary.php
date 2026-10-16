@@ -9,6 +9,12 @@ final class LeadDiscoveryPilotSummary
 {
     public const TARGET = 25;
 
+    /** Bound a persisted pilot target defensively to the current controlled-pilot maximum. */
+    public static function configuredTarget(array $configuration): int
+    {
+        return min(self::TARGET, max(1, (int) data_get($configuration, 'pilot_target', self::TARGET)));
+    }
+
     /** Candidates that count toward the pilot target after dedupe and geography rejection. */
     public function targetCount(string $tenantId, string $campaignId): int
     {
@@ -90,7 +96,7 @@ final class LeadDiscoveryPilotSummary
             ->groupBy('e.candidate_id')->havingRaw('count(distinct e.source_id) > 1')->get()->count();
 
         return [
-            'target' => self::TARGET,
+            'target' => self::configuredTarget($campaignConfiguration),
             'target_counting_rule' => 'Count distinct staged candidate records with eligible/needs_review status; exclude duplicates, invalid/internal failures, and location_mismatch. Unverifiable website outcomes remain reviewable and count. Manual rejection does not erase a candidate already staged toward the target.',
             'unique_staged' => $this->targetCount($tenantId, $campaignId),
             'total_raw_candidates' => (int) $runsAll->sum('raw_candidates'),
