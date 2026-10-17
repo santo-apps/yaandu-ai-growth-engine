@@ -144,9 +144,108 @@ class LeadDiscoveryLiveCampaignTest extends TestCase
         Queue::assertPushed(DiscoverLeadSourcePageJob::class);
         $summary = $this->withHeaders($headers)->getJson('/api/v1/lead-discovery/campaigns/'.$campaign['id'])->assertOk()->json('pilot_summary');
         self::assertSame([['source_id' => $sourceIds['gleif'], 'source_key' => 'gleif', 'source' => 'Unavailable GLEIF', 'reason_code' => 'SOURCE_TEMPORARILY_UNAVAILABLE']], $summary['skipped_sources']);
+        self::assertSame(3, $summary['source_availability']['requested_count']);
+        self::assertSame(2, $summary['source_availability']['executed_count']);
+        self::assertSame(1, $summary['source_availability']['skipped_count']);
         Http::assertNothingSent();
         self::assertSame(0, DB::table('campaign_recipients')->where('tenant_id', $tenant->id)->count());
         self::assertSame(0, DB::table('outbound_messages')->where('tenant_id', $tenant->id)->count());
+    }
+
+    public function test_mixed_osm_and_wikidata_campaign_stages_candidates_from_both_sources(): void
+    {
+        [$tenant] = $this->tenantAndUser('mixed-source-yield');
+        Queue::fake();
+        config(['lead_discovery.wikidata_user_agent' => 'PulamTest/1.0 (ops@example.test)']);
+        [$campaignId, $runs] = $this->campaignWithSourceRuns($tenant->id, 2);
+        $osmRun = $runs[0];
+        $wikidataRun = $runs[1];
+        $this->configureOsmRun($tenant->id, $osmRun);
+        $this->configureWikidataRun($tenant->id, $wikidataRun);
+
+        Http::fake([
+            'overpass-api.de/*' => Http::response(['elements' => [[
+                'type' => 'node', 'id' => 901, 'lat' => 13.05, 'lon' => 80.25,
+                'tags' => ['name' => 'Synthetic Chennai Furnishings', 'shop' => 'furniture',
+                    'addr:country' => 'IN', 'addr:city' => 'Chennai', 'addr:state' => 'Tamil Nadu'],
+            ]]], 200),
+            'query.wikidata.org/*' => Http::response(['results' => ['bindings' => [[
+                'item' => ['value' => 'https://www.wikidata.org/entity/Q987654'],
+                'label' => ['value' => 'Synthetic India Retailer'],
+                'country' => ['value' => 'https://www.wikidata.org/entity/Q668'],
+                'countryCode' => ['value' => 'IN'],
+                'industry' => ['value' => 'https://www.wikidata.org/entity/Q126793'],
+            ]]]], 200),
+        ]);
+
+        (new DiscoverLeadSourcePageJob($tenant->id, $osmRun['checkpoint']))
+            ->handle(app(LeadSourceAdapterRegistry::class), app(LiveCandidateStager::class));
+        (new DiscoverLeadSourcePageJob($tenant->id, $wikidataRun['checkpoint']))
+            ->handle(app(LeadSourceAdapterRegistry::class), app(LiveCandidateStager::class));
+
+        $candidates = DB::table('lead_discovery_candidates')->where('tenant_id', $tenant->id)
+            ->where('campaign_id', $campaignId)->get(['source_id', 'company_name', 'country_code', 'promotion_status']);
+        self::assertCount(2, $candidates);
+        self::assertSame([
+            $osmRun['id'] => 'Synthetic Chennai Furnishings',
+            $wikidataRun['id'] => 'Synthetic India Retailer',
+        ], $candidates->mapWithKeys(fn ($candidate) => [
+            (string) DB::table('lead_discovery_runs')->where('tenant_id', $tenant->id)->where('source_id', $candidate->source_id)->value('id')
+                => $candidate->company_name,
+        ])->all());
+        self::assertSame(['IN'], $candidates->pluck('country_code')->unique()->values()->all());
+        self::assertSame(['not_promoted'], $candidates->pluck('promotion_status')->unique()->values()->all());
+        self::assertSame(1, DB::table('lead_discovery_runs')->where('tenant_id', $tenant->id)->where('id', $osmRun['id'])->value('candidates_found'));
+        self::assertSame(1, DB::table('lead_discovery_runs')->where('tenant_id', $tenant->id)->where('id', $wikidataRun['id'])->value('candidates_found'));
+        self::assertSame(2, DB::table('lead_discovery_candidate_evidence')->where('tenant_id', $tenant->id)->where('campaign_id', $campaignId)
+            ->whereIn('source_id', [$this->sourceForRun($osmRun['id']), $this->sourceForRun($wikidataRun['id'])])->distinct('source_id')->count('source_id'));
+        self::assertSame(1, Http::recorded(fn ($request) => str_contains($request->url(), 'overpass-api.de'))->count());
+        self::assertSame(1, Http::recorded(fn ($request) => str_contains($request->url(), 'query.wikidata.org'))->count());
+        Http::assertSentCount(2);
+        Queue::assertNotPushed(\App\Jobs\SendOutboundMessage::class);
+        self::assertSame(0, DB::table('campaign_recipients')->where('tenant_id', $tenant->id)->count());
+        self::assertSame(0, DB::table('outbound_messages')->where('tenant_id', $tenant->id)->count());
+    }
+
+    public function test_stale_transient_osm_health_can_recover_through_a_normal_bounded_campaign_request(): void
+    {
+        [$tenant, $owner] = $this->tenantAndUser('stale-osm-recovery');
+        $owner->tenants()->attach($tenant->id, ['role' => 'owner', 'status' => 'active']);
+        Sanctum::actingAs($owner); Queue::fake();
+        config(['lead_discovery.osm_health_cooldown_seconds' => 300]);
+        $headers = ['X-Tenant-ID' => $tenant->id];
+        $source = $this->withHeaders($headers)->postJson('/api/v1/lead-discovery/sources', [
+            'source_key' => 'osm_overpass', 'provider_name' => 'Synthetic OSM', 'license_or_authorization' => 'ODbL',
+            'allowed_collection_method' => 'official_public_api', 'storage_rights_reference' => 'ODbL', 'storage_rights_confirmed' => true, 'enabled' => true,
+        ])->assertCreated()->json();
+        DB::table('lead_discovery_sources')->where('tenant_id', $tenant->id)->where('id', $source['id'])->update([
+            'health_state' => 'degraded', 'last_error_code' => 'SOURCE_TEMPORARILY_UNAVAILABLE', 'updated_at' => now()->subMinutes(6),
+        ]);
+        $campaign = $this->withHeaders($headers)->postJson('/api/v1/lead-discovery/campaigns', [
+            'name' => 'Chennai OSM recovery', 'industry' => 'E-commerce & Retail', 'country_code' => 'IN', 'region' => 'Tamil Nadu',
+            'city' => 'Chennai', 'pilot_mode' => true, 'pilot_target' => 25, 'source_ids' => [$source['id']],
+        ])->assertCreated()->json();
+        $this->withHeaders($headers)->postJson('/api/v1/lead-discovery/campaigns/'.$campaign['id'].'/start', ['source_ids' => [$source['id']]])
+            ->assertAccepted()->assertJsonCount(0, 'skipped_sources');
+
+        (new StartLeadDiscoveryCampaignJob($tenant->id, $campaign['id'], [$source['id']]))
+            ->handle(app(LeadDiscoveryQueryTaxonomy::class), app(LeadSourceAdapterRegistry::class), app(LeadDiscoverySourcePlanner::class));
+
+        self::assertSame(1, DB::table('lead_discovery_runs')->where('tenant_id', $tenant->id)->where('campaign_id', $campaign['id'])->where('source_id', $source['id'])->count());
+        self::assertSame(2, DB::table('lead_discovery_checkpoints')->where('tenant_id', $tenant->id)->where('campaign_id', $campaign['id'])->where('source_id', $source['id'])->count(), 'Only the two curated retail query partitions are queued.');
+        self::assertSame('degraded', DB::table('lead_discovery_sources')->where('tenant_id', $tenant->id)->where('id', $source['id'])->value('health_state'), 'Health remains degraded until a successful normal provider request.');
+        $checkpoint = DB::table('lead_discovery_checkpoints')->where('tenant_id', $tenant->id)->where('campaign_id', $campaign['id'])->where('source_id', $source['id'])->first();
+        RateLimiter::clear('lead-discovery-provider:osm_overpass');
+        \Illuminate\Support\Facades\Log::spy();
+        Http::fake(['overpass-api.de/*' => Http::response(['elements' => []], 200)]);
+        (new DiscoverLeadSourcePageJob($tenant->id, $checkpoint->id))->handle(app(LeadSourceAdapterRegistry::class), app(LiveCandidateStager::class));
+        self::assertSame('ready', DB::table('lead_discovery_sources')->where('tenant_id', $tenant->id)->where('id', $source['id'])->value('health_state'));
+        self::assertSame(1, (int) DB::table('lead_discovery_runs')->where('tenant_id', $tenant->id)->where('campaign_id', $campaign['id'])->where('source_id', $source['id'])->value('source_requests'));
+        \Illuminate\Support\Facades\Log::shouldHaveReceived('info')->withArgs(fn ($message, $context) => ($context['operation'] ?? null) === 'lead_discovery_source_recovered'
+            && ($context['source_id'] ?? null) === $source['id'])->once();
+        Http::assertSentCount(1);
+        Queue::assertNotPushed(\App\Jobs\SendOutboundMessage::class);
+        self::assertSame(0, DB::table('campaign_recipients')->where('tenant_id', $tenant->id)->count());
     }
 
     public function test_pilot_target_counts_only_unique_reviewable_candidates_and_stops_at_25(): void
@@ -446,7 +545,7 @@ class LeadDiscoveryLiveCampaignTest extends TestCase
         RateLimiter::clear($rateKey);
     }
 
-    public function test_unsupported_wikidata_industry_is_reported_while_other_campaign_sources_continue(): void
+    public function test_unsupported_industry_sources_are_skipped_without_corrupting_health_state(): void
     {
         [$tenant] = $this->tenantAndUser('live-lead-discovery-wikidata-unsupported');
         Queue::fake();
@@ -474,12 +573,14 @@ class LeadDiscoveryLiveCampaignTest extends TestCase
         (new StartLeadDiscoveryCampaignJob($tenant->id, $campaignId, [$wikidataId, $gleifId]))
             ->handle(app(LeadDiscoveryQueryTaxonomy::class), app(LeadSourceAdapterRegistry::class), app(LeadDiscoverySourcePlanner::class));
 
-        self::assertSame('SOURCE_QUERY_UNSUPPORTED', DB::table('lead_discovery_sources')->where('tenant_id', $tenant->id)->where('id', $wikidataId)->value('last_error_code'));
-        self::assertSame('not_configured', DB::table('lead_discovery_sources')->where('tenant_id', $tenant->id)->where('id', $wikidataId)->value('health_state'));
-        self::assertSame('running', DB::table('lead_discovery_campaigns')->where('tenant_id', $tenant->id)->where('id', $campaignId)->value('status'));
-        self::assertSame(1, DB::table('lead_discovery_runs')->where('tenant_id', $tenant->id)->where('campaign_id', $campaignId)->where('source_id', $gleifId)->count());
+        self::assertNull(DB::table('lead_discovery_sources')->where('tenant_id', $tenant->id)->where('id', $wikidataId)->value('last_error_code'), 'Unsupported campaign queries do not corrupt source health state.');
+        self::assertSame('ready', DB::table('lead_discovery_sources')->where('tenant_id', $tenant->id)->where('id', $wikidataId)->value('health_state'));
+        self::assertSame('failed', DB::table('lead_discovery_campaigns')->where('tenant_id', $tenant->id)->where('id', $campaignId)->value('status'));
+        self::assertSame(0, DB::table('lead_discovery_runs')->where('tenant_id', $tenant->id)->where('campaign_id', $campaignId)->where('source_id', $gleifId)->count(), 'GLEIF does not run when the selected industry cannot be verified by its supported filters.');
         self::assertSame(0, DB::table('lead_discovery_runs')->where('tenant_id', $tenant->id)->where('campaign_id', $campaignId)->where('source_id', $wikidataId)->count());
-        Queue::assertPushed(DiscoverLeadSourcePageJob::class, 1);
+        Queue::assertNotPushed(DiscoverLeadSourcePageJob::class);
+        $savedConfig = json_decode((string) DB::table('lead_discovery_campaigns')->where('tenant_id', $tenant->id)->where('id', $campaignId)->value('configuration'), true);
+        self::assertCount(2, $savedConfig['pilot_skipped_sources']);
         Http::assertNothingSent();
         self::assertSame(0, DB::table('campaign_recipients')->where('tenant_id', $tenant->id)->count());
         self::assertSame(0, DB::table('outbound_messages')->where('tenant_id', $tenant->id)->count());

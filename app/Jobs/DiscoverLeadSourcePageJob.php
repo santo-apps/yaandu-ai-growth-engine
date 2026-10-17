@@ -191,6 +191,11 @@ final class DiscoverLeadSourcePageJob implements ShouldQueue, ShouldBeUniqueUnti
             DB::table('lead_discovery_sources')->where('tenant_id', $this->tenantId)->where('id', $source->id)->update([
                 'health_state' => 'ready', 'last_success_at' => now(), 'last_error_code' => null, 'updated_at' => now(),
             ]);
+            if ((string) $source->source_key === 'osm_overpass' && (string) $source->health_state === 'degraded') {
+                Log::info('Lead discovery source recovered after a bounded campaign request.', ['operation' => 'lead_discovery_source_recovered',
+                    'tenant_id' => $this->tenantId, 'campaign_id' => $campaign->id, 'source_id' => $source->id,
+                    'reason_code' => (string) ($source->last_error_code ?? 'SOURCE_TEMPORARILY_UNAVAILABLE'), 'health_status' => 'ready']);
+            }
             $providerAuditData = (string) $source->source_key === 'wikidata' ? array_intersect_key($page->providerMetadata, array_flip([
                 'query_key', 'industry_key', 'country_code', 'result_count', 'logical_request_count', 'query_sha256', 'stage_count',
             ])) : [];
@@ -348,6 +353,11 @@ final class DiscoverLeadSourcePageJob implements ShouldQueue, ShouldBeUniqueUnti
             DB::table('lead_discovery_runs')->where('tenant_id', $this->tenantId)->where('id', $run->id)->increment('source_errors');
             DB::table('lead_discovery_sources')->where('tenant_id', $this->tenantId)->where('id', $source->id)->update(['health_state' => $code === 'SOURCE_AUTH_FAILED' ? 'auth_error' : 'degraded', 'last_error_code' => $code, 'updated_at' => now()]);
         });
+        if ((string) $source->source_key === 'osm_overpass' && in_array($code, ['SOURCE_TIMEOUT', 'SOURCE_TEMPORARILY_UNAVAILABLE', 'SOURCE_RATE_LIMITED'], true)) {
+            Log::warning('Lead discovery source entered transient health cooldown.', ['operation' => 'lead_discovery_source_health_cooldown',
+                'tenant_id' => $this->tenantId, 'campaign_id' => $checkpoint->campaign_id, 'source_id' => $source->id,
+                'reason_code' => $code, 'cooldown_seconds' => (int) config('lead_discovery.osm_health_cooldown_seconds', 300), 'health_status' => 'degraded']);
+        }
         Log::warning('Lead discovery source failed safely.', ['operation' => 'lead_discovery_source_failed', 'tenant_id' => $this->tenantId,
             'campaign_id' => $checkpoint->campaign_id, 'run_id' => $checkpoint->run_id, 'source_id' => $checkpoint->source_id,
             'query_key' => $checkpoint->query_key, 'error_code' => $code]);

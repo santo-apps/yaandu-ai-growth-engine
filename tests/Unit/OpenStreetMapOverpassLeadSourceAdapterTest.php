@@ -188,6 +188,20 @@ class OpenStreetMapOverpassLeadSourceAdapterTest extends TestCase
         self::assertSame(40, config('lead_discovery.overpass_logical_request_timeout_seconds'));
     }
 
+    public function test_expanded_retail_categories_remain_curated_and_bounded(): void
+    {
+        Http::fake(['overpass-api.de/*' => Http::response(['elements' => []], 200)]);
+        app(OpenStreetMapOverpassLeadSourceAdapter::class)->search($this->query('ecommerce_retail'), $this->approvedSource());
+
+        Http::assertSent(function ($request): bool {
+            $query = urldecode($request->body());
+            foreach (['mobile_phone', 'appliance', 'jewelry', 'gift', 'interior_decoration', 'lighting', 'hardware', 'stationery', 'sports', 'toys', 'books', 'cosmetics', 'household', 'variety_store'] as $category) {
+                if (! str_contains($query, '["shop"="'.$category.'"]')) return false;
+            }
+            return ! str_contains($query, '["shop"]') && substr_count($query, 'nwr["name"]') <= 100;
+        });
+    }
+
     public function test_two_degree_bbox_limit_is_preserved(): void
     {
         $query = new DiscoveryQuery('campaign', 'tenant', '', 'AE', null, null, 'retail', '', 10, null,
