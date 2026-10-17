@@ -8,6 +8,33 @@ final class LeadDiscoverySourcePlanner
 {
     public function __construct(private readonly LeadDiscoveryQueryTaxonomy $queries, private readonly LeadDiscoveryCountryCatalog $countries) {}
 
+    /** @return array{tasks:list<array{source:object,query:array,partition:array}>,selected_source_ids:list<string>,skipped_sources:list<array{source_id:string,reason_code:string}>} */
+    public function planWithDiagnostics(object $campaign, iterable $sources): array
+    {
+        $sources = is_array($sources) ? $sources : iterator_to_array((function () use ($sources) { yield from $sources; })(), false);
+        $tasks = $this->plan($campaign, $sources);
+        $selected = array_values(array_unique(array_map(static fn (array $task): string => (string) $task['source']->id, $tasks)));
+        $industry = trim((string) ($campaign->industry ?? ''));
+        $industryKey = $campaign->normalized_industry_key ?? app(LeadDiscoveryIndustryTaxonomy::class)->keyFor($industry);
+        $osmHasCuratedIndustry = $industryKey !== null && isset(config('lead_discovery.osm_categories', [])[$industryKey]);
+        $skipped = [];
+        foreach ($sources as $source) {
+            $sourceId = (string) ($source->id ?? '');
+            if ($sourceId === '' || in_array($sourceId, $selected, true)) continue;
+            $sourceKey = (string) ($source->source_key ?? '');
+            $reason = match (true) {
+                trim($industry) !== '' && in_array($sourceKey, ['gleif', 'india_ogd_mca'], true) => 'SOURCE_QUERY_UNSUPPORTED',
+                $sourceKey === 'wikidata' && ! app(WikidataLeadSourceAdapter::class)->supportsIndustryKey($industryKey) => 'SOURCE_QUERY_UNSUPPORTED',
+                $sourceKey === 'osm_overpass' && trim($industry) !== '' && ! $osmHasCuratedIndustry => 'SOURCE_QUERY_UNSUPPORTED',
+                $sourceKey === 'osm_overpass' => 'SOURCE_NOT_APPLICABLE',
+                default => 'SOURCE_QUERY_UNSUPPORTED',
+            };
+            $skipped[] = ['source_id' => $sourceId, 'reason_code' => $reason];
+        }
+
+        return ['tasks' => $tasks, 'selected_source_ids' => $selected, 'skipped_sources' => $skipped];
+    }
+
     /** @param Collection<int,object>|list<object> $sources @return list<array{source:object,query:array,partition:array}> */
     public function plan(object $campaign, iterable $sources): array
     {
@@ -23,6 +50,11 @@ final class LeadDiscoverySourcePlanner
             $capability = app(LeadSourceAdapterRegistry::class)->get((string) $source->source_key)->capabilities();
             if (! $capability->supportsLiveQuery || ! $capability->persistentStorageAllowed
                 || ! in_array($capability->governanceClass, ['OPEN_PERSISTABLE', 'CONDITIONAL'], true)) continue;
+            // Neither adapter currently applies a business-classification filter:
+            // GLEIF filters legal names, and the OGD adapter returns records with
+            // classification fields but does not filter them server-side. Do not
+            // run either as an industry source until a bounded supported filter exists.
+            if (trim($industry) !== '' && in_array((string) $source->source_key, ['gleif', 'india_ogd_mca'], true)) continue;
             $campaignConfiguration = $campaignSettings;
             $keywords = trim((string) data_get($campaignConfiguration, 'keywords', ''));
             if ($source->source_key === 'wikidata') {

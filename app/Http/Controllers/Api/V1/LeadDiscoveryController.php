@@ -23,6 +23,7 @@ use App\Models\CompanyWebsite;
 use App\Contacts\ContactMethodValue;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
 use Illuminate\Validation\ValidationException;
 use Symfony\Component\HttpFoundation\Response;
@@ -268,6 +269,7 @@ final class LeadDiscoveryController extends Controller
         abort_unless($row->status === 'draft', 409, 'Only a draft campaign can be started.');
         $config = json_decode((string) $row->configuration, true) ?: [];
         $sourceIds = array_values(array_unique($request->input('source_ids', data_get($config, 'discovery_source_ids', []))));
+        $requestedSourceIds = $sourceIds;
         $skippedSources = [];
         if ($sourceIds) {
             $selected = DB::table('lead_discovery_sources')->where('tenant_id', $tenant)->whereIn('id', $sourceIds)->get();
@@ -278,8 +280,13 @@ final class LeadDiscoveryController extends Controller
                 abort_unless($adapter instanceof \App\LeadDiscovery\SearchLeadSourceAdapterInterface
                     && $adapter->capabilities()->governanceClass !== 'PROHIBITED_FOR_BULK_STORAGE', 422, 'This provider is not approved for persistent discovery.');
                 $reason = $this->sourceBlockReason($source);
-                if ($reason === null && in_array((string) $source->health_state, ['degraded', 'auth_error', 'not_configured', 'disabled'], true)) $reason = 'SOURCE_TEMPORARILY_UNAVAILABLE';
-                if ($reason !== null) { $skippedSources[] = ['source_id' => $source->id, 'reason_code' => $reason]; continue; }
+                if ($reason === null) $reason = app(\App\LeadDiscovery\LeadDiscoverySourceHealthPolicy::class)->blockReason($source);
+                if ($reason !== null) {
+                    $skippedSources[] = ['source_id' => $source->id, 'reason_code' => $reason];
+                    Log::notice('Lead discovery source skipped before campaign execution.', ['operation' => 'lead_discovery_source_skipped', 'tenant_id' => $tenant,
+                        'campaign_id' => $campaign, 'source_id' => $source->id, 'reason_code' => $reason, 'health_status' => (string) $source->health_state]);
+                    continue;
+                }
                 $readyIds[] = (string) $source->id;
             }
             if ($readyIds === []) {
@@ -292,6 +299,8 @@ final class LeadDiscoveryController extends Controller
                 ->where('enabled', true)->where('authorization_status', 'authorized')->where('storage_rights_status', 'confirmed')->exists();
             abort_unless($eligibleOpenSources, 422, 'No enabled, authorized and storage-approved open source is configured for this tenant.');
         }
+        $config['discovery_source_ids'] = $requestedSourceIds;
+        $config['pilot_requested_sources'] = $requestedSourceIds;
         $config['pilot_skipped_sources'] = $skippedSources;
         DB::table('lead_discovery_campaigns')->where('tenant_id', $tenant)->where('id', $campaign)->update([
             'configuration' => json_encode($config), 'status' => 'queued', 'updated_at' => now(),
@@ -719,7 +728,7 @@ final class LeadDiscoveryController extends Controller
             $adapter = app(LeadSourceAdapterRegistry::class)->get((string) $source->source_key);
             if (! $adapter instanceof \App\LeadDiscovery\SearchLeadSourceAdapterInterface) return 'SOURCE_NOT_APPLICABLE';
             $adapter->validateConfiguration($configuration);
-            return null;
+            return app(\App\LeadDiscovery\LeadDiscoverySourceHealthPolicy::class)->blockReason($source);
         } catch (\App\LeadDiscovery\LiveLeadSourceException $error) { return $error->errorCode; }
         catch (\InvalidArgumentException) { return 'SOURCE_NOT_APPLICABLE'; }
     }
@@ -736,7 +745,7 @@ final class LeadDiscoveryController extends Controller
     private function configurationStatus(string $sourceKey): string
     {
         return match ($sourceKey) {
-            'osm_overpass' => filled(config('lead_discovery.user_agent')) && str_starts_with((string) config('lead_discovery.endpoints.osm_overpass'), 'https://') ? 'available' : 'missing',
+            'osm_overpass' => filled(config('lead_discovery.user_agent')) && (array) config('lead_discovery.overpass_endpoints', []) !== [] ? 'available' : 'missing',
             'wikidata' => filled(config('lead_discovery.wikidata_user_agent')) && (string) parse_url((string) config('lead_discovery.endpoints.wikidata'), PHP_URL_HOST) === 'query.wikidata.org' ? 'available' : 'missing',
             'india_ogd_mca' => filled(config('lead_discovery.mca_resource_id')) ? 'available' : 'missing',
             'gleif' => (string) parse_url((string) config('lead_discovery.endpoints.gleif'), PHP_URL_HOST) === 'api.gleif.org' ? 'available' : 'missing',

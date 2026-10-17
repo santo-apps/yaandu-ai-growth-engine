@@ -55,22 +55,30 @@ final class LeadDiscoveryPilotSummary
                 return max(0, (int) \Illuminate\Support\Carbon::parse($run->finished_at ?? now())->diffInSeconds(\Illuminate\Support\Carbon::parse($run->started_at)));
             });
             $source = $sources->get($sourceId);
+            $raw = (int) $sourceRuns->sum('raw_candidates');
+            $duplicates = (int) $sourceRuns->sum('duplicates_found') + (int) (clone $candidateRows)->where('processing_status', 'duplicate')->count();
+            $reviewableCount = (int) (clone $candidateRows)->whereIn('eligibility_status', ['eligible', 'needs_review'])->whereNotIn('processing_status', ['failed', 'invalid', 'duplicate'])->count();
+            $mismatchCount = (int) (clone $candidateRows)->where('geographic_relevance', 'location_mismatch')->count();
             return [
                 'source_id' => (string) $sourceId, 'source_key' => (string) $sourceRuns->first()->source_key,
                 'source' => (string) ($source->provider_name ?? $sourceRuns->first()->provider_name),
-                'raw_results' => (int) $sourceRuns->sum('raw_candidates'),
+                'raw_results' => $raw,
+                'new_candidates' => (int) $sourceRuns->sum('candidates_found'),
                 'staged_candidates' => (int) (clone $candidateRows)->where('processing_status', '!=', 'duplicate')->count(),
-                'duplicates' => (int) $sourceRuns->sum('duplicates_found') + (int) (clone $candidateRows)->where('processing_status', 'duplicate')->count(),
+                'duplicates' => $duplicates,
                 'verified' => (int) (clone $candidateRows)->where('official_domain_status', 'verified')->count(),
-                'reviewable' => (int) (clone $candidateRows)->whereIn('eligibility_status', ['eligible', 'needs_review'])->whereNotIn('processing_status', ['failed', 'invalid', 'duplicate'])->count(),
+                'reviewable' => $reviewableCount,
                 'rejected' => (int) (clone $candidateRows)->where('eligibility_status', 'rejected')->count(),
-                'geographic_mismatches' => (int) (clone $candidateRows)->where('geographic_relevance', 'location_mismatch')->count(),
+                'geographic_mismatches' => $mismatchCount,
                 'unverifiable_websites' => (int) (clone $candidateRows)->whereIn('validation_reason_code', self::unverifiableCodes())->count(),
                 'source_errors' => (int) $sourceRuns->sum('source_errors'),
                 'processing_errors' => (int) $sourceRuns->sum('processing_errors'),
                 'provider_requests' => (int) $sourceRuns->sum('source_requests'),
                 'retries' => (int) $pages->sum(fn ($page) => max(0, (int) $page->attempts - (int) $page->pages_completed)),
                 'elapsed_seconds' => $elapsed,
+                'yield_rate' => $raw > 0 ? round($reviewableCount / $raw * 100, 1) : 0.0,
+                'duplicate_rate' => $raw > 0 ? round($duplicates / $raw * 100, 1) : 0.0,
+                'mismatch_rate' => $raw > 0 ? round($mismatchCount / $raw * 100, 1) : 0.0,
             ];
         })->values()->all();
 
@@ -94,6 +102,25 @@ final class LeadDiscoveryPilotSummary
             $join->on('c.id', '=', 'e.candidate_id')->where('c.tenant_id', '=', $tenantId)->where('c.campaign_id', '=', $campaignId);
         })->where('e.tenant_id', $tenantId)->where('e.campaign_id', $campaignId)->select('e.candidate_id')
             ->groupBy('e.candidate_id')->havingRaw('count(distinct e.source_id) > 1')->get()->count();
+
+        $requestedIds = array_values(array_unique(array_filter((array) data_get($campaignConfiguration, 'pilot_requested_sources', data_get($campaignConfiguration, 'discovery_source_ids', [])), 'is_string')));
+        $requestedSources = $requestedIds === [] ? collect() : DB::table('lead_discovery_sources')->where('tenant_id', $tenantId)->whereIn('id', $requestedIds)->get(['id', 'source_key', 'provider_name'])->keyBy('id');
+        $executedIds = $runs->pluck('source_id')->unique()->map(fn ($id): string => (string) $id)->values();
+        $sourceAvailability = [
+            'requested_count' => count($requestedIds),
+            'executed_count' => $executedIds->count(),
+            'skipped_count' => count($skipped),
+            'requested' => collect($requestedIds)->map(function (string $id) use ($requestedSources, $executedIds, $skipped): array {
+                $source = $requestedSources->get($id);
+                $skip = collect($skipped)->firstWhere('source_id', $id);
+                return ['source_id' => $id, 'source_key' => (string) ($source->source_key ?? 'unknown'), 'source' => (string) ($source->provider_name ?? 'Unavailable source'),
+                    'status' => $skip ? 'skipped' : ($executedIds->contains($id) ? 'executed' : 'not_started'), 'reason_code' => $skip['reason_code'] ?? null];
+            })->all(),
+        ];
+        $duplicateTypes = DB::table('lead_discovery_candidate_evidence as e')->join('lead_discovery_candidates as c', function ($join) use ($tenantId, $campaignId): void {
+            $join->on('c.id', '=', 'e.candidate_id')->where('c.tenant_id', '=', $tenantId);
+        })->where('e.tenant_id', $tenantId)->where('e.campaign_id', $campaignId)
+            ->selectRaw("count(distinct case when c.campaign_id = ? then c.id end) as same_campaign, count(distinct case when c.campaign_id <> ? and c.matched_company_id is null then c.id end) as prior_campaign, count(distinct case when c.matched_company_id is not null then c.id end) as promoted_company", [$campaignId, $campaignId])->first();
 
         return [
             'target' => self::configuredTarget($campaignConfiguration),
@@ -124,8 +151,11 @@ final class LeadDiscoveryPilotSummary
                 'manually_rejected' => (int) (clone $candidates)->where('validation_reason_code', 'HUMAN_REJECTED')->count(),
             ],
             'source_contribution' => $sourceMetrics,
+            'source_availability' => $sourceAvailability,
             'skipped_sources' => $skipped,
             'deduplication' => [
+                'duplicate_types' => ['same_campaign' => (int) ($duplicateTypes->same_campaign ?? 0), 'prior_campaign_candidate' => (int) ($duplicateTypes->prior_campaign ?? 0),
+                    'existing_promoted_company' => (int) ($duplicateTypes->promoted_company ?? 0), 'cross_source_identity_match' => (int) $crossSourceMatches],
                 'duplicates_by_source' => collect($sourceMetrics)->map(fn (array $source): array => [
                     'source_id' => $source['source_id'], 'source_key' => $source['source_key'], 'duplicates' => $source['duplicates'],
                 ])->all(),

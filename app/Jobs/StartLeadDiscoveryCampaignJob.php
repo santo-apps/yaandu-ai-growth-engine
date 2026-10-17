@@ -40,17 +40,25 @@ final class StartLeadDiscoveryCampaignJob implements ShouldQueue
                 ->where('authorization_status', 'authorized')->where('storage_rights_status', 'confirmed')->pluck('id')->map(fn ($id) => (string) $id)->all();
         }
         $campaignConfig = json_decode((string) $campaign->configuration, true) ?: [];
-        $campaignConfig['discovery_source_ids'] = array_values(array_unique($sourceIds));
+        $requestedSourceIds = array_values(array_unique((array) data_get($campaignConfig, 'pilot_requested_sources', data_get($campaignConfig, 'discovery_source_ids', $sourceIds))));
+        if ($requestedSourceIds === []) $requestedSourceIds = array_values(array_unique($sourceIds));
+        $campaignConfig['discovery_source_ids'] = $requestedSourceIds;
         $campaignConfig['source_mode'] = 'selected';
         $campaign->configuration = json_encode($campaignConfig);
-        DB::table('lead_discovery_campaigns')->where('tenant_id', $this->tenantId)->where('id', $campaign->id)
-            ->update(['configuration' => json_encode($campaignConfig), 'updated_at' => now()]);
+        $skippedSources = (array) data_get($campaignConfig, 'pilot_skipped_sources', []);
         $sources = DB::table('lead_discovery_sources')->where('tenant_id', $this->tenantId)->whereIn('id', $sourceIds)->get();
         if ($sourceIds !== [] && $sources->count() !== count(array_unique($sourceIds))) { $this->failCampaign($campaign, 'SOURCE_NOT_AUTHORIZED'); return; }
 
         $approvedSources = [];
+        $healthPolicy = app(\App\LeadDiscovery\LeadDiscoverySourceHealthPolicy::class);
         foreach ($sources as $source) {
-            if (in_array((string) $source->health_state, ['degraded', 'auth_error', 'not_configured', 'disabled'], true)) continue;
+            $healthReason = $healthPolicy->blockReason($source);
+            if ($healthReason !== null) {
+                $skippedSources[] = ['source_id' => (string) $source->id, 'reason_code' => $healthReason];
+                Log::notice('Lead discovery source skipped by health policy.', ['operation' => 'lead_discovery_source_skipped', 'tenant_id' => $this->tenantId,
+                    'campaign_id' => $campaign->id, 'source_id' => $source->id, 'reason_code' => $healthReason, 'health_status' => (string) $source->health_state]);
+                continue;
+            }
             $configuration = json_decode((string) $source->configuration, true) ?: [];
             try {
                 $adapter = $registry->get((string) $source->source_key);
@@ -58,9 +66,7 @@ final class StartLeadDiscoveryCampaignJob implements ShouldQueue
                 if ($adapter->capabilities()->governanceClass === 'CONDITIONAL' && ! in_array($source->id, $sourceIds, true)) continue;
                 if ($adapter instanceof \App\LeadDiscovery\WikidataLeadSourceAdapter && ! empty($campaign->industry)
                     && ! $adapter->supportsIndustryKey($campaign->normalized_industry_key ?? app(\App\LeadDiscovery\LeadDiscoveryIndustryTaxonomy::class)->keyFor((string) $campaign->industry))) {
-                    DB::table('lead_discovery_sources')->where('tenant_id', $this->tenantId)->where('id', $source->id)->update([
-                        'health_state' => 'not_configured', 'last_error_code' => 'SOURCE_QUERY_UNSUPPORTED', 'updated_at' => now(),
-                    ]);
+                    $skippedSources[] = ['source_id' => (string) $source->id, 'reason_code' => 'SOURCE_QUERY_UNSUPPORTED'];
                     continue;
                 }
                 $adapter->validateConfiguration([...$configuration,
@@ -68,11 +74,25 @@ final class StartLeadDiscoveryCampaignJob implements ShouldQueue
                     'storage_rights_status' => $source->storage_rights_status]);
             } catch (LiveLeadSourceException $error) {
                 DB::table('lead_discovery_sources')->where('tenant_id', $this->tenantId)->where('id', $source->id)->update(['health_state' => 'not_configured', 'last_error_code' => $error->errorCode, 'updated_at' => now()]);
+                $skippedSources[] = ['source_id' => (string) $source->id, 'reason_code' => $error->errorCode];
                 continue;
             }
             $approvedSources[] = $source;
         }
-        $tasks = $planner->plan($campaign, $approvedSources);
+        $planning = $planner->planWithDiagnostics($campaign, $approvedSources);
+        $tasks = $planning['tasks'];
+        $plannedSourceIds = $planning['selected_source_ids'];
+        $skippedSources = [...$skippedSources, ...$planning['skipped_sources']];
+        $skippedSources = collect($skippedSources)->unique(fn (array $item): string => (string) ($item['source_id'] ?? '').':'.(string) ($item['reason_code'] ?? ''))->values()->all();
+        foreach ($skippedSources as $skip) {
+            Log::notice('Lead discovery source skipped by campaign planner.', ['operation' => 'lead_discovery_source_skipped', 'tenant_id' => $this->tenantId,
+                'campaign_id' => $campaign->id, 'source_id' => $skip['source_id'], 'reason_code' => $skip['reason_code'], 'health_status' => 'unchanged']);
+        }
+        $campaignConfig['pilot_skipped_sources'] = $skippedSources;
+        $campaignConfig['pilot_executed_sources'] = $plannedSourceIds;
+        DB::table('lead_discovery_campaigns')->where('tenant_id', $this->tenantId)->where('id', $campaign->id)
+            ->update(['configuration' => json_encode($campaignConfig), 'updated_at' => now()]);
+        $campaign->configuration = json_encode($campaignConfig);
         if ($tasks === []) { $this->failCampaign($campaign, 'NO_COMPATIBLE_SOURCE_PARTITIONS'); return; }
 
         $runIds = []; $jobs = []; $checkpointCounts = [];

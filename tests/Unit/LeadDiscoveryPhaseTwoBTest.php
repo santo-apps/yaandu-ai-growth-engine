@@ -383,7 +383,7 @@ class LeadDiscoveryPhaseTwoBTest extends TestCase
         self::assertNotContains('earth', array_map(fn ($task) => $task['partition']['key'], $tasks));
     }
 
-    public function test_custom_industry_and_valid_unconfigured_country_use_global_sources_without_osm_or_mca_failure(): void
+    public function test_custom_industry_without_reliable_classification_skips_all_sources_that_cannot_filter_it(): void
     {
         $sources = collect(['osm_overpass', 'wikidata', 'india_ogd_mca', 'gleif'])->map(fn ($key, $i) => (object) ['id' => 's'.$i, 'source_key' => $key]);
         $campaign = (object) ['id' => 'custom-industry-sa', 'industry' => 'Marine Engineering', 'normalized_industry_key' => null,
@@ -391,13 +391,10 @@ class LeadDiscoveryPhaseTwoBTest extends TestCase
             'configuration' => json_encode(['limits' => ['partitions' => 4, 'provider_requests' => 10]])];
         $tasks = app(LeadDiscoverySourcePlanner::class)->plan($campaign, $sources);
         self::assertLessThanOrEqual(10, count($tasks));
-        self::assertNotEmpty($tasks);
+        self::assertSame([], $tasks, 'No source can establish relevance for this custom industry and geography without a supported classifier or bounded OSM area.');
         self::assertNotContains('india_ogd_mca', array_map(fn ($task) => $task['source']->source_key, $tasks));
         self::assertNotContains('osm_overpass', array_map(fn ($task) => $task['source']->source_key, $tasks), 'OSM has no safe configured Saudi city bbox, but other providers remain usable.');
         self::assertNotContains('wikidata', array_map(fn ($task) => $task['source']->source_key, $tasks), 'Unmapped industries must not fall back to broad Wikidata organization discovery.');
-        self::assertContains('gleif', array_map(fn ($task) => $task['source']->source_key, $tasks));
-        self::assertSame(['SA'], array_values(array_unique(array_map(fn ($task) => $task['partition']['country_code'], $tasks))));
-        self::assertContains('Marine Engineering', array_column(array_column($tasks, 'query'), 'query'));
     }
 
     public function test_any_country_any_industry_uses_bounded_country_and_query_windows(): void

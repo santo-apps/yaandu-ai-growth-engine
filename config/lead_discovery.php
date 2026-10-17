@@ -24,6 +24,9 @@ return [
     'live_max_failures' => (int) env('LEAD_DISCOVERY_MAX_FAILURES', 10),
     'live_queue' => env('LEAD_DISCOVERY_QUEUE', 'lead-discovery'),
     'osm_min_request_interval_seconds' => max(1, (int) env('LEAD_DISCOVERY_OSM_MIN_REQUEST_INTERVAL_SECONDS', 5)),
+    // A failed OSM source is held for five minutes before one normal bounded
+    // campaign request may test recovery. No background health probes run.
+    'osm_health_cooldown_seconds' => max(60, min(3600, (int) env('LEAD_DISCOVERY_OSM_HEALTH_COOLDOWN_SECONDS', 300))),
     'live_rate_per_minute' => (int) env('LEAD_DISCOVERY_RATE_PER_MINUTE', 30),
     'user_agent' => env('LEAD_DISCOVERY_USER_AGENT', ''),
     'live_result_count' => 10,
@@ -76,7 +79,8 @@ return [
         ['key' => 'NZ:AUK:Auckland', 'country_code' => 'NZ', 'region' => 'Auckland', 'city' => 'Auckland', 'bbox' => [-37.00, 174.60, -36.70, 175.00]],
     ],
     'osm_categories' => [
-        'ecommerce_retail' => ['shop' => ['supermarket', 'department_store', 'clothes', 'shoes', 'computer', 'electronics', 'furniture', 'mall']], 'healthcare' => ['amenity' => ['hospital', 'clinic', 'doctors'], 'healthcare' => ['*']],
+        // Curated retail values only; deliberately never use the broad shop=* selector.
+        'ecommerce_retail' => ['shop' => ['supermarket', 'department_store', 'clothes', 'shoes', 'computer', 'electronics', 'mobile_phone', 'appliance', 'furniture', 'mall', 'jewelry', 'gift', 'interior_decoration', 'lighting', 'hardware', 'stationery', 'sports', 'toys', 'books', 'cosmetics', 'household', 'variety_store']], 'healthcare' => ['amenity' => ['hospital', 'clinic', 'doctors'], 'healthcare' => ['*']],
         'hospitality_travel' => ['tourism' => ['*', 'hotel', 'guest_house'], 'amenity' => ['restaurant', 'cafe']],
         'professional_services' => ['office' => ['*']], 'manufacturing' => ['industrial' => ['*'], 'craft' => ['*']],
         'it_software' => ['office' => ['it', 'company']], 'education' => ['amenity' => ['school', 'college', 'university']],
